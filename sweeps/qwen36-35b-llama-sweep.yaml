@@ -1,0 +1,59 @@
+name: qwen36-35b-llama-sweep
+
+database: results/llama_tune.duckdb
+
+commands:
+  bench: ["llama", "bench"]
+  server: ["llama", "server"]
+
+models:
+  # Compact first pass for 32 GB machines.
+  - name: qwen36-35b-a3b-ud-iq4-nl
+    hf: unsloth/Qwen3.6-35B-A3B-GGUF
+    params:
+      hff: Qwen3.6-35B-A3B-UD-IQ4_NL.gguf
+
+  # Higher-quality dynamic 4-bit if memory pressure is acceptable.
+  - name: qwen36-35b-a3b-ud-q4-k-m
+    hf: unsloth/Qwen3.6-35B-A3B-GGUF
+    params:
+      hff: Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+
+defaults:
+  cache_type_k: q8_0
+  cache_type_v: q8_0
+  batch_size: 512
+  ubatch_size: 512
+  threads: 4
+  poll: 0
+
+bench:
+  prompt_tokens: [512, 2048]
+  gen_tokens: [128, 512]
+  repetitions: 3
+  output: json
+  params:
+    n_gpu_layers: 99
+    flash_attn: 1
+  extra_args: []
+
+server:
+  params:
+    ctx_size: 8192
+    n_gpu_layers: all
+    flash_attn: auto
+    no_mmproj: true
+    reasoning: "off"
+    # Extract <think>...</think> out of message.content. With `none`, Qwen can return
+    # an empty visible think block that hurts strict instruction-following evals.
+    reasoning_format: deepseek
+    parallel: 1
+    perf: true
+  extra_args: []
+  env: {}
+
+eval:
+  tasks: ifeval,gsm8k
+  limit: 50
+  max_length: 8192
+  eos_string: "<|im_end|>"

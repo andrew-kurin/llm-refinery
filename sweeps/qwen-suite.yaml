@@ -1,0 +1,13 @@
+name: qwen-suite
+
+database: results/llama_tune.duckdb
+
+models:
+  - name: local-qwen
+    hf: local/qwen
+
+eval:
+  tasks: ifeval,gsm8k
+  limit: 50
+  max_length: 8192
+  eos_string: "<|im_end|>"

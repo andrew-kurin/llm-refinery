@@ -1,0 +1,71 @@
+name: gemma-q8-b512-ub512-quality-next
+
+database: results/llama_tune.duckdb
+
+commands:
+  bench: ["llama", "bench"]
+  server: ["llama", "server"]
+
+# Quality-first follow-up sweep.
+# Runtime defaults are locked to the current winner:
+# - q8_0/q8_0 KV baseline
+# - batch_size=512, ubatch_size=512
+# - flash_attn on
+# - threads=4, poll=0
+#
+# The high-value question left is KV-cache precision. llama-bench only measures
+# speed/viability, not answer quality, but this tells us whether higher-quality
+# KV profiles are practical at 16k context on this machine.
+models:
+  - name: gemma-4-26b-a4b-q4km-kv-q8
+    hf: ggml-org/gemma-4-26B-A4B-it-GGUF:Q4_K_M
+    params:
+      cache_type_k: q8_0
+      cache_type_v: q8_0
+
+  # Quality-biased middle ground: keep K compact, make V full precision.
+  - name: gemma-4-26b-a4b-q4km-kv-q8-f16v
+    hf: ggml-org/gemma-4-26B-A4B-it-GGUF:Q4_K_M
+    params:
+      cache_type_k: q8_0
+      cache_type_v: f16
+
+  # Max-quality KV cache if memory allows.
+  - name: gemma-4-26b-a4b-q4km-kv-f16
+    hf: ggml-org/gemma-4-26B-A4B-it-GGUF:Q4_K_M
+    params:
+      cache_type_k: f16
+      cache_type_v: f16
+
+defaults:
+  batch_size: 512
+  ubatch_size: 512
+  flash_attn: 1
+  threads: 4
+  poll: 0
+
+sweep: {}
+
+bench:
+  # 2048 is common long-prompt behavior; 16384 proves full-context viability.
+  prompt_tokens: [2048, 16384]
+  # 128 gives a less noisy decode measurement than the runtime triage's n=16.
+  gen_tokens: [128]
+  repetitions: 3
+  output: json
+  params:
+    n_gpu_layers: 99
+  extra_args: []
+
+server:
+  # Server parity for the candidate settings. flash_attn auto overrides the
+  # bench-style integer default above.
+  params:
+    ctx_size: 16384
+    n_gpu_layers: all
+    flash_attn: auto
+    mlock: true
+    parallel: 1
+    perf: true
+  extra_args: []
+  env: {}

@@ -1,0 +1,57 @@
+name: gemma-cache-sweep
+
+database: results/llama_tune.duckdb
+
+# Default assumes the newer unified llama.cpp binary style used in your example:
+#   llama server ...
+# If your install has standalone binaries, use:
+#   bench: ["llama-bench"]
+#   server: ["llama-server"]
+commands:
+  bench: ["llama", "bench"]
+  server: ["llama", "server"]
+
+models:
+  - name: gemma-4-26b-a4b-q4km
+    hf: ggml-org/gemma-4-26B-A4B-it-GGUF:Q4_K_M
+
+# Common llama.cpp flags. Keys are converted from snake_case to --kebab-case.
+# Keep this section restricted to flags accepted by both `llama bench` and
+# `llama server`. Put command-specific flags under bench.params/server.params.
+defaults:
+  cache_type_k: q4_0
+  cache_type_v: q4_0
+
+# Cartesian product over these values.
+sweep:
+  cache_type_k: [q8_0]
+  cache_type_v: [q8_0]
+  # Add these once the basic sweep works on your machine:
+  batch_size: [512, 1024, 2048]
+  ubatch_size: [128, 256, 512]
+
+bench:
+  prompt_tokens: [512, 2048]
+  gen_tokens: [128, 512]
+  repetitions: 3
+  # llama-bench commonly supports: -o json. Set to null if your build does not.
+  output: json
+  # Bench-only flags. `llama bench` does not accept server-style values like
+  # --ctx-size, --mlock, --perf, --parallel, --flash-attn auto, or --n-gpu-layers all.
+  params:
+    n_gpu_layers: 99
+    flash_attn: 1
+  omit_params: []
+  extra_args: []
+
+server:
+  # Server-only flags from your current command.
+  params:
+    ctx_size: 16384
+    n_gpu_layers: all
+    flash_attn: auto
+    mlock: true
+    parallel: 1
+    perf: true
+  extra_args: []
+  env: {}

@@ -1,0 +1,55 @@
+name: gemma-f16-kv-batch-neighborhood
+
+database: results/llama_tune.duckdb
+
+commands:
+  bench: ["llama", "bench"]
+  server: ["llama", "server"]
+
+models:
+  - name: gemma-4-26b-a4b-q4km-kv-f16
+    hf: ggml-org/gemma-4-26B-A4B-it-GGUF:Q4_K_M
+
+# Quality-first winning defaults from gemma-q8-b512-ub512-quality-next:
+# - f16/f16 KV cache was viable at 16k and should preserve the most KV quality.
+# - 512/512, flash_attn on, threads=4, poll=0 were the best runtime defaults so far.
+#
+# This sweep only retunes the highest-value runtime knobs around that winner because
+# changing KV precision already changed the memory/throughput profile.
+defaults:
+  cache_type_k: q8_0
+  cache_type_v: q8_0
+  batch_size: 512
+  ubatch_size: 512
+  flash_attn: 1
+  threads: 4
+  poll: 0
+
+# Local neighborhood around the current 512/512 winner. Keep this compact first;
+# if 1024/512 or 512/256 wins, expand around that result next.
+sweep:
+  batch_size: [512, 1024]
+  ubatch_size: [512, 256]
+
+bench:
+  # 2048 represents common long prompts; 16384 proves full-context behavior.
+  prompt_tokens: [2048, 16384]
+  # Include both normal and long decode to avoid overfitting to short generation.
+  gen_tokens: [128, 512]
+  repetitions: 3
+  output: json
+  params:
+    n_gpu_layers: 99
+  extra_args: []
+
+server:
+  params:
+    ctx_size: 8192
+    n_gpu_layers: all
+    # Server accepts auto; bench uses integer 1 above.
+    flash_attn: auto
+    mlock: false
+    parallel: 1
+    perf: true
+  extra_args: []
+  env: {}
