@@ -1,8 +1,8 @@
-# Gemma 4 Local Serving Benchmark Summary
+# Local Serving Benchmark Summary
 
-Last updated: 2026-06-06
+Last updated: 2026-06-07
 
-This file summarizes the local Gemma 4 serving experiments so far across llama.cpp, Ollama, and MLX on Apple Silicon.
+This file summarizes local serving experiments so far across llama.cpp, Ollama, MLX, and MLX-VLM on Apple Silicon. It started as a Gemma 4 benchmark log and now also tracks Qwen triage for local coding-agent use.
 
 ## Executive summary
 
@@ -11,16 +11,20 @@ Current practical conclusions:
 1. **Best math/limited-eval score so far:** llama.cpp Gemma 4 31B QAT `Q4_0` hits GSM8K 0.9600/0.9600, but it is slow and memory-tight. **Best instruction-following score so far:** Ollama `hf.co/ggml-org/gemma-4-12B-it-GGUF:Q8_0`.
 2. **Best llama.cpp 26B daily default candidate:** Unsloth Gemma 4 26B `UD-Q4_K_XL` with `q8_0/q8_0` KV, reasoning disabled, 8k context. It beats the older ggml-org `Q4_K_M` baseline on GSM8K and IFEval, and HTTP latency is practical.
 3. **Best MLX quality mode:** MLX Gemma 4 26B OptiQ with thinking disabled. It scores well and handles short/coding prompts well, but long-context TTFT is much worse than llama.cpp/Ollama because prompt cache reuse appears weak.
-4. **Most important eval fix:** disable thinking/reasoning and use the right Gemma 4 stop token.
+4. **Most important eval fix:** disable thinking/reasoning and use the right model-specific stop token.
+5. **Qwen status:** Qwen3.6 35B-A3B `UD-IQ4_NL` is fast enough to be interesting (~15-17 tok/s coding), but the first run had weak IFEval and visible empty `<think>` tags because it used `--reasoning-format none`. The Qwen sweeps now use `--reasoning-format deepseek`; rerun before making a quality decision. Qwen3.6 27B is dense and looked much slower (~5.5 tok/s from server logs), so it is not the practical default unless quality is dramatically better.
+6. **Workflow status:** one-off shell scripts were retired. Quality evals now run through `uv run llama-tune lm-eval` or `uv run llama-tune suite`, with eval settings stored in YAML when possible.
 
 Reasoning/thinking-disabled settings:
 
 | Runtime | Required setting |
 |---|---|
 | llama.cpp | `--reasoning off` |
-| Ollama OpenAI-compatible API | `GEN_KWARGS='reasoning_effort="none"'` for lm-eval, or JSON field `"reasoning_effort": "none"` |
+| Ollama OpenAI-compatible API | `--gen-kwargs 'reasoning_effort="none"'` for `llama-tune lm-eval`, or JSON field `"reasoning_effort": "none"` |
 | MLX `mlx_lm.server` | `--chat-template-args '{"enable_thinking":false}'` |
-| lm-eval stop token | `EOS_STRING=<turn|>` |
+| Qwen llama.cpp | `--reasoning off --reasoning-format deepseek` |
+| Gemma lm-eval stop token | `<turn|>` |
+| Qwen lm-eval stop token | `<|im_end|>` |
 
 Without those fixes, the model often emits reasoning text and little/no final `content`, which makes the scores invalid.
 
@@ -39,9 +43,9 @@ Some recent 12B timing numbers may be contaminated because an MLX-VLM server was
 
 For coding-agent use, **IFEval prompt strict** is especially important because agent prompts often contain multiple simultaneous constraints.
 
-## Current leaderboard
+## Current Gemma leaderboard
 
-Superseded variants are excluded here. Rows are ranked primarily by IFEval prompt strict, then IFEval inst strict, with practical speed/memory notes.
+Superseded variants are excluded here. Rows are ranked primarily by IFEval prompt strict, then IFEval inst strict, with practical speed/memory notes. Qwen runs are tracked separately until corrected reruns are complete.
 
 | Rank | Model | Role | IFEval prompt strict | IFEval inst strict | GSM8K strict | Practical speed |
 |---:|---|---|---:|---:|---:|---:|
@@ -59,9 +63,9 @@ Removed from the active leaderboard:
 | Ollama `hf.co/ggml-org/gemma-4-12B-it-GGUF:Q4_K_M` | Superseded by Ollama 12B Q8: lower quality with similar measured token speed. |
 | llama.cpp 26B ggml-org `Q4_K_M` | Superseded by llama.cpp 26B Unsloth `UD-Q4_K_XL`: lower GSM8K and IFEval; only slightly faster raw generation. |
 
-## Valid historical lm-eval quality results
+## Valid historical Gemma lm-eval quality results
 
-All rows below are `limit=50`, so they are useful for local comparison but not publication-grade metrics. This table intentionally keeps superseded but valid runs for audit/history; use the leaderboard above for current decisions.
+All rows below are `limit=50`, so they are useful for local comparison but not publication-grade metrics. This table intentionally keeps superseded but valid Gemma runs for audit/history; use the leaderboard above for current Gemma decisions.
 
 | Runtime / model | Notes | GSM8K strict | GSM8K flexible | IFEval prompt strict | IFEval inst strict | Eval time |
 |---|---|---:|---:|---:|---:|---:|
@@ -98,6 +102,20 @@ Interpretation:
 - MLX 12B 4bit is a mixed result: excellent GSM8K, but meaningfully worse IFEval prompt strict. For coding-agent use, the instruction-following drop matters more than the math gain.
 - MLX 12B 8bit exactly matched llama.cpp 12B Q8 on this limited eval. A clean rerun took 77.6m, close to Ollama 12B Q8 and slightly faster than llama.cpp 12B Q8.
 - The 12B Q8/8bit/library-quant runs were much slower in lm-eval than the 26B llama.cpp/MLX runs.
+
+## Qwen exploratory lm-eval quality results
+
+All rows are `limit=50`. Qwen runs use `eos_string: "<|im_end|>"`.
+
+| Runtime / model | Notes | GSM8K strict | GSM8K flexible | IFEval prompt strict | IFEval inst strict | Eval time |
+|---|---|---:|---:|---:|---:|---:|
+| llama.cpp Qwen3.6 35B-A3B `UD-IQ4_NL` | q8 KV, ctx 8192; **preliminary** because server used `--reasoning-format none` and visible empty `<think>` tags remained in `content` | 0.8800 | 0.9000 | 0.6200 | 0.7237 | 27.2m |
+
+Interpretation:
+
+- GSM8K was strong, but IFEval was too weak for a coding-agent default.
+- The run likely undercounted instruction following because visible `<think>\n\n</think>` appeared in content during sanity checks. The dedicated Qwen sweeps now use `--reasoning-format deepseek`, so rerun Qwen3.6 35B-A3B before rejecting it.
+- Qwen3.6 27B is dense, not MoE. Server logs showed about ~5.5 tok/s generation on the 32 GB Mac, versus ~15-17 tok/s for 35B-A3B in HTTP load. Treat 27B as a quality experiment, not a latency candidate.
 
 ## Invalid or superseded lm-eval results
 
@@ -190,6 +208,18 @@ Interpretation:
 - MLX 26B has a **large long-context TTFT penalty**: ~20–25s vs sub-second for llama.cpp/Ollama.
 - Direct checks showed MLX was only reporting about `19 / 5915` prompt tokens cached on repeated long-context requests, so it appears to re-prefill almost the whole prompt. llama.cpp/Ollama appear to benefit from much stronger prompt/prefix cache reuse.
 
+### llama.cpp Qwen3.6 35B-A3B `UD-IQ4_NL`, concurrency 1, preliminary
+
+HTTP load was run with `sweeps/qwen36-http-load.yaml` against `unsloth/Qwen3.6-35B-A3B-GGUF` / `Qwen3.6-35B-A3B-UD-IQ4_NL.gguf`, q8 KV, ctx 8192. The server for this first run used `--reasoning-format none`, so strict instruction scores should be rerun with the corrected sweep (`--reasoning-format deepseek`).
+
+| Scenario | latency p95 | TTFT p95 | completion tok/s | check pass | errors |
+|---|---:|---:|---:|---:|---:|
+| interactive-short | 8.306s | 1.292s | 16.068 | n/a | 0 |
+| coding-assistant | 10.352s | 0.824s | 16.817 | 1.000 | 0 |
+| long-context-recall | 3.340s | 0.159s | 15.347 | 1.000 | 0 |
+
+Memory pressure was high for this 32 GB machine after the run: swap climbed from ~3.3 GB before to ~6.6 GB after. That makes 35B-A3B plausible but not obviously comfortable as an always-on default on the current Mac.
+
 ## Memory observations
 
 Activity Monitor “App Memory” can understate Metal/unified-memory allocations; watch system memory pressure, wired memory, compressed memory, and swap.
@@ -207,6 +237,7 @@ Activity Monitor “App Memory” can understate Metal/unified-memory allocation
 | Ollama 26B QAT `Q4_0` LM Studio mirror | Yellow pressure near end of eval. Ollama backend used 32k ctx + mmproj; ~29.9 / 32 GB used, ~18.5 GB wired, ~7.3 GB compressed, ~5.7 GB swap. |
 | MLX 26B QAT `mxfp4` | Green and comfortable during eval; ~21.6 / 32 GB used, ~15.7 GB wired, ~0.2 GB compressed, ~4.7 GB swap. |
 | llama.cpp 31B Google QAT `Q4_0` + q8 KV + 8k ctx | Fits, but tight. During/after eval: green pressure, ~30 / 32 GB used, ~20.5 GB wired, ~3 GB compressed, ~3.3 GB swap. Not ideal as an always-on default. |
+| llama.cpp Qwen3.6 35B-A3B `UD-IQ4_NL` + q8 KV + 8k ctx | Fits but swap-heavy on the 32 GB Mac. After eval + HTTP load, swap was ~6.6 GB and free swap was low. Rerun after reboot/cleanup for a cleaner daily-use reading. |
 
 ## Runtime tuning findings
 
@@ -234,13 +265,39 @@ MLX prefill tuning:
 - `MLX_PREFILL_STEP_SIZE=4096`: best observed, TTFT ~20.8s.
 - `MLX_PREFILL_STEP_SIZE=8192`: regressed to TTFT ~25.3s and used more memory.
 
+## Workflow notes
+
+One-off shell scripts have been retired. Use Python/YAML workflow commands instead:
+
+```bash
+uv run llama-tune lm-eval llama_cpp 50 \
+  --eos-string '<turn|>' \
+  --max-length 8192
+
+uv run llama-tune suite sweeps/qwen36-35b-llama-sweep.yaml \
+  --http-load-config sweeps/qwen36-http-load.yaml \
+  --target llama-qwen36-35b-a3b-ud-iq4-nl
+```
+
+YAML configs can carry eval defaults:
+
+```yaml
+eval:
+  tasks: ifeval,gsm8k
+  limit: 50
+  max_length: 8192
+  eos_string: "<|im_end|>"
+  gen_kwargs: reasoning_effort="none"
+```
+
 ## Recommended commands
 
-### llama.cpp 26B balanced default
+### llama.cpp Gemma 4 26B daily default
 
 ```bash
 llama server \
-  -hf ggml-org/gemma-4-26B-A4B-it-GGUF:Q4_K_M \
+  -hf unsloth/gemma-4-26B-A4B-it-GGUF \
+  -hff gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
   --no-mmproj \
   --reasoning off \
   --cache-type-k q8_0 \
@@ -277,6 +334,40 @@ llama server \
   --n-gpu-layers all \
   --parallel 1 \
   --perf
+```
+
+### Qwen3.6 35B-A3B rerun candidate
+
+Terminal 1:
+
+```bash
+kill $(lsof -tiTCP:8080 -sTCP:LISTEN) 2>/dev/null || true
+uv run llama-tune server sweeps/qwen36-35b-llama-sweep.yaml --index 0
+```
+
+Terminal 2:
+
+```bash
+uv run llama-tune suite sweeps/qwen36-35b-llama-sweep.yaml \
+  --http-load-config sweeps/qwen36-http-load.yaml \
+  --target llama-qwen36-35b-a3b-ud-iq4-nl
+```
+
+### Qwen3-Coder 30B-A3B Q4_K_M candidate
+
+Terminal 1:
+
+```bash
+kill $(lsof -tiTCP:8080 -sTCP:LISTEN) 2>/dev/null || true
+uv run llama-tune server sweeps/qwen3-coder-30b-llama-sweep.yaml --index 0
+```
+
+Terminal 2:
+
+```bash
+uv run llama-tune suite sweeps/qwen3-coder-30b-llama-sweep.yaml \
+  --http-load-config sweeps/qwen3-coder-http-load.yaml \
+  --target llama-qwen3-coder-30b-a3b-q4km
 ```
 
 ### Ollama Gemma 4 12B Q8 quality eval
@@ -332,10 +423,10 @@ uvx --from mlx-vlm mlx_vlm.generate \
 
 ## Next suggested experiments
 
-1. Try official Google Gemma 4 12B QAT `Q4_0` through Ollama to see whether Ollama improves IFEval as it did for 12B Q8.
-2. Try 31B QAT Q4_0 through Ollama only if curious; 26B QAT through Ollama did not improve quality and used more memory.
-3. Optionally retest 31B QAT with q4 KV or 4k ctx to see if it becomes less memory-tight, but expect possible IFEval loss.
-4. Add a dedicated HTTP target name for Gemma 4 12B Q8 so results are not stored under stale `llama-f16-kv` labels.
-5. Run HTTP load for 12B Q8 to compare practical coding-agent latency against 26B llama.cpp/Ollama/MLX.
+1. Rerun Qwen3.6 35B-A3B `UD-IQ4_NL` with `sweeps/qwen36-35b-llama-sweep.yaml` so `<think>` blocks are extracted with `--reasoning-format deepseek`.
+2. Run Qwen3-Coder 30B-A3B `Q4_K_M` with `sweeps/qwen3-coder-30b-llama-sweep.yaml` and compare against Gemma 4 26B `UD-Q4_K_XL`.
+3. Add a dedicated HTTP target/sweep for Gemma 4 26B `UD-Q4_K_XL` so future results are not stored under stale QAT labels.
+4. Add a lightweight deterministic agentic eval harness: patch applies, pytest repair, JSON/tool validity, multi-file edit, long-context repo task, retry behavior.
+5. Run a real multimodal smoke test for Ollama 12B Q8 with an image.
 6. Capture `prompt_tokens_details.cached_tokens` in `http-load` so prompt-cache behavior is visible in DB comparisons.
-7. Investigate why Ollama 12B Q8 scores better than llama.cpp 12B Q8 on the same GGUF family.
+7. If a 128 GB Mac becomes available, try DS4 / DeepSeek V4 Flash q2-imatrix as the high-memory local frontier-ish candidate.
