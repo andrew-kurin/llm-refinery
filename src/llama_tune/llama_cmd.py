@@ -8,6 +8,8 @@ from llama_tune.config import Trial, TuneConfig
 # Explicit aliases for common llama.cpp flags. Unknown keys fall back to --kebab-case.
 FLAG_ALIASES = {
     "ctx_size": "--ctx-size",
+    "hff": "-hff",
+    "hf_file": "--hf-file",
     "n_gpu_layers": "--n-gpu-layers",
     "gpu_layers": "--n-gpu-layers",
     "flash_attn": "--flash-attn",
