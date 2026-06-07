@@ -12,7 +12,7 @@ Current practical conclusions:
 2. **Best llama.cpp 26B daily default candidate:** Unsloth Gemma 4 26B `UD-Q4_K_XL` with `q8_0/q8_0` KV, reasoning disabled, 8k context. It beats the older ggml-org `Q4_K_M` baseline on GSM8K and IFEval, and HTTP latency is practical.
 3. **Best MLX quality mode:** MLX Gemma 4 26B OptiQ with thinking disabled. It scores well and handles short/coding prompts well, but long-context TTFT is much worse than llama.cpp/Ollama because prompt cache reuse appears weak.
 4. **Most important eval fix:** disable thinking/reasoning and use the right model-specific stop token.
-5. **Qwen status:** Qwen3.6 35B-A3B `UD-IQ4_NL` is fast enough to be interesting (~15-17 tok/s coding), but the first run had weak IFEval and visible empty `<think>` tags because it used `--reasoning-format none`. The Qwen sweeps now use `--reasoning-format deepseek`; rerun before making a quality decision. Qwen3.6 27B is dense and looked much slower (~5.5 tok/s from server logs), so it is not the practical default unless quality is dramatically better.
+5. **Qwen status:** Qwen3.6 35B-A3B `UD-IQ4_NL` is fast enough to be interesting (~15-17 tok/s coding), but limited IFEval was weak and visible empty `<think>` tags remained in `content`. Qwen3.6 27B `IQ4_NL` is dense and is rejected for daily use: limited quality did not improve, lm-eval took ~147m, and HTTP coding speed was only ~3.2 tok/s.
 6. **Workflow status:** one-off shell scripts were retired. Quality evals now run through `uv run llama-tune lm-eval` or `uv run llama-tune suite`, with eval settings stored in YAML when possible.
 
 Reasoning/thinking-disabled settings:
@@ -26,7 +26,7 @@ Reasoning/thinking-disabled settings:
 | Gemma lm-eval stop token | `<turn|>` |
 | Qwen lm-eval stop token | `<|im_end|>` |
 
-Without those fixes, the model often emits reasoning text and little/no final `content`, which makes the scores invalid.
+Without those fixes, the model often emits reasoning text and little/no final `content`, which makes the scores invalid. For Qwen3.6 specifically, even `--reasoning off --reasoning-format deepseek` has still produced a visible empty `<think></think>` prefix in llama.cpp OpenAI responses; treat Qwen IFEval as provisional until that prefix is removed or stripped.
 
 ## Contamination caveat
 
@@ -109,13 +109,14 @@ All rows are `limit=50`. Qwen runs use `eos_string: "<|im_end|>"`.
 
 | Runtime / model | Notes | GSM8K strict | GSM8K flexible | IFEval prompt strict | IFEval inst strict | Eval time |
 |---|---|---:|---:|---:|---:|---:|
-| llama.cpp Qwen3.6 35B-A3B `UD-IQ4_NL` | q8 KV, ctx 8192; **preliminary** because server used `--reasoning-format none` and visible empty `<think>` tags remained in `content` | 0.8800 | 0.9000 | 0.6200 | 0.7237 | 27.2m |
+| llama.cpp Qwen3.6 35B-A3B `UD-IQ4_NL` | q8 KV, ctx 8192; visible empty `<think>` tags remained in `content`; rerun only if template/output stripping is fixed | 0.8800 | 0.9000 | 0.6200 | 0.7237 | 27.2m |
+| llama.cpp Qwen3.6 27B `IQ4_NL` | q8 KV, ctx 8192; dense model; visible empty `<think>` tags remained in `content`; too slow for daily use | 0.8600 | 0.9000 | 0.6200 | 0.7368 | 147.2m |
 
 Interpretation:
 
-- GSM8K was strong, but IFEval was too weak for a coding-agent default.
-- The run likely undercounted instruction following because visible `<think>\n\n</think>` appeared in content during sanity checks. The dedicated Qwen sweeps now use `--reasoning-format deepseek`, so rerun Qwen3.6 35B-A3B before rejecting it.
-- Qwen3.6 27B is dense, not MoE. Server logs showed about ~5.5 tok/s generation on the 32 GB Mac, versus ~15-17 tok/s for 35B-A3B in HTTP load. Treat 27B as a quality experiment, not a latency candidate.
+- GSM8K was strong enough to keep Qwen interesting for math, but IFEval was too weak for a coding-agent default.
+- Visible `<think>\n\n</think>` appeared in content during sanity checks for both 35B-A3B and 27B. That likely undercounts IFEval and means these Qwen quality scores should not be treated as final until the chat template/output stripping issue is fixed.
+- Qwen3.6 27B is dense, not MoE. It was far slower than 35B-A3B and did not improve instruction following, so reject it for practical daily use on the 32 GB Mac.
 
 ## Invalid or superseded lm-eval results
 
@@ -210,7 +211,7 @@ Interpretation:
 
 ### llama.cpp Qwen3.6 35B-A3B `UD-IQ4_NL`, concurrency 1, preliminary
 
-HTTP load was run with `sweeps/qwen36-http-load.yaml` against `unsloth/Qwen3.6-35B-A3B-GGUF` / `Qwen3.6-35B-A3B-UD-IQ4_NL.gguf`, q8 KV, ctx 8192. The server for this first run used `--reasoning-format none`, so strict instruction scores should be rerun with the corrected sweep (`--reasoning-format deepseek`).
+HTTP load was run with `sweeps/qwen36-http-load.yaml` against `unsloth/Qwen3.6-35B-A3B-GGUF` / `Qwen3.6-35B-A3B-UD-IQ4_NL.gguf`, q8 KV, ctx 8192. Visible empty `<think>` tags remained in content during sanity checks, so strict instruction quality needs a template/output-stripping fix before final judgment.
 
 | Scenario | latency p95 | TTFT p95 | completion tok/s | check pass | errors |
 |---|---:|---:|---:|---:|---:|
@@ -219,6 +220,18 @@ HTTP load was run with `sweeps/qwen36-http-load.yaml` against `unsloth/Qwen3.6-3
 | long-context-recall | 3.340s | 0.159s | 15.347 | 1.000 | 0 |
 
 Memory pressure was high for this 32 GB machine after the run: swap climbed from ~3.3 GB before to ~6.6 GB after. That makes 35B-A3B plausible but not obviously comfortable as an always-on default on the current Mac.
+
+### llama.cpp Qwen3.6 27B `IQ4_NL`, concurrency 1
+
+HTTP load was run with `sweeps/qwen36-27b-http-load.yaml` against `unsloth/Qwen3.6-27B-GGUF` / `Qwen3.6-27B-IQ4_NL.gguf`, q8 KV, ctx 8192. This is a dense model and was much slower than the 35B-A3B MoE.
+
+| Scenario | latency p95 | TTFT p95 | completion tok/s | check pass | errors |
+|---|---:|---:|---:|---:|---:|
+| interactive-short | 41.694s | 3.376s | 3.104 | n/a | 0 |
+| coding-assistant | 56.477s | 3.508s | 3.170 | 1.000 | 0 |
+| long-context-recall | 14.148s | 0.924s | 3.249 | 1.000 | 0 |
+
+Verdict: reject for daily use on the 32 GB Mac. It is ~5x slower than Qwen3.6 35B-A3B in HTTP coding throughput and does not improve IFEval.
 
 ## Memory observations
 
@@ -238,6 +251,7 @@ Activity Monitor “App Memory” can understate Metal/unified-memory allocation
 | MLX 26B QAT `mxfp4` | Green and comfortable during eval; ~21.6 / 32 GB used, ~15.7 GB wired, ~0.2 GB compressed, ~4.7 GB swap. |
 | llama.cpp 31B Google QAT `Q4_0` + q8 KV + 8k ctx | Fits, but tight. During/after eval: green pressure, ~30 / 32 GB used, ~20.5 GB wired, ~3 GB compressed, ~3.3 GB swap. Not ideal as an always-on default. |
 | llama.cpp Qwen3.6 35B-A3B `UD-IQ4_NL` + q8 KV + 8k ctx | Fits but swap-heavy on the 32 GB Mac. After eval + HTTP load, swap was ~6.6 GB and free swap was low. Rerun after reboot/cleanup for a cleaner daily-use reading. |
+| llama.cpp Qwen3.6 27B `IQ4_NL` + q8 KV + 8k ctx | Fits but not comfortable after a long eval. Swap was ~3.6 GB before and ~5.9 GB after; generation speed was too slow to justify the footprint. |
 
 ## Runtime tuning findings
 
@@ -336,7 +350,9 @@ llama server \
   --perf
 ```
 
-### Qwen3.6 35B-A3B rerun candidate
+### Qwen3.6 35B-A3B debugging candidate
+
+Only trust IFEval after confirming the sanity preview no longer starts with an empty `<think></think>` block.
 
 Terminal 1:
 
@@ -423,7 +439,7 @@ uvx --from mlx-vlm mlx_vlm.generate \
 
 ## Next suggested experiments
 
-1. Rerun Qwen3.6 35B-A3B `UD-IQ4_NL` with `sweeps/qwen36-35b-llama-sweep.yaml` so `<think>` blocks are extracted with `--reasoning-format deepseek`.
+1. Investigate Qwen3.6 empty `<think></think>` prefixes in llama.cpp OpenAI responses. Try a custom/generic ChatML template or response-stripping proxy before trusting IFEval; if fixed, rerun Qwen3.6 35B-A3B `UD-IQ4_NL`.
 2. Run Qwen3-Coder 30B-A3B `Q4_K_M` with `sweeps/qwen3-coder-30b-llama-sweep.yaml` and compare against Gemma 4 26B `UD-Q4_K_XL`.
 3. Add a dedicated HTTP target/sweep for Gemma 4 26B `UD-Q4_K_XL` so future results are not stored under stale QAT labels.
 4. Add a lightweight deterministic agentic eval harness: patch applies, pytest repair, JSON/tool validity, multi-file edit, long-context repo task, retry behavior.
