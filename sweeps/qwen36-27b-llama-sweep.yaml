@@ -53,7 +53,6 @@ server:
     # Extract <think>...</think> out of message.content. With `none`, Qwen can return
     # an empty visible think block that hurts strict instruction-following evals.
     reasoning_format: deepseek
-    chat_template_kwargs: '{"enable_thinking":false}'
     parallel: 1
     perf: true
   extra_args: []
