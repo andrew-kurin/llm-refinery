@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.error
 import urllib.request
 from typing import Any
+
+REASONING_TAG_RE = re.compile(r"</?(?:think|thinking)\b", re.IGNORECASE)
 
 
 def run_api_sanity_check(
@@ -48,6 +51,8 @@ def run_api_sanity_check(
             raise ValueError("empty content returned")
         if reasoning.strip():
             raise ValueError("reasoning/thinking output present when not expected")
+        if has_reasoning_tags(content):
+            raise ValueError("reasoning/thinking tags present in content")
 
         return {
             "success": True,
@@ -69,3 +74,7 @@ def run_api_sanity_check(
         return {"success": False, "error": f"sanity failed: {exc}"}
     except Exception as exc:  # noqa: BLE001 - convert unexpected sanity errors into result data
         return {"success": False, "error": f"unexpected error: {exc}"}
+
+
+def has_reasoning_tags(text: str) -> bool:
+    return bool(REASONING_TAG_RE.search(text))
