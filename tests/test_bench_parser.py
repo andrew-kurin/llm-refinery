@@ -1,4 +1,4 @@
-from llama_tune.bench_parser import parse_llama_bench_metrics
+from llm_refinery.bench_parser import parse_llama_bench_metrics
 
 
 def test_parse_json_bench_metrics():

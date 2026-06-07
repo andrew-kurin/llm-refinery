@@ -1,4 +1,4 @@
-from llama_tune.runner import BenchProgress, format_duration
+from llm_refinery.runner import BenchProgress, format_duration
 
 
 def test_format_duration():

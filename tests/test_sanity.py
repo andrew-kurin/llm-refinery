@@ -1,4 +1,4 @@
-from llama_tune.utils.sanity import has_reasoning_tags
+from llm_refinery.utils.sanity import has_reasoning_tags
 
 
 def test_has_reasoning_tags_detects_think_tags():

@@ -1,6 +1,6 @@
 name: qwen3-coder-http-load
 
-database: results/llama_tune.duckdb
+database: results/llm_refinery.duckdb
 
 targets:
   - name: llama-qwen3-coder-30b-a3b-q4km

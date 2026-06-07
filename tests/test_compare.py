@@ -1,4 +1,4 @@
-from llama_tune.compare import build_compare_rows
+from llm_refinery.compare import build_compare_rows
 
 
 def test_compare_sort_keeps_missing_metrics_last_when_ascending():

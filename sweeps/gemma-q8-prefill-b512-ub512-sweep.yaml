@@ -1,6 +1,6 @@
 name: gemma-q8-prefill-b512-ub512-sweep
 
-database: results/llama_tune.duckdb
+database: results/llm_refinery.duckdb
 
 commands:
   bench: ["llama", "bench"]

@@ -1,4 +1,4 @@
-from llama_tune.http_load import (
+from llm_refinery.http_load import (
     HttpLoadConfig,
     RequestResult,
     _read_ollama_stream,

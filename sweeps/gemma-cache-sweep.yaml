@@ -1,6 +1,6 @@
 name: gemma-cache-sweep
 
-database: results/llama_tune.duckdb
+database: results/llm_refinery.duckdb
 
 # Default assumes the newer unified llama.cpp binary style used in your example:
 #   llama server ...

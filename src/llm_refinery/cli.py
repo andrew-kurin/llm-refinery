@@ -7,25 +7,25 @@ from typing import Any
 import click
 import duckdb
 
-from llama_tune import __version__
-from llama_tune.bench_parser import parse_llama_bench_metrics
-from llama_tune.compare import build_compare_rows, build_compare_table_rows
-from llama_tune.config import ConfigError, load_config
-from llama_tune.http_load import load_http_load_config, run_http_load
-from llama_tune.lm_eval import (
+from llm_refinery import __version__
+from llm_refinery.bench_parser import parse_llama_bench_metrics
+from llm_refinery.compare import build_compare_rows, build_compare_table_rows
+from llm_refinery.config import ConfigError, load_config
+from llm_refinery.http_load import load_http_load_config, run_http_load
+from llm_refinery.lm_eval import (
     TARGET_CHOICES,
     LmEvalConfig,
     LmEvalTarget,
     default_targets,
     run_lm_eval,
 )
-from llama_tune.runner import launch_server, print_plan, run_bench
-from llama_tune.storage import ResultStore
-from llama_tune.workflows.suite import BenchmarkSuiteWorkflow
+from llm_refinery.runner import launch_server, print_plan, run_bench
+from llm_refinery.storage import ResultStore
+from llm_refinery.workflows.suite import BenchmarkSuiteWorkflow
 
 EXAMPLE_CONFIG = """name: gemma-cache-sweep
 
-database: results/llama_tune.duckdb
+database: results/llm_refinery.duckdb
 
 commands:
   bench: ["llama", "bench"]
@@ -83,9 +83,9 @@ class ErrorHandlingGroup(click.Group):
     cls=ErrorHandlingGroup,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
-@click.version_option(__version__, "--version", prog_name="llama-tune")
+@click.version_option(__version__, "--version", prog_name="llm-refinery")
 def main() -> None:
-    """Local-first llama.cpp tuning and benchmarking harness."""
+    """Local LLM benchmarking and serving workflow harness."""
 
 
 @main.command("init", help="Write a starter sweep config.")
@@ -388,7 +388,7 @@ def http_load(
 @click.argument(
     "database",
     required=False,
-    default="results/llama_tune.duckdb",
+    default="results/llm_refinery.duckdb",
     type=click.Path(dir_okay=False, path_type=Path),
 )
 @click.option("--metric", help="Metric name to sort by descending.")
@@ -443,7 +443,7 @@ def report(database: Path, metric: str | None, limit: int, list_metrics: bool) -
         click.echo(_table(table_rows))
         click.echo(
             "\nUse --metrics to list metric names, --metric NAME to rank runs, "
-            "or `llama-tune compare` to compare configs."
+            "or `llm-refinery compare` to compare configs."
         )
 
 
@@ -451,7 +451,7 @@ def report(database: Path, metric: str | None, limit: int, list_metrics: bool) -
 @click.argument(
     "database",
     required=False,
-    default="results/llama_tune.duckdb",
+    default="results/llm_refinery.duckdb",
     type=click.Path(dir_okay=False, path_type=Path),
 )
 @click.option(
@@ -531,7 +531,7 @@ def compare(
 @click.argument(
     "database",
     required=False,
-    default="results/llama_tune.duckdb",
+    default="results/llm_refinery.duckdb",
     type=click.Path(dir_okay=False, path_type=Path),
 )
 @click.option("--include-failed", is_flag=True, help="Also reparse failed runs.")

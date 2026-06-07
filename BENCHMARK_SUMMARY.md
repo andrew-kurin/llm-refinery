@@ -13,20 +13,20 @@ Current practical conclusions:
 3. **Best MLX quality mode:** MLX Gemma 4 26B OptiQ with thinking disabled. It scores well and handles short/coding prompts well, but long-context TTFT is much worse than llama.cpp/Ollama because prompt cache reuse appears weak.
 4. **Most important eval fix:** disable thinking/reasoning and use the right model-specific stop token.
 5. **Qwen status:** corrected Qwen3.6 35B-A3B `UD-IQ4_NL` is a strong non-Gemma candidate: IFEval 0.8800/0.9211, GSM8K 0.8800/0.9000, HTTP coding ~18.5 tok/s, and good long-context TTFT. Qwen3-Coder 30B-A3B `Q4_K_M` is faster and stronger on GSM8K (0.9200), but trails on IFEval (0.8600/0.8947). Both are interesting; Gemma 4 26B `UD-Q4_K_XL` remains the safer 32 GB daily default. Qwen3.6 27B `IQ4_NL` is dense and rejected for daily use: lm-eval took ~147m and HTTP coding speed was only ~3.2 tok/s.
-6. **Workflow status:** one-off shell scripts were retired. Quality evals now run through `uv run llama-tune lm-eval` or `uv run llama-tune suite`, with eval settings stored in YAML when possible.
+6. **Workflow status:** one-off shell scripts were retired. Quality evals now run through `uv run llm-refinery lm-eval` or `uv run llm-refinery suite`, with eval settings stored in YAML when possible.
 
 Reasoning/thinking-disabled settings:
 
 | Runtime | Required setting |
 |---|---|
 | llama.cpp | `--reasoning off` |
-| Ollama OpenAI-compatible API | `--gen-kwargs 'reasoning_effort="none"'` for `llama-tune lm-eval`, or JSON field `"reasoning_effort": "none"` |
+| Ollama OpenAI-compatible API | `--gen-kwargs 'reasoning_effort="none"'` for `llm-refinery lm-eval`, or JSON field `"reasoning_effort": "none"` |
 | MLX `mlx_lm.server` | `--chat-template-args '{"enable_thinking":false}'` |
 | Qwen llama.cpp | `--reasoning off --reasoning-format deepseek` |
 | Gemma lm-eval stop token | `<turn|>` |
 | Qwen lm-eval stop token | `<|im_end|>` |
 
-Without those fixes, the model often emits reasoning text and little/no final `content`, which makes the scores invalid. For Qwen3.6, visible empty `<think></think>` prefixes mean the server was probably launched with the wrong reasoning format; `llama-tune suite` now fails preflight if reasoning tags appear in `content`.
+Without those fixes, the model often emits reasoning text and little/no final `content`, which makes the scores invalid. For Qwen3.6, visible empty `<think></think>` prefixes mean the server was probably launched with the wrong reasoning format; `llm-refinery suite` now fails preflight if reasoning tags appear in `content`.
 
 ## Contamination caveat
 
@@ -311,11 +311,11 @@ MLX prefill tuning:
 One-off shell scripts have been retired. Use Python/YAML workflow commands instead:
 
 ```bash
-uv run llama-tune lm-eval llama_cpp 50 \
+uv run llm-refinery lm-eval llama_cpp 50 \
   --eos-string '<turn|>' \
   --max-length 8192
 
-uv run llama-tune suite sweeps/qwen36-35b-llama-sweep.yaml \
+uv run llm-refinery suite sweeps/qwen36-35b-llama-sweep.yaml \
   --http-load-config sweeps/qwen36-http-load.yaml \
   --target llama-qwen36-35b-a3b-ud-iq4-nl
 ```
@@ -383,13 +383,13 @@ Terminal 1:
 
 ```bash
 kill $(lsof -tiTCP:8080 -sTCP:LISTEN) 2>/dev/null || true
-uv run llama-tune server sweeps/qwen36-35b-llama-sweep.yaml --index 0
+uv run llm-refinery server sweeps/qwen36-35b-llama-sweep.yaml --index 0
 ```
 
 Terminal 2:
 
 ```bash
-uv run llama-tune suite sweeps/qwen36-35b-llama-sweep.yaml \
+uv run llm-refinery suite sweeps/qwen36-35b-llama-sweep.yaml \
   --http-load-config sweeps/qwen36-http-load.yaml \
   --target llama-qwen36-35b-a3b-ud-iq4-nl
 ```
@@ -400,13 +400,13 @@ Terminal 1:
 
 ```bash
 kill $(lsof -tiTCP:8080 -sTCP:LISTEN) 2>/dev/null || true
-uv run llama-tune server sweeps/qwen3-coder-30b-llama-sweep.yaml --index 0
+uv run llm-refinery server sweeps/qwen3-coder-30b-llama-sweep.yaml --index 0
 ```
 
 Terminal 2:
 
 ```bash
-uv run llama-tune suite sweeps/qwen3-coder-30b-llama-sweep.yaml \
+uv run llm-refinery suite sweeps/qwen3-coder-30b-llama-sweep.yaml \
   --http-load-config sweeps/qwen3-coder-http-load.yaml \
   --target llama-qwen3-coder-30b-a3b-q4km
 ```
@@ -414,7 +414,7 @@ uv run llama-tune suite sweeps/qwen3-coder-30b-llama-sweep.yaml \
 ### Ollama Gemma 4 12B Q8 quality eval
 
 ```bash
-uv run llama-tune lm-eval ollama 50 \
+uv run llm-refinery lm-eval ollama 50 \
   --model 'hf.co/ggml-org/gemma-4-12B-it-GGUF:Q8_0' \
   --gen-kwargs 'reasoning_effort="none"' \
   --max-length 8192

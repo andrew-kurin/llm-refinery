@@ -3,8 +3,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from llama_tune.config import ModelSpec, TuneConfig
-from llama_tune.workflows.suite import BenchmarkSuiteWorkflow
+from llm_refinery.config import ModelSpec, TuneConfig
+from llm_refinery.workflows.suite import BenchmarkSuiteWorkflow
 
 
 def _minimal_tune_config(tmp_path: Path) -> TuneConfig:
@@ -46,7 +46,7 @@ def test_suite_http_load_without_target_runs_all_targets(tmp_path, monkeypatch):
         calls.append(cmd)
         return subprocess.CompletedProcess(cmd, 0)
 
-    monkeypatch.setattr("llama_tune.workflows.suite.subprocess.run", fake_run)
+    monkeypatch.setattr("llm_refinery.workflows.suite.subprocess.run", fake_run)
 
     workflow = BenchmarkSuiteWorkflow(
         config=_minimal_tune_config(tmp_path),
@@ -58,9 +58,9 @@ def test_suite_http_load_without_target_runs_all_targets(tmp_path, monkeypatch):
     workflow.run_load()
 
     assert len(calls) == 2
-    assert calls[0][:4] == ["uv", "run", "llama-tune", "http-load"]
+    assert calls[0][:4] == ["uv", "run", "llm-refinery", "http-load"]
     assert "--target" not in calls[0]
-    assert calls[1][:4] == ["uv", "run", "llama-tune", "compare"]
+    assert calls[1][:4] == ["uv", "run", "llm-refinery", "compare"]
     assert "--suite" in calls[1]
     assert calls[1][calls[1].index("--suite") + 1] == "http-suite"
     assert calls[1][4] == str(tmp_path / "http.duckdb")
@@ -73,7 +73,7 @@ def test_suite_http_load_with_target_passes_target(tmp_path, monkeypatch):
         calls.append(cmd)
         return subprocess.CompletedProcess(cmd, 0)
 
-    monkeypatch.setattr("llama_tune.workflows.suite.subprocess.run", fake_run)
+    monkeypatch.setattr("llm_refinery.workflows.suite.subprocess.run", fake_run)
 
     workflow = BenchmarkSuiteWorkflow(
         config=_minimal_tune_config(tmp_path),
@@ -96,7 +96,7 @@ def test_suite_quality_sets_eval_config(tmp_path, monkeypatch):
         captured["config"] = config
         captured["dry_run"] = dry_run
 
-    monkeypatch.setattr("llama_tune.workflows.suite.run_lm_eval", fake_run_lm_eval)
+    monkeypatch.setattr("llm_refinery.workflows.suite.run_lm_eval", fake_run_lm_eval)
 
     workflow = BenchmarkSuiteWorkflow(
         config=_minimal_tune_config(tmp_path),

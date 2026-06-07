@@ -68,7 +68,7 @@ wheels = [
 ]
 
 [[package]]
-name = "llama-cpp-tune"
+name = "llm-refinery"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

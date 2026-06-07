@@ -3,7 +3,7 @@ from __future__ import annotations
 import shlex
 from typing import Any
 
-from llama_tune.config import Trial, TuneConfig
+from llm_refinery.config import Trial, TuneConfig
 
 # Explicit aliases for common llama.cpp flags. Unknown keys fall back to --kebab-case.
 FLAG_ALIASES = {

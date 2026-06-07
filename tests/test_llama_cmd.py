@@ -1,5 +1,5 @@
-from llama_tune.config import TuneConfig, expand_trials
-from llama_tune.llama_cmd import build_bench_command, build_server_command, shell_join
+from llm_refinery.config import TuneConfig, expand_trials
+from llm_refinery.llama_cmd import build_bench_command, build_server_command, shell_join
 
 
 def test_build_bench_command_uses_unified_llama_cli_and_flags():

@@ -1,9 +1,9 @@
 name: gemma-http-load-ollama-compare
 
-database: results/llama_tune.duckdb
+database: results/llm_refinery.duckdb
 
 # Start the llama.cpp server in another terminal first, for example:
-#   uv run llama-tune server sweeps/gemma-f16-kv-batch-neighborhood.yaml --index 0
+#   uv run llm-refinery server sweeps/gemma-f16-kv-batch-neighborhood.yaml --index 0
 #
 # Also ensure Ollama is running and the model name below exists:
 #   ollama serve

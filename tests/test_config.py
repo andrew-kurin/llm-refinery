@@ -1,4 +1,4 @@
-from llama_tune.config import TuneConfig, expand_trials
+from llm_refinery.config import TuneConfig, expand_trials
 
 
 def test_expand_trials_cartesian_product():

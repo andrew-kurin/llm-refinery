@@ -1,6 +1,6 @@
 name: gemma4-31b-qat-http-load
 
-database: results/llama_tune.duckdb
+database: results/llm_refinery.duckdb
 
 targets:
   - name: llama-gemma4-31b-qat-q4_0

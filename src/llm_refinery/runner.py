@@ -9,10 +9,10 @@ from pathlib import Path
 from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TaskID, TextColumn
 
-from llama_tune.bench_parser import parse_llama_bench_metrics
-from llama_tune.config import Trial, TuneConfig, expand_trials
-from llama_tune.llama_cmd import build_bench_command, build_server_command, shell_join
-from llama_tune.storage import ResultStore, RunRecord, utc_now
+from llm_refinery.bench_parser import parse_llama_bench_metrics
+from llm_refinery.config import Trial, TuneConfig, expand_trials
+from llm_refinery.llama_cmd import build_bench_command, build_server_command, shell_join
+from llm_refinery.storage import ResultStore, RunRecord, utc_now
 
 PROGRESS_INTERVAL_S = 0.5
 TRIAL_DESCRIPTION_WIDTH = 72

@@ -6,11 +6,11 @@ from urllib.parse import urlparse
 
 from rich.console import Console
 
-from llama_tune.config import TuneConfig
-from llama_tune.http_load import load_http_load_config
-from llama_tune.lm_eval import LmEvalConfig, LmEvalTarget, run_lm_eval
-from llama_tune.utils.sanity import run_api_sanity_check
-from llama_tune.utils.system import get_system_snapshot, is_port_listening
+from llm_refinery.config import TuneConfig
+from llm_refinery.http_load import load_http_load_config
+from llm_refinery.lm_eval import LmEvalConfig, LmEvalTarget, run_lm_eval
+from llm_refinery.utils.sanity import run_api_sanity_check
+from llm_refinery.utils.system import get_system_snapshot, is_port_listening
 
 console = Console()
 
@@ -120,7 +120,7 @@ class BenchmarkSuiteWorkflow:
         http_config = load_http_load_config(self.http_load_config)
         self._log(f"Running HTTP load (target={self.target_name or 'all'})")
 
-        cmd = ["uv", "run", "llama-tune", "http-load", str(self.http_load_config)]
+        cmd = ["uv", "run", "llm-refinery", "http-load", str(self.http_load_config)]
         if self.target_name:
             cmd.extend(["--target", self.target_name])
 
@@ -133,7 +133,7 @@ class BenchmarkSuiteWorkflow:
         compare_cmd = [
             "uv",
             "run",
-            "llama-tune",
+            "llm-refinery",
             "compare",
             str(http_config.database),
             "--suite",

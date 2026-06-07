@@ -1,6 +1,6 @@
 name: qwen-suite
 
-database: results/llama_tune.duckdb
+database: results/llm_refinery.duckdb
 
 models:
   - name: local-qwen

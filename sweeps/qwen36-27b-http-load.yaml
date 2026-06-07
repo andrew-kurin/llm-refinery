@@ -1,6 +1,6 @@
 name: qwen36-27b-http-load
 
-database: results/llama_tune.duckdb
+database: results/llm_refinery.duckdb
 
 targets:
   - name: llama-qwen36-27b-iq4-nl

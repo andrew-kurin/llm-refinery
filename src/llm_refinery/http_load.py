@@ -13,8 +13,8 @@ from typing import Any
 
 import yaml
 
-from llama_tune.config import ConfigError, coerce_list, stable_hash
-from llama_tune.storage import ResultStore, RunRecord, utc_now
+from llm_refinery.config import ConfigError, coerce_list, stable_hash
+from llm_refinery.storage import ResultStore, RunRecord, utc_now
 
 PROVIDERS = {"openai", "ollama"}
 PERCENTILES = (50, 90, 95, 99)
@@ -174,7 +174,7 @@ class HttpLoadConfig:
         base_dir = source_path.parent if source_path else Path.cwd()
         return cls(
             name=name,
-            database=Path(str(raw.get("database") or "results/llama_tune.duckdb")),
+            database=Path(str(raw.get("database") or "results/llm_refinery.duckdb")),
             targets=[HttpTarget.from_mapping(dict(item)) for item in targets_raw],
             scenarios=[
                 HttpScenario.from_mapping(dict(item), base_dir=base_dir) for item in scenarios_raw

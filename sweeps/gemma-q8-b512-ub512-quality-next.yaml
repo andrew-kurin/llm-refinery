@@ -1,6 +1,6 @@
 name: gemma-q8-b512-ub512-quality-next
 
-database: results/llama_tune.duckdb
+database: results/llm_refinery.duckdb
 
 commands:
   bench: ["llama", "bench"]

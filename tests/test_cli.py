@@ -1,14 +1,14 @@
 from click.testing import CliRunner
 
-from llama_tune.cli import main
-from llama_tune.storage import ResultStore, RunRecord, utc_now
+from llm_refinery.cli import main
+from llm_refinery.storage import ResultStore, RunRecord, utc_now
 
 
 def test_click_version():
     result = CliRunner().invoke(main, ["--version"])
 
     assert result.exit_code == 0
-    assert "llama-tune" in result.output
+    assert "llm-refinery" in result.output
     assert "0.1.0" in result.output
 
 

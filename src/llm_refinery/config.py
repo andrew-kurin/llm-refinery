@@ -129,7 +129,7 @@ class TuneConfig:
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any], source_path: Path | None = None) -> TuneConfig:
-        name = str(raw.get("name") or (source_path.stem if source_path else "llama-tune"))
+        name = str(raw.get("name") or (source_path.stem if source_path else "llm-refinery"))
         commands = raw.get("commands") or {}
         models_raw = raw.get("models") or []
         if not models_raw:
@@ -137,7 +137,7 @@ class TuneConfig:
 
         return cls(
             name=name,
-            database=Path(str(raw.get("database") or "results/llama_tune.duckdb")),
+            database=Path(str(raw.get("database") or "results/llm_refinery.duckdb")),
             commands={
                 "bench": coerce_command(commands.get("bench") or ["llama", "bench"]),
                 "server": coerce_command(commands.get("server") or ["llama", "server"]),
