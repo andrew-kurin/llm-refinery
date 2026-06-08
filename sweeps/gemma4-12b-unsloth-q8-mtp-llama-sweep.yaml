@@ -40,8 +40,9 @@ server:
     parallel: 1
     perf: true
     fit: "off"
-    cache_ram: 0
-    ctx_checkpoints: 0
+    cache_ram: 8192
+    ctx_checkpoints: 32
+    checkpoint_min_step: 256
     spec_type: draft-mtp
     spec_draft_n_max: 2
     spec_draft_ngl: all
