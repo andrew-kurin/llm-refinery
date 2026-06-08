@@ -15,6 +15,32 @@ Current practical conclusions:
 5. **Qwen status:** corrected Qwen3.6 35B-A3B `UD-IQ4_NL` is a strong non-Gemma candidate: IFEval 0.8800/0.9211, GSM8K 0.8800/0.9000, HTTP coding ~18.5 tok/s, and good long-context TTFT. Qwen3-Coder 30B-A3B `Q4_K_M` is faster and stronger on GSM8K (0.9200), but trails on IFEval (0.8600/0.8947). Both are interesting; Gemma 4 26B `UD-Q4_K_XL` remains the safer 32 GB daily default. Qwen3.6 27B `IQ4_NL` is dense and rejected for daily use: lm-eval took ~147m and HTTP coding speed was only ~3.2 tok/s.
 6. **Workflow status:** one-off shell scripts were retired. Quality evals now run through `uv run llm-refinery lm-eval` or `uv run llm-refinery suite`, with eval settings stored in YAML when possible.
 
+## Recommended non-rejected shortlist
+
+All quality scores are limited `limit=50` runs. Speed is coding-assistant HTTP load when available.
+
+| Model | Quality | Speed | Memory | Use when |
+|---|---:|---:|---|---|
+| Gemma 4 26B Unsloth `UD-Q4_K_XL` llama.cpp | GSM8K 0.820/0.820; IFEval 0.880/0.908 | ~21 tok/s coding; p95 7.8s; TTFT 0.73s | Acceptable on 32 GB; RSS ~14-17 GB in long sessions | Best daily default: balanced quality, latency, and prompt-cache behavior. |
+| Qwen3.6 35B-A3B `UD-IQ4_NL` llama.cpp | GSM8K 0.880/0.900; IFEval 0.880/0.921 | ~18.5 tok/s coding; p95 9.6s; TTFT 0.99s | Swap-heavy on 32 GB | Strong non-Gemma quality candidate; better suited to the 128 GB Mac. |
+| Qwen3-Coder 30B-A3B `Q4_K_M` llama.cpp | GSM8K 0.920/0.920; IFEval 0.860/0.895 | ~20.7 tok/s coding; p95 11.4s; TTFT 0.14s | Fits similarly to other 30B-class MoEs | Math/coding-focused tasks where strict instruction following matters slightly less. |
+| Ollama Gemma 4 12B Q8 | GSM8K 0.880/0.880; IFEval 0.920/0.947 | ~7.2 tok/s coding token check; TTFT 1.32s | Compact/easy Ollama path | Best 12B instruction follower and lightweight fallback. |
+| MLX Gemma 4 26B OptiQ | GSM8K 0.800/0.820; IFEval 0.880/0.921 | ~20.9 tok/s coding; p95 7.9s; TTFT 0.31s | Comfortable | MLX workflows and short/coding prompts; avoid long-context due poor TTFT. |
+| Gemma 4 31B Google QAT `Q4_0` llama.cpp | GSM8K 0.960/0.960; IFEval 0.900/0.934 | ~3.6 tok/s coding; p95 46s; TTFT 4.8s | Tight on 32 GB | Highest math/quality fallback when latency does not matter. |
+| Gemma 4 12B Unsloth QAT `UD-Q4_K_XL` llama.cpp | GSM8K 0.880/0.920; IFEval 0.840/0.895 | ~8.8 tok/s coding; p95 24.4s; TTFT 2.48s | Very comfortable; RSS ~9.2 GB after eval + HTTP load | Compact llama.cpp math-oriented fallback. |
+| Gemma 4 12B Google QAT `Q4_0` llama.cpp | GSM8K 0.860/0.860; IFEval 0.860/0.895 | ~12.5 tok/s observed; HTTP TBD | Very comfortable | Compact llama.cpp fallback if footprint matters. |
+
+Practical ordering:
+
+```text
+Daily default:          Gemma 4 26B Unsloth UD-Q4_K_XL
+Best 12B fallback:      Ollama Gemma 4 12B Q8
+Best math quality:      Gemma 4 31B QAT Q4_0
+Best non-Gemma quality: Qwen3.6 35B-A3B UD-IQ4_NL
+Best coding/math MoE:   Qwen3-Coder 30B-A3B Q4_K_M
+Best MLX option:        Gemma 4 26B OptiQ
+```
+
 Reasoning/thinking-disabled settings:
 
 | Runtime | Required setting |
