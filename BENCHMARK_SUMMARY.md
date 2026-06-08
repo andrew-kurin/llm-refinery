@@ -271,10 +271,11 @@ After upgrading the local `llama` binary to GitHub release `b9553`, Gemma 4 MTP 
 
 | Config | Predicted tokens | Draft tokens | Accepted draft tokens | Accept rate | Weighted decode tok/s | Wall tok/s | Verdict |
 |---|---:|---:|---:|---:|---:|---:|---|
-| `--spec-draft-n-max 3`, f16/f16 KV | 765 | 1028 | 417 | 0.406 | 3.32 | 3.07 | Moderate acceptance; not enough speedup. |
-| `--spec-draft-n-max 2`, q8_0/q8_0 KV | 1309 | 1318 | 645 | 0.489 | 3.45 | 3.21 | Better acceptance; still near non-MTP speed. |
+| `--spec-draft-n-max 3`, f16/f16 KV, Q8 MTP head | 765 | 1028 | 417 | 0.406 | 3.32 | 3.07 | Moderate acceptance; not enough speedup. |
+| `--spec-draft-n-max 2`, q8_0/q8_0 KV, Q8 MTP head | 1309 | 1318 | 645 | 0.489 | 3.45 | 3.21 | Better acceptance; still near non-MTP speed. |
+| `--spec-draft-n-max 2`, q8_0/q8_0 KV, F16 MTP head | 1309 | 1322 | 643 | 0.486 | 3.35 | 3.10 | No improvement over Q8 head; slightly slower in this run. |
 
-MTP is functional on this build, and q8_0 KV does not collapse acceptance to zero, but 31B QAT remains around the old non-MTP speed range on the 32 GB M4. `n_max=2` looks better than `n_max=3`; `n_max=4` is only worth testing for completeness.
+MTP is functional on this build, and q8_0 KV does not collapse acceptance to zero, but 31B QAT remains around the old non-MTP speed range on the 32 GB M4. `n_max=2` looks better than `n_max=3`; the F16 MTP head did not improve acceptance or speed over the Q8 MTP head. `n_max=4` and `p_min` sweeps are only worth testing for completeness.
 
 Interpretation:
 
@@ -283,7 +284,7 @@ Interpretation:
 - Unsloth 26B `UD-Q4_K_XL` is slightly slower in completion tok/s than some 26B baselines, but coding latency is excellent because it produces concise successful answers; long-context TTFT is also excellent.
 - 26B QAT Q4_0 has a good latency profile and excellent prompt-cache behavior, but its limited-eval instruction-following score is worse than the older 26B `Q4_K_M`.
 - 31B QAT Q4_0 is quality-strong but **too slow for the daily coding-agent default** at ~3.5 completion tok/s and ~4.8s TTFT on short/coding prompts.
-- Gemma 4 MTP works with the 31B QAT target on `b9553`, but on the current M4 it has not produced a meaningful practical speedup; `n_max=2` q8_0/q8_0 KV reached ~0.49 draft acceptance and ~3.45 weighted decode tok/s.
+- Gemma 4 MTP works with the 31B QAT target on `b9553`, but on the current M4 it has not produced a meaningful practical speedup; `n_max=2` q8_0/q8_0 KV reached ~0.49 draft acceptance and ~3.45 weighted decode tok/s with the Q8 MTP head. The F16 MTP head was not better.
 - It is useful as a high-quality local fallback when latency is less important.
 - MLX 26B became viable after disabling thinking and passed coding/long-context checks.
 - MLX 26B has a **large long-context TTFT penalty**: ~20–25s vs sub-second for llama.cpp/Ollama.
