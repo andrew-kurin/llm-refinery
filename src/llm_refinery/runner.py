@@ -9,9 +9,15 @@ from pathlib import Path
 from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TaskID, TextColumn
 
+from llm_refinery.assets import ensure_mtp_head
 from llm_refinery.bench_parser import parse_llama_bench_metrics
 from llm_refinery.config import Trial, TuneConfig, expand_trials
-from llm_refinery.llama_cmd import build_bench_command, build_server_command, shell_join
+from llm_refinery.llama_cmd import (
+    build_bench_command,
+    build_server_command,
+    effective_params,
+    shell_join,
+)
 from llm_refinery.storage import ResultStore, RunRecord, utc_now
 
 PROGRESS_INTERVAL_S = 0.5
@@ -193,10 +199,21 @@ def launch_server(config: TuneConfig, *, index: int = 0, dry_run: bool = False) 
     if dry_run:
         return 0
 
+    prepare_server_assets(config, trial)
+
     env = os.environ.copy()
     env.update(config.server.env)
     completed = subprocess.run(cmd, env=env, check=False)  # noqa: S603 - command is user config
     return completed.returncode
+
+
+def prepare_server_assets(config: TuneConfig, trial: Trial) -> None:
+    params = effective_params(trial.params, config.server.params, config.server.omit_params)
+    mtp_head = params.get("mtp_head")
+    if mtp_head is None:
+        return
+    spec = ensure_mtp_head(mtp_head)
+    print(f"MTP head ready: {spec.path}")
 
 
 def _run_one_bench(

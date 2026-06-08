@@ -129,6 +129,19 @@ Important notes:
 - `bench.omit_params` / `server.omit_params` remove shared flags for one command type.
 - Snake-case keys become llama.cpp kebab-case flags. Example: `ctx_size` -> `--ctx-size`.
 - Boolean `true` values become flags. Boolean `false` values are omitted.
+- Server params support an `mtp_head` helper for Gemma/Qwen MTP draft heads. It expands to `--model-draft <path>` and, in `llm-refinery server`, auto-downloads when `hf` + `file` or `url` is provided:
+
+  ```yaml
+  server:
+    params:
+      spec_type: draft-mtp
+      spec_draft_n_max: 2
+      mtp_head:
+        hf: unsloth/gemma-4-12B-it-GGUF
+        file: MTP/gemma-4-12B-it-MTP-Q8_0.gguf
+  ```
+
+  The default download location is `~/.local/share/llm-refinery/mtp/<filename>`. Set `path:` to override it.
 
 ## Suggested workflow
 

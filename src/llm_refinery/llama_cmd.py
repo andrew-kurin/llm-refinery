@@ -3,6 +3,7 @@ from __future__ import annotations
 import shlex
 from typing import Any
 
+from llm_refinery.assets import resolve_mtp_head
 from llm_refinery.config import Trial, TuneConfig
 
 # Explicit aliases for common llama.cpp flags. Unknown keys fall back to --kebab-case.
@@ -25,6 +26,7 @@ FLAG_ALIASES = {
     "mlock": "--mlock",
     "no_mmap": "--no-mmap",
     "perf": "--perf",
+    "model_draft": "--model-draft",
 }
 
 
@@ -80,6 +82,10 @@ def params_args(params: dict[str, Any]) -> list[str]:
     args: list[str] = []
     for key, value in params.items():
         if key.startswith("_") or value is None:
+            continue
+
+        if key == "mtp_head":
+            args.extend(["--model-draft", str(resolve_mtp_head(value).path)])
             continue
 
         flag = flag_for_key(key)

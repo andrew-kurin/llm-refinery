@@ -61,6 +61,34 @@ def test_build_server_command_omits_bench_dimensions():
     assert shell_join(cmd) == "llama server -m /models/model.gguf --ctx-size 4096 --host 127.0.0.1"
 
 
+def test_build_server_command_resolves_mtp_head(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config = TuneConfig.from_mapping(
+        {
+            "name": "suite",
+            "models": [{"name": "m", "hf": "repo/model"}],
+            "server": {
+                "params": {
+                    "spec_type": "draft-mtp",
+                    "mtp_head": {
+                        "hf": "org/draft-repo",
+                        "file": "MTP/head-Q8_0.gguf",
+                    },
+                }
+            },
+        }
+    )
+    trial = expand_trials(config, include_bench_dimensions=False)[0]
+
+    cmd = build_server_command(config, trial)
+
+    assert "--model-draft" in cmd
+    draft_path = cmd[cmd.index("--model-draft") + 1]
+    assert draft_path == str(tmp_path / ".local/share/llm-refinery/mtp/head-Q8_0.gguf")
+    assert "--spec-type" in cmd
+    assert "draft-mtp" in cmd
+
+
 def test_build_server_command_uses_llama_hf_file_short_flag():
     config = TuneConfig.from_mapping(
         {
