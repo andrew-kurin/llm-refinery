@@ -8,7 +8,7 @@ This file summarizes local serving experiments so far across llama.cpp, Ollama, 
 
 Current practical conclusions:
 
-1. **Best math/limited-eval score so far:** llama.cpp Gemma 4 31B QAT `Q4_0` hits GSM8K 0.9600/0.9600, but it is slow and memory-tight. **Best instruction-following score so far:** Ollama `hf.co/ggml-org/gemma-4-12B-it-GGUF:Q8_0`. New llama.cpp Unsloth Gemma 4 12B `UD-Q4_K_XL` is quality-strong (IFEval 0.8800/0.9211) but too slow for daily coding-agent use on the 32 GB Mac; the Unsloth 12B QAT `UD-Q4_K_XL` variant is much faster and stronger on GSM8K but lower on IFEval.
+1. **Best math/limited-eval score so far:** llama.cpp Gemma 4 31B QAT `Q4_0` hits GSM8K 0.9600/0.9600, but it is slow and memory-tight. **Best instruction-following score so far:** Ollama `hf.co/ggml-org/gemma-4-12B-it-GGUF:Q8_0`. New llama.cpp Unsloth Gemma 4 12B `UD-Q4_K_XL` is quality-strong (IFEval 0.8800/0.9211) but too slow for daily coding-agent use on the 32 GB Mac; the Unsloth 12B QAT `UD-Q4_K_XL` variant is much faster and stronger on GSM8K but lower on IFEval. Gemma 4 MTP works in `b9553`, but current full-suite MTP runs are not keepers on the M4.
 2. **Best llama.cpp 26B daily default candidate:** Unsloth Gemma 4 26B `UD-Q4_K_XL` with `q8_0/q8_0` KV, reasoning disabled, 8k context. It beats the older ggml-org `Q4_K_M` baseline on GSM8K and IFEval, and HTTP latency is practical.
 3. **Best MLX quality mode:** MLX Gemma 4 26B OptiQ with thinking disabled. It scores well and handles short/coding prompts well, but long-context TTFT is much worse than llama.cpp/Ollama because prompt cache reuse appears weak.
 4. **Most important eval fix:** disable thinking/reasoning and use the right model-specific stop token.
@@ -241,10 +241,21 @@ MTP was tested after upgrading the local `llama` binary to GitHub release `b9553
 
 | Test | Predicted tokens | Draft tokens | Accepted draft tokens | Accept rate | Weighted decode tok/s | Wall tok/s | Notes |
 |---|---:|---:|---:|---:|---:|---:|---|
-| 9-prompt acceptance suite | 1350 | 1142 | 772 | 0.676 | 12.48 | 11.72 | Good acceptance; substantially faster than non-MTP 12B QAT. |
+| 9-prompt acceptance suite | 1350 | 1142 | 772 | 0.676 | 12.48 | 11.72 | Short microbench only; promising but not representative of full suite. |
 | coding-assistant prompt x6 | 1260 | 996 | 762 | 0.765 | 10.63 | 10.05 | All 6 contained `def percentile`; mean latency 20.9s. |
 
-MTP looks more useful on 12B QAT than 31B QAT on the M4. The result is still not in the 26B daily-default speed class, but it improves the compact 12B llama.cpp fallback.
+Full suite result with the same MTP server and prompt cache/checkpoints disabled:
+
+| Metric | Result |
+|---|---:|
+| GSM8K strict/flex | 0.8800 / 0.9200 |
+| IFEval prompt/inst strict | 0.8400 / 0.8947 |
+| Eval time | 342.5m |
+| HTTP interactive | 4.051 tok/s, p95 33.004s, TTFT 2.856s |
+| HTTP coding | 5.543 tok/s, p95 39.426s, TTFT 2.990s, pass 1.000 |
+| HTTP long-context | 5.065 tok/s, p95 12.122s, TTFT 0.118s, pass 1.000 |
+
+MTP is functional and short prompts can show good draft acceptance, but this full-suite run was worse than non-MTP 12B QAT (`52.9m` eval, ~8.8 tok/s HTTP). The likely culprit is a combination of MTP overhead and running the suite with prompt cache/checkpoints disabled. MTP should remain experimental until rerun with prompt cache enabled and compared under the same suite.
 
 ### llama.cpp 26B Unsloth UD-Q4_K_XL, concurrency 1
 
@@ -291,7 +302,7 @@ MTP is functional on this build, and q8_0 KV does not collapse acceptance to zer
 Interpretation:
 
 - Unsloth 12B `UD-Q4_K_XL` is quality-strong but **too slow for daily coding-agent use** in llama.cpp on this machine: coding latency p95 ~52s and completion throughput ~4.2 tok/s, despite modest memory use.
-- Unsloth 12B QAT `UD-Q4_K_XL` roughly doubles non-QAT HTTP throughput and cuts lm-eval time by more than half, but it gives up instruction-following quality. With Gemma 4 MTP (`n_max=2`, q8_0 KV), decode improved to ~10-12.5 tok/s in microbenchmarks, making it a better compact llama.cpp fallback. It is still weaker on IFEval than Ollama 12B Q8.
+- Unsloth 12B QAT `UD-Q4_K_XL` roughly doubles non-QAT HTTP throughput and cuts lm-eval time by more than half, but it gives up instruction-following quality. Gemma 4 MTP (`n_max=2`, q8_0 KV) looked better in short microbenchmarks, but the full suite regressed badly when run with prompt cache/checkpoints disabled: eval took ~342.5m and HTTP coding throughput dropped to ~5.5 tok/s. Do not use MTP as the default until it passes a cache-enabled suite rerun.
 - Unsloth 26B `UD-Q4_K_XL` is slightly slower in completion tok/s than some 26B baselines, but coding latency is excellent because it produces concise successful answers; long-context TTFT is also excellent.
 - 26B QAT Q4_0 has a good latency profile and excellent prompt-cache behavior, but its limited-eval instruction-following score is worse than the older 26B `Q4_K_M`.
 - 31B QAT Q4_0 is quality-strong but **too slow for the daily coding-agent default** at ~3.5 completion tok/s and ~4.8s TTFT on short/coding prompts.
