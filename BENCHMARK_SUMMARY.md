@@ -310,6 +310,25 @@ Activity Monitor “App Memory” can understate Metal/unified-memory allocation
 | llama.cpp Qwen3-Coder 30B-A3B `Q4_K_M` + q8 KV + 8k ctx | Fits similarly to other 30B-class MoEs. Swap was already high before the run (~3.88 GB) and ended around ~4.18 GB after eval + HTTP load. Less swap growth than Qwen3.6 35B-A3B in this session. |
 | llama.cpp Qwen3.6 27B `IQ4_NL` + q8 KV + 8k ctx | Fits but not comfortable after a long eval. Swap was ~3.6 GB before and ~5.9 GB after; generation speed was too slow to justify the footprint. |
 
+## Local cache cleanup
+
+After 12B triage, rejected/soft-rejected local 12B caches were removed to save disk:
+
+- Deleted HF caches: `mlx-community/gemma-4-12B-it-8bit`, `unsloth/gemma-4-12B-it-GGUF`.
+- Already absent locally: `mlx-community/gemma-4-12B-it-4bit`, `ggml-org/gemma-4-12B-it-GGUF` HF cache.
+- Ollama already had only the kept `hf.co/ggml-org/gemma-4-12B-it-GGUF:Q8_0` model installed.
+- Kept HF cache: `unsloth/gemma-4-12B-it-qat-GGUF`.
+
+Current HF model cache after cleanup:
+
+```text
+6.4G  models--unsloth--gemma-4-12B-it-qat-GGUF
+17G   models--lmstudio-community--Qwen3-Coder-30B-A3B-Instruct-GGUF
+17G   models--unsloth--gemma-4-26B-A4B-it-GGUF
+18G   models--google--gemma-4-31B-it-qat-q4_0-gguf
+18G   models--unsloth--Qwen3.6-35B-A3B-GGUF
+```
+
 ## Runtime tuning findings
 
 Best llama.cpp runtime defaults found from `llama bench` and sweeps:
