@@ -265,6 +265,17 @@ Dedicated HTTP load was run with `sweeps/gemma4-31b-qat-http-load.yaml` against 
 | coding-assistant | 46.212s | 4.828s | 3.583 | 1.000 | 0 |
 | long-context-recall | 11.320s | 0.315s | 3.496 | 1.000 | 0 |
 
+### llama.cpp 31B QAT Q4_0 + Gemma 4 MTP head
+
+After upgrading the local `llama` binary to GitHub release `b9553`, Gemma 4 MTP loaded successfully with `google/gemma-4-31B-it-qat-q4_0-gguf` plus `unsloth/gemma-4-31B-it-GGUF` / `MTP/gemma-4-31B-it-MTP-Q8_0.gguf`. The tested server used q8_0/q8_0 target KV, q8_0/q8_0 draft KV, ctx 8192, reasoning off, no mmproj, and `--spec-type draft-mtp`.
+
+| Config | Predicted tokens | Draft tokens | Accepted draft tokens | Accept rate | Weighted decode tok/s | Wall tok/s | Verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `--spec-draft-n-max 3`, f16/f16 KV | 765 | 1028 | 417 | 0.406 | 3.32 | 3.07 | Moderate acceptance; not enough speedup. |
+| `--spec-draft-n-max 2`, q8_0/q8_0 KV | 1309 | 1318 | 645 | 0.489 | 3.45 | 3.21 | Better acceptance; still near non-MTP speed. |
+
+MTP is functional on this build, and q8_0 KV does not collapse acceptance to zero, but 31B QAT remains around the old non-MTP speed range on the 32 GB M4. `n_max=2` looks better than `n_max=3`; `n_max=4` is only worth testing for completeness.
+
 Interpretation:
 
 - Unsloth 12B `UD-Q4_K_XL` is quality-strong but **too slow for daily coding-agent use** in llama.cpp on this machine: coding latency p95 ~52s and completion throughput ~4.2 tok/s, despite modest memory use.
@@ -272,6 +283,7 @@ Interpretation:
 - Unsloth 26B `UD-Q4_K_XL` is slightly slower in completion tok/s than some 26B baselines, but coding latency is excellent because it produces concise successful answers; long-context TTFT is also excellent.
 - 26B QAT Q4_0 has a good latency profile and excellent prompt-cache behavior, but its limited-eval instruction-following score is worse than the older 26B `Q4_K_M`.
 - 31B QAT Q4_0 is quality-strong but **too slow for the daily coding-agent default** at ~3.5 completion tok/s and ~4.8s TTFT on short/coding prompts.
+- Gemma 4 MTP works with the 31B QAT target on `b9553`, but on the current M4 it has not produced a meaningful practical speedup; `n_max=2` q8_0/q8_0 KV reached ~0.49 draft acceptance and ~3.45 weighted decode tok/s.
 - It is useful as a high-quality local fallback when latency is less important.
 - MLX 26B became viable after disabling thinking and passed coding/long-context checks.
 - MLX 26B has a **large long-context TTFT penalty**: ~20–25s vs sub-second for llama.cpp/Ollama.
@@ -332,6 +344,7 @@ Activity Monitor “App Memory” can understate Metal/unified-memory allocation
 | Ollama 26B QAT `Q4_0` LM Studio mirror | Yellow pressure near end of eval. Ollama backend used 32k ctx + mmproj; ~29.9 / 32 GB used, ~18.5 GB wired, ~7.3 GB compressed, ~5.7 GB swap. |
 | MLX 26B QAT `mxfp4` | Green and comfortable during eval; ~21.6 / 32 GB used, ~15.7 GB wired, ~0.2 GB compressed, ~4.7 GB swap. |
 | llama.cpp 31B Google QAT `Q4_0` + q8 KV + 8k ctx | Fits, but tight. During/after eval: green pressure, ~30 / 32 GB used, ~20.5 GB wired, ~3 GB compressed, ~3.3 GB swap. Not ideal as an always-on default. |
+| llama.cpp 31B Google QAT `Q4_0` + MTP Q8 head + q8 KV + 8k ctx | Fits, but very tight. Activity Monitor showed green pressure but ~30.1 / 32 GB used, ~20.8 GB wired, ~4.3 GB compressed, ~1.6 GB swap. Per-process “App Memory” showed llama at only ~1.65 GB, so watch system wired/compressed/swap rather than process RSS for Metal allocations. |
 | llama.cpp Qwen3.6 35B-A3B `UD-IQ4_NL` + q8 KV + 8k ctx | Fits but swap-heavy on the 32 GB Mac. Corrected eval + HTTP load ended at ~6.65 GB swap used with only ~0.52 GB free swap. Strong quality, but not ideal as an always-on default. |
 | llama.cpp Qwen3-Coder 30B-A3B `Q4_K_M` + q8 KV + 8k ctx | Fits similarly to other 30B-class MoEs. Swap was already high before the run (~3.88 GB) and ended around ~4.18 GB after eval + HTTP load. Less swap growth than Qwen3.6 35B-A3B in this session. |
 | llama.cpp Qwen3.6 27B `IQ4_NL` + q8 KV + 8k ctx | Fits but not comfortable after a long eval. Swap was ~3.6 GB before and ~5.9 GB after; generation speed was too slow to justify the footprint. |
