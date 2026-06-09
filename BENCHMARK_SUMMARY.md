@@ -8,7 +8,7 @@ This file summarizes local serving experiments so far across llama.cpp, Ollama, 
 
 Current practical conclusions:
 
-1. **Best math/limited-eval score so far:** llama.cpp Gemma 4 31B QAT `Q4_0` hits GSM8K 0.9600/0.9600, but it is slow and memory-tight. **Best instruction-following score so far:** Ollama `hf.co/ggml-org/gemma-4-12B-it-GGUF:Q8_0`. New llama.cpp Unsloth Gemma 4 12B `UD-Q4_K_XL` is quality-strong (IFEval 0.8800/0.9211) but too slow for daily coding-agent use on the 32 GB Mac; the Unsloth 12B QAT `UD-Q4_K_XL` variant is much faster and stronger on GSM8K but lower on IFEval. Gemma 4 MTP works in `b9553`, but current full-suite MTP runs are not keepers on the M4.
+1. **Best math/limited-eval score so far:** llama.cpp Gemma 4 31B QAT `Q4_0` hits GSM8K 0.9600/0.9600, but it is slow and memory-tight. **Best instruction-following score so far:** Ollama `hf.co/ggml-org/gemma-4-12B-it-GGUF:Q8_0`. New llama.cpp Unsloth Gemma 4 12B `UD-Q4_K_XL` is quality-strong (IFEval 0.8800/0.9211) but too slow for daily coding-agent use on the 32 GB Mac; the Unsloth 12B QAT `UD-Q4_K_XL` variant is much faster and stronger on GSM8K but lower on IFEval. Gemma 4 MTP works in `b9553`, but current full-suite MTP runs are not keepers on the M4: 12B QAT MTP regressed badly with cache disabled, and 12B Q8 MTP with cache enabled is only roughly comparable to non-MTP 12B options while using more memory/swap.
 2. **Best llama.cpp 26B daily default candidate:** Unsloth Gemma 4 26B `UD-Q4_K_XL` with `q8_0/q8_0` KV, reasoning disabled, 8k context. It beats the older ggml-org `Q4_K_M` baseline on GSM8K and IFEval, and HTTP latency is practical.
 3. **Best MLX quality mode:** MLX Gemma 4 26B OptiQ with thinking disabled. It scores well and handles short/coding prompts well, but long-context TTFT is much worse than llama.cpp/Ollama because prompt cache reuse appears weak.
 4. **Most important eval fix:** disable thinking/reasoning and use the right model-specific stop token.
@@ -114,6 +114,7 @@ All rows below are `limit=50`, so they are useful for local comparison but not p
 | llama.cpp 12B Google QAT `Q4_0` | q8 KV, reasoning off, ctx 16384; memory-comfortable | 0.8600 | 0.8600 | 0.8600 | 0.8947 | 48.7m active |
 | Ollama `gemma4:12b` | `reasoning_effort="none"`, Ollama library quant, ~7.6 GB | 0.8200 | 0.8200 | **0.9200** | 0.9342 | 90.3m progress; 123m shell wall |
 | Ollama `hf.co/ggml-org/gemma-4-12B-it-GGUF:Q4_K_M` | `reasoning_effort="none"`, official Q4_K_M | 0.8000 | 0.8200 | 0.9000 | 0.9211 | 56.3m |
+| llama.cpp 12B Unsloth `Q8_0` + MTP Q8 head | q8 KV, reasoning off, ctx 8192, prompt cache/checkpoints enabled | 0.8200 | 0.8400 | 0.8600 | 0.9079 | 65.9m |
 | llama.cpp 12B ggml-org `Q8_0` | q8 KV, reasoning off | 0.8200 | 0.8200 | 0.8600 | 0.9079 | 81.6m |
 | MLX `mlx-community/gemma-4-12B-it-4bit` | `mlx-vlm`, `enable_thinking=False` | 0.8800 | **0.9200** | 0.8000 | 0.8684 | 73.8m |
 | MLX `mlx-community/gemma-4-12B-it-8bit` | `mlx-vlm`, `enable_thinking=False` | 0.8200 | 0.8200 | 0.8600 | 0.9079 | 77.6m clean rerun |
@@ -140,7 +141,7 @@ Interpretation:
 - MLX 26B QAT MXFP4 is memory-comfortable and fast, but quality trails MLX 26B OptiQ on GSM8K, IFEval prompt strict, and IFEval inst strict. It is not a keeper unless needed for additional MXFP4-specific testing.
 - Unsloth 26B `UD-Q4_K_XL` is the best llama.cpp 26B quality result so far: it improves over ggml-org 26B `Q4_K_M` on GSM8K, IFEval prompt strict, and IFEval inst strict while remaining practical in HTTP load. It is the likely llama.cpp daily-default replacement.
 - Ollama `gemma4:26b` is now valid after `reasoning_effort="none"`; it is fast and has better GSM8K than the old llama.cpp 26B `Q4_K_M` baseline, but instruction-following does not beat Ollama 12B Q8, MLX 26B OptiQ, or Unsloth 26B `UD-Q4_K_XL`.
-- llama.cpp 12B Q8 is a strong result: it beats llama.cpp 26B Q4 on GSM8K and IFEval instruction strict, but does not match Ollama 12B Q8.
+- llama.cpp 12B Q8 is a strong result: it beats llama.cpp 26B Q4 on GSM8K and IFEval instruction strict, but does not match Ollama 12B Q8. The Unsloth Q8 + MTP cache-enabled run preserved the same IFEval scores and improved eval wall time vs the older llama.cpp Q8 run, but memory/swap increased and HTTP latency still trails Ollama Q8.
 - MLX 12B 4bit is a mixed result: excellent GSM8K, but meaningfully worse IFEval prompt strict. For coding-agent use, the instruction-following drop matters more than the math gain.
 - MLX 12B 8bit exactly matched llama.cpp 12B Q8 on this limited eval. A clean rerun took 77.6m, close to Ollama 12B Q8 and slightly faster than llama.cpp 12B Q8.
 - The 12B Q8/8bit/library-quant runs were much slower in lm-eval than the 26B llama.cpp/MLX runs.
@@ -255,7 +256,22 @@ Full suite result with the same MTP server and prompt cache/checkpoints disabled
 | HTTP coding | 5.543 tok/s, p95 39.426s, TTFT 2.990s, pass 1.000 |
 | HTTP long-context | 5.065 tok/s, p95 12.122s, TTFT 0.118s, pass 1.000 |
 
-MTP is functional and short prompts can show good draft acceptance, but this full-suite run was worse than non-MTP 12B QAT (`52.9m` eval, ~8.8 tok/s HTTP). The likely culprit is a combination of MTP overhead and running the suite with prompt cache/checkpoints disabled. MTP should remain experimental until rerun with prompt cache enabled and compared under the same suite.
+MTP is functional and short prompts can show good draft acceptance, but this full-suite run was worse than non-MTP 12B QAT (`52.9m` eval, ~8.8 tok/s HTTP). The likely culprit is a combination of MTP overhead and running the suite with prompt cache/checkpoints disabled. QAT MTP should remain experimental until rerun with prompt cache enabled and compared under the same suite.
+
+### llama.cpp 12B Unsloth Q8_0 + Gemma 4 MTP head
+
+A cache-enabled MTP suite was run with `sweeps/gemma4-12b-unsloth-q8-mtp-llama-sweep.yaml` and `sweeps/gemma4-12b-unsloth-q8-mtp-http-load.yaml` against `unsloth/gemma-4-12B-it-GGUF` / `gemma-4-12b-it-Q8_0.gguf` plus `MTP/gemma-4-12B-it-MTP-Q8_0.gguf`, q8_0/q8_0 target KV, q8_0/q8_0 draft KV, ctx 8192, reasoning off, no mmproj, prompt cache 8192 MiB, 32 context checkpoints, and `--spec-draft-n-max 2`.
+
+| Metric | Result |
+|---|---:|
+| GSM8K strict/flex | 0.8200 / 0.8400 |
+| IFEval prompt/inst strict | 0.8600 / 0.9079 |
+| Eval time | 65.9m |
+| HTTP interactive | 7.157 tok/s, p95 18.253s, TTFT 2.439s |
+| HTTP coding | 8.259 tok/s, p95 23.899s, TTFT 2.237s, pass 1.000 |
+| HTTP long-context | 8.383 tok/s, p95 7.490s, TTFT 0.192s, pass 1.000 |
+
+This is much better than the cache-disabled QAT MTP full suite, and faster than the old non-MTP llama.cpp 12B Q8 eval, but it still does not beat Ollama 12B Q8 on instruction following or practical latency. It is useful as an MTP reference run, not a daily default.
 
 ### llama.cpp 26B Unsloth UD-Q4_K_XL, concurrency 1
 
@@ -302,7 +318,7 @@ MTP is functional on this build, and q8_0 KV does not collapse acceptance to zer
 Interpretation:
 
 - Unsloth 12B `UD-Q4_K_XL` is quality-strong but **too slow for daily coding-agent use** in llama.cpp on this machine: coding latency p95 ~52s and completion throughput ~4.2 tok/s, despite modest memory use.
-- Unsloth 12B QAT `UD-Q4_K_XL` roughly doubles non-QAT HTTP throughput and cuts lm-eval time by more than half, but it gives up instruction-following quality. Gemma 4 MTP (`n_max=2`, q8_0 KV) looked better in short microbenchmarks, but the full suite regressed badly when run with prompt cache/checkpoints disabled: eval took ~342.5m and HTTP coding throughput dropped to ~5.5 tok/s. Do not use MTP as the default until it passes a cache-enabled suite rerun.
+- Unsloth 12B QAT `UD-Q4_K_XL` roughly doubles non-QAT HTTP throughput and cuts lm-eval time by more than half, but it gives up instruction-following quality. Gemma 4 MTP (`n_max=2`, q8_0 KV) looked better in short microbenchmarks, but the QAT full suite regressed badly when run with prompt cache/checkpoints disabled: eval took ~342.5m and HTTP coding throughput dropped to ~5.5 tok/s. The cache-enabled Q8 MTP suite was healthier (65.9m eval, ~8.3 tok/s HTTP coding) but still does not beat Ollama 12B Q8 or the 26B daily default.
 - Unsloth 26B `UD-Q4_K_XL` is slightly slower in completion tok/s than some 26B baselines, but coding latency is excellent because it produces concise successful answers; long-context TTFT is also excellent.
 - 26B QAT Q4_0 has a good latency profile and excellent prompt-cache behavior, but its limited-eval instruction-following score is worse than the older 26B `Q4_K_M`.
 - 31B QAT Q4_0 is quality-strong but **too slow for the daily coding-agent default** at ~3.5 completion tok/s and ~4.8s TTFT on short/coding prompts.
@@ -362,6 +378,7 @@ Activity Monitor “App Memory” can understate Metal/unified-memory allocation
 | llama.cpp 12B Google QAT `Q4_0` + q8 KV + 16k ctx | Very comfortable. During eval: green pressure, ~18.4 / 32 GB used, ~9.9 GB wired, ~0.7 GB compressed, ~3.1 GB swap. |
 | llama.cpp 12B Unsloth `UD-Q4_K_XL` + q8 KV + 8k ctx | Very comfortable footprint. Clean sanity had no swap and llama RSS ~7.5 GB; after full eval + HTTP load, llama RSS was ~8.9 GB and swap was only ~313 MB. Runtime, not memory, is the blocker. |
 | llama.cpp 12B Unsloth QAT `UD-Q4_K_XL` + q8 KV + 8k ctx | Very comfortable. Started with llama RSS ~7.1 GB and ~297 MB swap; after eval + HTTP load, llama RSS was ~9.2 GB and swap was ~281 MB. |
+| llama.cpp 12B Unsloth Q8_0 + MTP Q8 head + q8 KV + 8k ctx | Fits, but heavier than non-MTP 12B. Cache-enabled run started with llama RSS ~13.2 GB and ~0.94 GB swap, ended with llama RSS ~15.2 GB and ~2.52 GB swap. |
 | llama.cpp 26B Google QAT `Q4_0` + q8 KV + 8k ctx | Comfortable enough. During eval: green pressure, ~24.6 / 32 GB used, ~16.8 GB wired, ~1.0 GB compressed, ~2.9 GB swap. After HTTP load, llama RSS grew to ~16.8 GB and compressed memory rose. |
 | llama.cpp 26B Unsloth `UD-Q4_K_XL` + q8 KV + 8k ctx | Similar model/RSS footprint to Google 26B QAT. During eval/HTTP reruns, pressure stayed acceptable with llama RSS around ~14.3–17.2 GB. Swap remained high after a long benchmarking session, so restart/quit other apps for clean daily-use memory readings. |
 | Ollama 26B QAT `Q4_0` LM Studio mirror | Yellow pressure near end of eval. Ollama backend used 32k ctx + mmproj; ~29.9 / 32 GB used, ~18.5 GB wired, ~7.3 GB compressed, ~5.7 GB swap. |
