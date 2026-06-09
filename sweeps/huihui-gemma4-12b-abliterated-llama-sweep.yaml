@@ -1,0 +1,66 @@
+name: huihui-gemma4-12b-abliterated-llama-sweep
+
+database: results/llm_refinery.duckdb
+
+commands:
+  bench: ["llama", "bench"]
+  server: ["llama", "server"]
+
+models:
+  - name: huihui-gemma4-12b-abliterated-q4k
+    hf: huihui-ai/Huihui-gemma-4-12B-it-qat-q4_0-unquantized-abliterated-GGUF
+    params:
+      hff: Huihui-gemma-4-12B-it-qat-q4_0-unquantized-abliterated-Q4_K.gguf
+
+  - name: huihui-gemma4-12b-abliterated-q4k-mtp-n2-q8kv
+    hf: huihui-ai/Huihui-gemma-4-12B-it-qat-q4_0-unquantized-abliterated-GGUF
+    params:
+      hff: Huihui-gemma-4-12B-it-qat-q4_0-unquantized-abliterated-Q4_K.gguf
+      spec_type: draft-mtp
+      spec_draft_n_max: 2
+      spec_draft_ngl: all
+      spec_draft_type_k: q8_0
+      spec_draft_type_v: q8_0
+      mtp_head:
+        hf: huihui-ai/Huihui-gemma-4-12B-it-qat-q4_0-unquantized-abliterated-GGUF
+        file: mtp-ggml-model-bf16.gguf
+
+defaults:
+  cache_type_k: q8_0
+  cache_type_v: q8_0
+  batch_size: 512
+  ubatch_size: 512
+  threads: 4
+  poll: 0
+
+bench:
+  prompt_tokens: [512, 2048]
+  gen_tokens: [128, 512]
+  repetitions: 3
+  output: json
+  params:
+    n_gpu_layers: 99
+    flash_attn: 1
+  extra_args: []
+
+server:
+  params:
+    ctx_size: 8192
+    n_gpu_layers: all
+    flash_attn: auto
+    no_mmproj: true
+    reasoning: "off"
+    parallel: 1
+    perf: true
+    fit: "off"
+    cache_ram: 8192
+    ctx_checkpoints: 32
+    checkpoint_min_step: 256
+  extra_args: []
+  env: {}
+
+eval:
+  tasks: ifeval,gsm8k
+  limit: 50
+  max_length: 8192
+  eos_string: "<turn|>"
