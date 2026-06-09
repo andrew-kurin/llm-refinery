@@ -111,6 +111,7 @@ All rows below are `limit=50`, so they are useful for local comparison but not p
 | Ollama `hf.co/ggml-org/gemma-4-12B-it-GGUF:Q8_0` | `reasoning_effort="none"`, Q8 12B | 0.8800 | 0.8800 | **0.9200** | **0.9474** | 74.4m |
 | llama.cpp 12B Unsloth `UD-Q4_K_XL` | q8 KV, reasoning off, ctx 8192; strong quality but slow HTTP/load | 0.8200 | 0.8600 | 0.8800 | 0.9211 | 143.3m |
 | llama.cpp 12B Unsloth QAT `UD-Q4_K_XL` | q8 KV, reasoning off, ctx 8192; faster/math-stronger but lower IFEval than non-QAT | 0.8800 | 0.9200 | 0.8400 | 0.8947 | 52.9m |
+| llama.cpp Huihui 12B abliterated `Q4_K` | q8 KV, reasoning off, ctx 8192; valid abliterated comparison | 0.8600 | 0.8800 | 0.8600 | 0.9079 | 58.7m |
 | llama.cpp 12B Google QAT `Q4_0` | q8 KV, reasoning off, ctx 16384; memory-comfortable | 0.8600 | 0.8600 | 0.8600 | 0.8947 | 48.7m active |
 | Ollama `gemma4:12b` | `reasoning_effort="none"`, Ollama library quant, ~7.6 GB | 0.8200 | 0.8200 | **0.9200** | 0.9342 | 90.3m progress; 123m shell wall |
 | Ollama `hf.co/ggml-org/gemma-4-12B-it-GGUF:Q4_K_M` | `reasoning_effort="none"`, official Q4_K_M | 0.8000 | 0.8200 | 0.9000 | 0.9211 | 56.3m |
@@ -133,6 +134,7 @@ Interpretation:
 - The **12B Q8 Ollama result remains the strongest instruction-following result so far**, despite being a smaller model.
 - llama.cpp Unsloth 12B `UD-Q4_K_XL` is the strongest llama.cpp 12B instruction result so far and matches MLX 26B OptiQ on limited IFEval, but runtime is poor: ~143m lm-eval and ~4.2 tok/s coding HTTP. Treat it as a compact quality diagnostic rather than a daily default.
 - llama.cpp Unsloth 12B QAT `UD-Q4_K_XL` is a major speed improvement over non-QAT and improves GSM8K to 0.8800/0.9200, but IFEval drops to 0.8400/0.8947. It is a compact math-oriented fallback, not the best instruction-following 12B.
+- Huihui 12B abliterated `Q4_K` is valid and reasonably fast, but it does not beat the kept 12B options overall: IFEval trails Ollama 12B Q8, GSM8K trails Unsloth 12B QAT, and HTTP latency is not better. Keep only if abliterated behavior is specifically desired.
 - Ollama `gemma4:12b` is a strong lower-disk/memory 12B option: it matches Q8 on IFEval prompt strict but trails Q8 on GSM8K and instruction strict.
 - Ollama official `Q4_K_M` is the fastest 12B Ollama eval so far, but gives up quality versus both `gemma4:12b` and Q8.
 - llama.cpp 12B QAT Q4_0 is fast and memory-comfortable. It improves GSM8K over llama.cpp 12B Q8, but does **not** improve IFEval prompt strict and trails Ollama 12B Q4/Q8 on instruction following.
@@ -236,6 +238,16 @@ HTTP load was run with `sweeps/gemma4-12b-unsloth-qat-ud-q4-k-xl-http-load.yaml`
 | coding-assistant | 24.376s | 2.478s | 8.778 | 1.000 | 0 |
 | long-context-recall | 5.766s | 0.123s | 8.794 | 1.000 | 0 |
 
+### llama.cpp Huihui Gemma 4 12B abliterated Q4_K, concurrency 1
+
+HTTP load was run with `sweeps/huihui-gemma4-12b-abliterated-http-load.yaml` against `huihui-ai/Huihui-gemma-4-12B-it-qat-q4_0-unquantized-abliterated-GGUF` / `Huihui-gemma-4-12B-it-qat-q4_0-unquantized-abliterated-Q4_K.gguf`, q8 KV, reasoning off, ctx 8192, prompt cache 8192 MiB, and 32 context checkpoints. Sanity preview was clean: `Hello, I am here now.`.
+
+| Scenario | latency p95 | TTFT p95 | completion tok/s | check pass | errors |
+|---|---:|---:|---:|---:|---:|
+| interactive-short | 17.104s | 2.436s | 7.688 | n/a | 0 |
+| coding-assistant | 29.962s | 2.357s | 8.026 | 1.000 | 0 |
+| long-context-recall | 6.131s | 0.244s | 7.647 | 1.000 | 0 |
+
 ### llama.cpp 12B Unsloth QAT UD-Q4_K_XL + Gemma 4 MTP head
 
 MTP was tested after upgrading the local `llama` binary to GitHub release `b9553`, using `unsloth/gemma-4-12B-it-qat-GGUF` / `gemma-4-12B-it-qat-UD-Q4_K_XL.gguf` plus `unsloth/gemma-4-12B-it-GGUF` / `MTP/gemma-4-12B-it-MTP-Q8_0.gguf`, q8_0/q8_0 target KV, q8_0/q8_0 draft KV, ctx 8192, reasoning off, no mmproj, no prompt cache/checkpoints, and `--spec-draft-n-max 2`.
@@ -319,6 +331,7 @@ Interpretation:
 
 - Unsloth 12B `UD-Q4_K_XL` is quality-strong but **too slow for daily coding-agent use** in llama.cpp on this machine: coding latency p95 ~52s and completion throughput ~4.2 tok/s, despite modest memory use.
 - Unsloth 12B QAT `UD-Q4_K_XL` roughly doubles non-QAT HTTP throughput and cuts lm-eval time by more than half, but it gives up instruction-following quality. Gemma 4 MTP (`n_max=2`, q8_0 KV) looked better in short microbenchmarks, but the QAT full suite regressed badly when run with prompt cache/checkpoints disabled: eval took ~342.5m and HTTP coding throughput dropped to ~5.5 tok/s. The cache-enabled Q8 MTP suite was healthier (65.9m eval, ~8.3 tok/s HTTP coding) but still does not beat Ollama 12B Q8 or the 26B daily default.
+- Huihui 12B abliterated `Q4_K` is an interesting behavioral variant, but the baseline run is not a new keeper for coding-agent use: ~8.0 tok/s coding, p95 coding latency ~30s, IFEval 0.860/0.9079, and GSM8K 0.860/0.880.
 - Unsloth 26B `UD-Q4_K_XL` is slightly slower in completion tok/s than some 26B baselines, but coding latency is excellent because it produces concise successful answers; long-context TTFT is also excellent.
 - 26B QAT Q4_0 has a good latency profile and excellent prompt-cache behavior, but its limited-eval instruction-following score is worse than the older 26B `Q4_K_M`.
 - 31B QAT Q4_0 is quality-strong but **too slow for the daily coding-agent default** at ~3.5 completion tok/s and ~4.8s TTFT on short/coding prompts.
@@ -379,6 +392,7 @@ Activity Monitor “App Memory” can understate Metal/unified-memory allocation
 | llama.cpp 12B Unsloth `UD-Q4_K_XL` + q8 KV + 8k ctx | Very comfortable footprint. Clean sanity had no swap and llama RSS ~7.5 GB; after full eval + HTTP load, llama RSS was ~8.9 GB and swap was only ~313 MB. Runtime, not memory, is the blocker. |
 | llama.cpp 12B Unsloth QAT `UD-Q4_K_XL` + q8 KV + 8k ctx | Very comfortable. Started with llama RSS ~7.1 GB and ~297 MB swap; after eval + HTTP load, llama RSS was ~9.2 GB and swap was ~281 MB. |
 | llama.cpp 12B Unsloth Q8_0 + MTP Q8 head + q8 KV + 8k ctx | Fits, but heavier than non-MTP 12B. Cache-enabled run started with llama RSS ~13.2 GB and ~0.94 GB swap, ended with llama RSS ~15.2 GB and ~2.52 GB swap. |
+| llama.cpp Huihui 12B abliterated `Q4_K` + q8 KV + 8k ctx | Fits. Run started with pre-existing ~2.06 GB swap and llama RSS ~7.6 GB; after eval + HTTP load llama RSS grew to ~16.6 GB with ~2.0 GB swap. Prompt cache/checkpoints increased footprint over the long run. |
 | llama.cpp 26B Google QAT `Q4_0` + q8 KV + 8k ctx | Comfortable enough. During eval: green pressure, ~24.6 / 32 GB used, ~16.8 GB wired, ~1.0 GB compressed, ~2.9 GB swap. After HTTP load, llama RSS grew to ~16.8 GB and compressed memory rose. |
 | llama.cpp 26B Unsloth `UD-Q4_K_XL` + q8 KV + 8k ctx | Similar model/RSS footprint to Google 26B QAT. During eval/HTTP reruns, pressure stayed acceptable with llama RSS around ~14.3–17.2 GB. Swap remained high after a long benchmarking session, so restart/quit other apps for clean daily-use memory readings. |
 | Ollama 26B QAT `Q4_0` LM Studio mirror | Yellow pressure near end of eval. Ollama backend used 32k ctx + mmproj; ~29.9 / 32 GB used, ~18.5 GB wired, ~7.3 GB compressed, ~5.7 GB swap. |
