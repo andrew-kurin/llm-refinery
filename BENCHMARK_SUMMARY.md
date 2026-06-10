@@ -1,6 +1,6 @@
 # Local Serving Benchmark Summary
 
-Last updated: 2026-06-07
+Last updated: 2026-06-09
 
 This file summarizes local serving experiments so far across llama.cpp, Ollama, MLX, and MLX-VLM on Apple Silicon. It started as a Gemma 4 benchmark log and now also tracks Qwen triage for local coding-agent use.
 
@@ -9,7 +9,7 @@ This file summarizes local serving experiments so far across llama.cpp, Ollama, 
 Current practical conclusions:
 
 1. **Best math/limited-eval score so far:** llama.cpp Gemma 4 31B QAT `Q4_0` hits GSM8K 0.9600/0.9600, but it is slow and memory-tight. **Best instruction-following score so far:** Ollama `hf.co/ggml-org/gemma-4-12B-it-GGUF:Q8_0`. New llama.cpp Unsloth Gemma 4 12B `UD-Q4_K_XL` is quality-strong (IFEval 0.8800/0.9211) but too slow for daily coding-agent use on the 32 GB Mac; the Unsloth 12B QAT `UD-Q4_K_XL` variant is much faster and stronger on GSM8K but lower on IFEval. Gemma 4 MTP works in `b9553`, but current full-suite MTP runs are not keepers on the M4: 12B QAT MTP regressed badly with cache disabled, and 12B Q8 MTP with cache enabled is only roughly comparable to non-MTP 12B options while using more memory/swap.
-2. **Best llama.cpp 26B daily default candidate:** Unsloth Gemma 4 26B `UD-Q4_K_XL` with `q8_0/q8_0` KV, reasoning disabled, 8k context. It beats the older ggml-org `Q4_K_M` baseline on GSM8K and IFEval, and HTTP latency is practical.
+2. **Best llama.cpp 26B daily default candidate:** Unsloth Gemma 4 26B `UD-Q4_K_XL` with `q8_0/q8_0` KV, reasoning disabled, 8k context. It beats the older ggml-org `Q4_K_M` baseline on GSM8K and IFEval, and HTTP latency is practical. SuperGemma4 26B uncensored `Q4_K_M` is similarly fast in HTTP load, but quality is much worse and it produced one parser-breaking `<|channel>thought`/`<channel|>` leak during GSM8K retry handling, so it is not a keeper.
 3. **Best MLX quality mode:** MLX Gemma 4 26B OptiQ with thinking disabled. It scores well and handles short/coding prompts well, but long-context TTFT is much worse than llama.cpp/Ollama because prompt cache reuse appears weak.
 4. **Most important eval fix:** disable thinking/reasoning and use the right model-specific stop token.
 5. **Qwen status:** corrected Qwen3.6 35B-A3B `UD-IQ4_NL` is a strong non-Gemma candidate: IFEval 0.8800/0.9211, GSM8K 0.8800/0.9000, HTTP coding ~18.5 tok/s, and good long-context TTFT. Qwen3-Coder 30B-A3B `Q4_K_M` is faster and stronger on GSM8K (0.9200), but trails on IFEval (0.8600/0.8947). Both are interesting; Gemma 4 26B `UD-Q4_K_XL` remains the safer 32 GB daily default. Qwen3.6 27B `IQ4_NL` is dense and rejected for daily use: lm-eval took ~147m and HTTP coding speed was only ~3.2 tok/s.
@@ -90,6 +90,7 @@ Removed from the active leaderboard:
 | Ollama `gemma4:12b` | Superseded by Ollama 12B Q8: same prompt strict, lower inst/GSM8K, slower in token check. |
 | Ollama `hf.co/ggml-org/gemma-4-12B-it-GGUF:Q4_K_M` | Superseded by Ollama 12B Q8: lower quality with similar measured token speed. |
 | llama.cpp 26B ggml-org `Q4_K_M` | Superseded by llama.cpp 26B Unsloth `UD-Q4_K_XL`: lower GSM8K and IFEval; only slightly faster raw generation. |
+| llama.cpp SuperGemma4 26B uncensored `Q4_K_M` | Rejected for coding-agent default: HTTP speed is good, but limited eval quality is weak and one GSM8K request triggered parser-breaking internal channel-token leakage. |
 
 ## Current Qwen / non-Gemma candidates
 
@@ -123,6 +124,7 @@ All rows below are `limit=50`, so they are useful for local comparison but not p
 | Ollama `gemma4:26b` | `reasoning_effort="none"`; valid rerun | 0.8200 | 0.8400 | 0.8600 | 0.8947 | 22.2m |
 | MLX `mlx-community/gemma-4-26B-A4B-it-qat-mxfp4` | `enable_thinking=False`; memory-comfortable | 0.6800 | 0.7200 | 0.8600 | 0.8947 | 18.8m |
 | llama.cpp 26B Unsloth `UD-Q4_K_XL` | q8 KV, reasoning off, ctx 8192; best llama.cpp 26B quality so far | 0.8200 | 0.8200 | 0.8800 | 0.9079 | 27.7m |
+| llama.cpp SuperGemma4 26B uncensored `Q4_K_M` | q8 KV, reasoning off, ctx 8192; fast but quality/reliability reject | 0.7800 | 0.8200 | 0.7800 | 0.8289 | 55.3m |
 | llama.cpp 26B Google QAT `Q4_0` | q8 KV, reasoning off, ctx 8192; fast | 0.8000 | 0.8000 | 0.8400 | 0.8816 | 18.9m |
 | Ollama 26B QAT `Q4_0` LM Studio mirror | `reasoning_effort="none"`; backend used 32k ctx + mmproj | 0.7200 | 0.7200 | 0.8400 | 0.8684 | 20.1m |
 | llama.cpp 26B Unsloth `UD-Q5_K_M` | q8 KV, reasoning off | 0.8000 | 0.8000 | 0.8600 | 0.8947 | 29.3m |
@@ -142,6 +144,7 @@ Interpretation:
 - Ollama 26B QAT Q4_0 did not rescue the model: it matched llama.cpp on IFEval prompt strict but regressed badly on GSM8K and used more memory due 32k ctx + mmproj.
 - MLX 26B QAT MXFP4 is memory-comfortable and fast, but quality trails MLX 26B OptiQ on GSM8K, IFEval prompt strict, and IFEval inst strict. It is not a keeper unless needed for additional MXFP4-specific testing.
 - Unsloth 26B `UD-Q4_K_XL` is the best llama.cpp 26B quality result so far: it improves over ggml-org 26B `Q4_K_M` on GSM8K, IFEval prompt strict, and IFEval inst strict while remaining practical in HTTP load. It is the likely llama.cpp daily-default replacement.
+- SuperGemma4 26B uncensored `Q4_K_M` is fast but not useful for the coding-agent shortlist: GSM8K and IFEval both fall well below the kept 26B and 12B options, and one GSM8K retry exposed internal channel tokens (`<|channel>thought` / `<channel|>`) that llama.cpp could not parse.
 - Ollama `gemma4:26b` is now valid after `reasoning_effort="none"`; it is fast and has better GSM8K than the old llama.cpp 26B `Q4_K_M` baseline, but instruction-following does not beat Ollama 12B Q8, MLX 26B OptiQ, or Unsloth 26B `UD-Q4_K_XL`.
 - llama.cpp 12B Q8 is a strong result: it beats llama.cpp 26B Q4 on GSM8K and IFEval instruction strict, but does not match Ollama 12B Q8. The Unsloth Q8 + MTP cache-enabled run preserved the same IFEval scores and improved eval wall time vs the older llama.cpp Q8 run, but memory/swap increased and HTTP latency still trails Ollama Q8.
 - MLX 12B 4bit is a mixed result: excellent GSM8K, but meaningfully worse IFEval prompt strict. For coding-agent use, the instruction-following drop matters more than the math gain.
@@ -295,6 +298,16 @@ HTTP load was run with `sweeps/gemma4-26b-qat-http-load.yaml` while the server w
 | coding-assistant | 7.798s | 0.731s | 20.965 | 1.000 | 0 |
 | long-context-recall | 2.222s | 0.065s | 19.483 | 1.000 | 0 |
 
+### llama.cpp SuperGemma4 26B uncensored Q4_K_M, concurrency 1
+
+HTTP load was run with `sweeps/supergemma4-26b-uncensored-http-load.yaml` against `Jiunsong/supergemma4-26b-uncensored-gguf-v2` / `supergemma4-26b-uncensored-fast-v2-Q4_K_M.gguf`, q8 KV, reasoning off, ctx 8192, prompt cache 8192 MiB, and 32 context checkpoints. Sanity preview was clean: `Hello to you, dear friend.`. During lm-eval, one GSM8K request failed once and retried after the model/server path exposed parser-breaking internal channel tokens (`<|channel>thought` / `<channel|>`).
+
+| Scenario | latency p95 | TTFT p95 | completion tok/s | check pass | errors |
+|---|---:|---:|---:|---:|---:|
+| interactive-short | 6.900s | 1.539s | 19.208 | n/a | 0 |
+| coding-assistant | 8.256s | 1.143s | 19.529 | 1.000 | 0 |
+| long-context-recall | 2.550s | 0.104s | 18.796 | 1.000 | 0 |
+
 ### llama.cpp 26B QAT Q4_0, concurrency 1
 
 Dedicated HTTP load was run with `sweeps/gemma4-26b-qat-http-load.yaml` against `google/gemma-4-26B-A4B-it-qat-q4_0-gguf`, q8 KV, reasoning off, ctx 8192.
@@ -333,6 +346,7 @@ Interpretation:
 - Unsloth 12B QAT `UD-Q4_K_XL` roughly doubles non-QAT HTTP throughput and cuts lm-eval time by more than half, but it gives up instruction-following quality. Gemma 4 MTP (`n_max=2`, q8_0 KV) looked better in short microbenchmarks, but the QAT full suite regressed badly when run with prompt cache/checkpoints disabled: eval took ~342.5m and HTTP coding throughput dropped to ~5.5 tok/s. The cache-enabled Q8 MTP suite was healthier (65.9m eval, ~8.3 tok/s HTTP coding) but still does not beat Ollama 12B Q8 or the 26B daily default.
 - Huihui 12B abliterated `Q4_K` is an interesting behavioral variant, but the baseline run is not a new keeper for coding-agent use: ~8.0 tok/s coding, p95 coding latency ~30s, IFEval 0.860/0.9079, and GSM8K 0.860/0.880.
 - Unsloth 26B `UD-Q4_K_XL` is slightly slower in completion tok/s than some 26B baselines, but coding latency is excellent because it produces concise successful answers; long-context TTFT is also excellent.
+- SuperGemma4 26B uncensored `Q4_K_M` has good HTTP speed (~19.5 tok/s coding, p95 ~8.3s), but quality/reliability are not competitive: IFEval prompt strict is only 0.7800, GSM8K strict is only 0.7800, and one eval request leaked internal channel tokens that caused a server parse retry.
 - 26B QAT Q4_0 has a good latency profile and excellent prompt-cache behavior, but its limited-eval instruction-following score is worse than the older 26B `Q4_K_M`.
 - 31B QAT Q4_0 is quality-strong but **too slow for the daily coding-agent default** at ~3.5 completion tok/s and ~4.8s TTFT on short/coding prompts.
 - Gemma 4 MTP works with the 31B QAT target on `b9553`, but on the current M4 it has not produced a meaningful practical speedup; `n_max=2` q8_0/q8_0 KV reached ~0.49 draft acceptance and ~3.45 weighted decode tok/s with the Q8 MTP head. The F16 MTP head was not better.
@@ -395,6 +409,7 @@ Activity Monitor “App Memory” can understate Metal/unified-memory allocation
 | llama.cpp Huihui 12B abliterated `Q4_K` + q8 KV + 8k ctx | Fits. Run started with pre-existing ~2.06 GB swap and llama RSS ~7.6 GB; after eval + HTTP load llama RSS grew to ~16.6 GB with ~2.0 GB swap. Prompt cache/checkpoints increased footprint over the long run. |
 | llama.cpp 26B Google QAT `Q4_0` + q8 KV + 8k ctx | Comfortable enough. During eval: green pressure, ~24.6 / 32 GB used, ~16.8 GB wired, ~1.0 GB compressed, ~2.9 GB swap. After HTTP load, llama RSS grew to ~16.8 GB and compressed memory rose. |
 | llama.cpp 26B Unsloth `UD-Q4_K_XL` + q8 KV + 8k ctx | Similar model/RSS footprint to Google 26B QAT. During eval/HTTP reruns, pressure stayed acceptable with llama RSS around ~14.3–17.2 GB. Swap remained high after a long benchmarking session, so restart/quit other apps for clean daily-use memory readings. |
+| llama.cpp SuperGemma4 26B uncensored `Q4_K_M` + q8 KV + 8k ctx | Fits but pressured the 32 GB machine. Run started with ~1.59 GB swap; after eval + HTTP load swap grew to ~4.35 GB. Process snapshot did not capture the llama server at the end, so use system swap/compressor rather than per-process RSS for this run. |
 | Ollama 26B QAT `Q4_0` LM Studio mirror | Yellow pressure near end of eval. Ollama backend used 32k ctx + mmproj; ~29.9 / 32 GB used, ~18.5 GB wired, ~7.3 GB compressed, ~5.7 GB swap. |
 | MLX 26B QAT `mxfp4` | Green and comfortable during eval; ~21.6 / 32 GB used, ~15.7 GB wired, ~0.2 GB compressed, ~4.7 GB swap. |
 | llama.cpp 31B Google QAT `Q4_0` + q8 KV + 8k ctx | Fits, but tight. During/after eval: green pressure, ~30 / 32 GB used, ~20.5 GB wired, ~3 GB compressed, ~3.3 GB swap. Not ideal as an always-on default. |
