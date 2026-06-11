@@ -63,7 +63,9 @@ scenarios:
       After reading all repeated notes, answer with exactly two lines:
       codename: <codename>
       settings: <server settings>
-    prompt_repeat: 64
+    # DiffusionGemma 26B MLX 4bit has already hit 600s no-token timeouts
+    # in full lm-eval on the 32 GB Mac. Keep this as a shorter context smoke.
+    prompt_repeat: 16
     max_tokens: [128]
     concurrency: [1]
     requests: 3
@@ -71,5 +73,5 @@ scenarios:
     temperature: 0
     seed: 42
     stream: true
-    timeout_s: 900
+    timeout_s: 300
     expected_contains: ["DIFFUSIONGEMMA26-MLX", "4096", "8192"]

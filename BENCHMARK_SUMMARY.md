@@ -13,7 +13,8 @@ Current practical conclusions:
 3. **Best MLX quality mode:** MLX Gemma 4 26B OptiQ with thinking disabled. It scores well and handles short/coding prompts well, but long-context TTFT is much worse than llama.cpp/Ollama because prompt cache reuse appears weak.
 4. **Most important eval fix:** disable thinking/reasoning and use the right model-specific stop token.
 5. **Qwen status:** corrected Qwen3.6 35B-A3B `UD-IQ4_NL` is a strong non-Gemma candidate: IFEval 0.8800/0.9211, GSM8K 0.8800/0.9000, HTTP coding ~18.5 tok/s, and good long-context TTFT. Qwen3-Coder 30B-A3B `Q4_K_M` is faster and stronger on GSM8K (0.9200), but trails on IFEval (0.8600/0.8947). Both are interesting; Gemma 4 26B `UD-Q4_K_XL` remains the safer 32 GB daily default. Qwen3.6 27B `IQ4_NL` is dense and rejected for daily use: lm-eval took ~147m and HTTP coding speed was only ~3.2 tok/s.
-6. **Workflow status:** one-off shell scripts were retired. Quality evals now run through `uv run llm-refinery lm-eval` or `uv run llm-refinery suite`, with eval settings stored in YAML when possible.
+6. **DiffusionGemma MLX status:** MLX-VLM DiffusionGemma 26B 4bit loads and passes a short sanity check, but the full `limit=50` IFEval+GSM8K suite failed at 28/100 after repeated 600s no-token timeouts. Treat full quality eval as a 32 GB practical reject; the sweep now defaults to a short smoke eval only.
+7. **Workflow status:** one-off shell scripts were retired. Quality evals now run through `uv run llm-refinery lm-eval` or `uv run llm-refinery suite`, with eval settings stored in YAML when possible.
 
 ## Recommended non-rejected shortlist
 
@@ -180,6 +181,7 @@ These should not be used for model comparison:
 | Ollama 12B Q8 first run without `reasoning_effort="none"` | Runtime was 3h23m; GSM8K 0.0200 and IFEval prompt 0.4400 because it mostly generated reasoning. |
 | Qwen3.6 35B-A3B first run with `--reasoning-format none` | Visible empty `<think></think>` tags remained in content; superseded by corrected `--reasoning-format deepseek` rerun. |
 | Qwen3.6 27B quality run with visible `<think></think>` tags | Quality may be undercounted, but speed/memory results are enough to reject it for daily use. |
+| MLX-VLM DiffusionGemma 26B 4bit full `limit=50` IFEval+GSM8K run | Failed at 28/100 requests after ~5h51m. Three retries hit the MLX-VLM 600s no-token queue timeout, so there are no valid quality metrics; this is a practical 32 GB reject for full lm-eval. |
 
 ## HTTP / coding-agent load results
 
@@ -624,7 +626,7 @@ uvx --from mlx-vlm mlx_vlm.generate \
 1. Add a lightweight deterministic agentic eval harness: patch applies, pytest repair, JSON/tool validity, multi-file edit, long-context repo task, retry behavior.
 2. Use the agentic harness to decide between Gemma 4 26B `UD-Q4_K_XL`, Qwen3.6 35B-A3B `UD-IQ4_NL`, Qwen3-Coder 30B-A3B `Q4_K_M`, Ollama 12B Q8, MLX 26B OptiQ, and llama.cpp 31B QAT.
 3. Add a dedicated HTTP target/sweep for Gemma 4 26B `UD-Q4_K_XL` so future results are not stored under stale QAT labels.
-4. Run the new MLX-VLM DiffusionGemma 26B sweep on the 32 GB Mac in this order: 4bit, mxfp4, nvfp4, then 5bit only if memory pressure stays green. Defer 6bit/8bit/mxfp8/bf16 to the 128 GB M5 Max.
+4. DiffusionGemma 26B MLX 4bit full lm-eval is already a practical reject on the 32 GB Mac due repeated 600s no-token timeouts. Use only the updated smoke defaults / HTTP load on this machine; defer full 4bit/5bit/6bit/8bit/mxfp8/bf16 evals to the 128 GB M5 Max.
 5. On the 128 GB M5 Max, rerun the top candidates for clean memory/speed numbers and try higher-quality Qwen/Gemma quants.
 6. Run a real multimodal smoke test for Ollama 12B Q8 with an image.
 7. Capture `prompt_tokens_details.cached_tokens` in `http-load` so prompt-cache behavior is visible in DB comparisons.
