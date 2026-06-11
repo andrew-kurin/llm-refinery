@@ -46,6 +46,7 @@ def test_eval_config_defaults_and_overrides():
     assert default_config.eval.limit == 50
     assert default_config.eval.max_length == 8192
     assert default_config.eval.eos_string == "<turn|>"
+    assert default_config.eval.api_model == "local-model"
 
     qwen_config = TuneConfig.from_mapping(
         {
@@ -57,6 +58,7 @@ def test_eval_config_defaults_and_overrides():
                 "max_length": 4096,
                 "eos_string": "<|im_end|>",
                 "gen_kwargs": "enable_thinking=False",
+                "api_model": "repo/model",
             },
         }
     )
@@ -65,3 +67,4 @@ def test_eval_config_defaults_and_overrides():
     assert qwen_config.eval.max_length == 4096
     assert qwen_config.eval.eos_string == "<|im_end|>"
     assert qwen_config.eval.gen_kwargs == "enable_thinking=False"
+    assert qwen_config.eval.api_model == "repo/model"

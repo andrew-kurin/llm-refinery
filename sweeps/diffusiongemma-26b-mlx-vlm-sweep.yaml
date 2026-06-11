@@ -1,0 +1,55 @@
+name: diffusiongemma-26b-mlx-vlm-sweep
+
+database: results/llm_refinery.duckdb
+
+commands:
+  bench: ["llama", "bench"]
+  server: ["uvx", "--from", "mlx-vlm", "mlx_vlm.server"]
+
+models:
+  # Best first run on the 32 GB Mac: official MLX 4bit, ~15.7 GB on disk.
+  - name: diffusiongemma-26b-mlx-4bit
+    hf: mlx-community/diffusiongemma-26B-A4B-it-4bit
+
+  # Smallest MLX DiffusionGemma checkpoint, useful if memory pressure is high.
+  - name: diffusiongemma-26b-mlx-mxfp4
+    hf: mlx-community/diffusiongemma-26B-A4B-it-mxfp4
+
+  # Alternative FP4 quant; worth comparing against 4bit/mxfp4 before trying 5bit+.
+  - name: diffusiongemma-26b-mlx-nvfp4
+    hf: mlx-community/diffusiongemma-26B-A4B-it-nvfp4
+
+  # Quality-bump candidate. More likely to swap on the 32 GB Mac; run after 4bit.
+  - name: diffusiongemma-26b-mlx-5bit
+    hf: mlx-community/diffusiongemma-26B-A4B-it-5bit
+
+# This file is mainly for `llm-refinery server`; MLX low-level benchmarking is not
+# parsed by the llama-bench parser. HTTP/lm-eval checks are in the companion config.
+bench:
+  prompt_tokens: [512]
+  gen_tokens: [128]
+  repetitions: 1
+  output: json
+  extra_args: []
+
+server:
+  model_flag: "--model"
+  params:
+    host: 127.0.0.1
+    port: 8082
+    prefill_step_size: 4096
+    max_tokens: 1280
+    max_kv_size: 8192
+    vision_cache_size: 4
+    log_level: INFO
+  extra_args: []
+  env: {}
+
+eval:
+  tasks: ifeval,gsm8k
+  limit: 50
+  max_length: 8192
+  eos_string: "<turn|>"
+  gen_kwargs: "enable_thinking=False"
+  # Default for index 0. Pass --api-model for other server-sweep indices.
+  api_model: mlx-community/diffusiongemma-26B-A4B-it-4bit

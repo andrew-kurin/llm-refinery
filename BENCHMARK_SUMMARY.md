@@ -624,7 +624,8 @@ uvx --from mlx-vlm mlx_vlm.generate \
 1. Add a lightweight deterministic agentic eval harness: patch applies, pytest repair, JSON/tool validity, multi-file edit, long-context repo task, retry behavior.
 2. Use the agentic harness to decide between Gemma 4 26B `UD-Q4_K_XL`, Qwen3.6 35B-A3B `UD-IQ4_NL`, Qwen3-Coder 30B-A3B `Q4_K_M`, Ollama 12B Q8, MLX 26B OptiQ, and llama.cpp 31B QAT.
 3. Add a dedicated HTTP target/sweep for Gemma 4 26B `UD-Q4_K_XL` so future results are not stored under stale QAT labels.
-4. On the 128 GB M5 Max, rerun the top candidates for clean memory/speed numbers and try higher-quality Qwen/Gemma quants.
-5. Run a real multimodal smoke test for Ollama 12B Q8 with an image.
-6. Capture `prompt_tokens_details.cached_tokens` in `http-load` so prompt-cache behavior is visible in DB comparisons.
-7. On the 128 GB M5 Max, try DS4 / DeepSeek V4 Flash q2-imatrix as the high-memory local frontier-ish candidate.
+4. Run the new MLX-VLM DiffusionGemma 26B sweep on the 32 GB Mac in this order: 4bit, mxfp4, nvfp4, then 5bit only if memory pressure stays green. Defer 6bit/8bit/mxfp8/bf16 to the 128 GB M5 Max.
+5. On the 128 GB M5 Max, rerun the top candidates for clean memory/speed numbers and try higher-quality Qwen/Gemma quants.
+6. Run a real multimodal smoke test for Ollama 12B Q8 with an image.
+7. Capture `prompt_tokens_details.cached_tokens` in `http-load` so prompt-cache behavior is visible in DB comparisons.
+8. On the 128 GB M5 Max, try DS4 / DeepSeek V4 Flash q2-imatrix as the high-memory local frontier-ish candidate.

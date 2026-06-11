@@ -30,6 +30,7 @@ class BenchmarkSuiteWorkflow:
         llama_cpp_base_url: str = "http://127.0.0.1:8080/v1/chat/completions",
         http_load_config: Path | None = None,
         target_name: str | None = None,
+        api_model: str = "local-model",
     ):
         self.config = config
         self.limit = limit
@@ -43,6 +44,7 @@ class BenchmarkSuiteWorkflow:
         self.llama_cpp_base_url = llama_cpp_base_url
         self.http_load_config = http_load_config
         self.target_name = target_name
+        self.api_model = api_model
 
         self.log_dir = Path("results/logs")
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -75,7 +77,7 @@ class BenchmarkSuiteWorkflow:
         console.print(get_system_snapshot())
 
         self._log("Sanity check: reasoning off / content present")
-        sanity = run_api_sanity_check(self.llama_cpp_base_url)
+        sanity = run_api_sanity_check(self.llama_cpp_base_url, model_name=self.api_model)
         if not sanity["success"]:
             self._error(str(sanity["error"]))
 
@@ -102,7 +104,7 @@ class BenchmarkSuiteWorkflow:
                     targets={
                         "llama_cpp": LmEvalTarget(
                             name="llama_cpp",
-                            model="local-model",
+                            model=self.api_model,
                             base_url=self.llama_cpp_base_url,
                         )
                     },

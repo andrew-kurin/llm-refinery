@@ -74,6 +74,7 @@ class ServerSpec:
     omit_params: set[str] = field(default_factory=set)
     extra_args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
+    model_flag: str | None = None
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any] | None) -> ServerSpec:
@@ -83,6 +84,7 @@ class ServerSpec:
             omit_params={str(v) for v in coerce_list(raw.get("omit_params") or [])},
             extra_args=coerce_arg_list(raw.get("extra_args") or []),
             env={str(k): str(v) for k, v in dict(raw.get("env") or {}).items()},
+            model_flag=str(raw["model_flag"]) if raw.get("model_flag") else None,
         )
 
 
@@ -93,6 +95,7 @@ class EvalSpec:
     max_length: int = 8192
     eos_string: str = "<turn|>"
     gen_kwargs: str | None = None
+    api_model: str = "local-model"
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any] | None) -> EvalSpec:
@@ -111,6 +114,7 @@ class EvalSpec:
             max_length=int(raw.get("max_length", 8192)),
             eos_string=str(raw.get("eos_string") or "<turn|>"),
             gen_kwargs=str(raw["gen_kwargs"]) if raw.get("gen_kwargs") else None,
+            api_model=str(raw.get("api_model") or "local-model"),
         )
 
 

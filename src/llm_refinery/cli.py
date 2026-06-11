@@ -244,6 +244,10 @@ def lm_eval_command(
     help="API URL for sanity check.",
 )
 @click.option(
+    "--api-model",
+    help="Model name to send to the OpenAI-compatible API. Defaults to config eval.api_model.",
+)
+@click.option(
     "--http-load-config",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="Config for http-load. Providing this enables HTTP load unless --no-run-http-load is set.",
@@ -260,6 +264,7 @@ def suite(
     run_http_load: bool | None,
     require_clean: bool,
     llama_cpp_base_url: str,
+    api_model: str | None,
     http_load_config: Path | None,
     target: str | None,
 ) -> None:
@@ -281,6 +286,7 @@ def suite(
         llama_cpp_base_url=llama_cpp_base_url,
         http_load_config=http_load_config,
         target_name=target,
+        api_model=api_model or tune_config.eval.api_model,
     )
     workflow.execute()
 

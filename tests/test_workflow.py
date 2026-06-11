@@ -107,6 +107,7 @@ def test_suite_quality_sets_eval_config(tmp_path, monkeypatch):
         gen_kwargs="enable_thinking=False",
         run_lm_eval=True,
         run_http_load=False,
+        api_model="repo/model",
     )
 
     workflow.run_quality()
@@ -119,4 +120,5 @@ def test_suite_quality_sets_eval_config(tmp_path, monkeypatch):
     assert config.max_length == 4096
     assert config.eos_string == "<|im_end|>"
     assert config.gen_kwargs == "enable_thinking=False"
+    assert config.targets["llama_cpp"].model == "repo/model"
     assert config.targets["llama_cpp"].base_url == "http://127.0.0.1:8080/v1/chat/completions"

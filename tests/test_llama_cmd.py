@@ -89,6 +89,36 @@ def test_build_server_command_resolves_mtp_head(monkeypatch, tmp_path):
     assert "draft-mtp" in cmd
 
 
+def test_build_server_command_uses_custom_model_flag_for_non_llama_servers():
+    config = TuneConfig.from_mapping(
+        {
+            "name": "suite",
+            "commands": {"server": ["uvx", "--from", "mlx-vlm", "mlx_vlm.server"]},
+            "models": [{"name": "m", "hf": "mlx-community/model-4bit"}],
+            "server": {
+                "model_flag": "--model",
+                "params": {"host": "127.0.0.1", "port": 8082},
+            },
+        }
+    )
+    trial = expand_trials(config, include_bench_dimensions=False)[0]
+
+    cmd = build_server_command(config, trial)
+
+    assert cmd == [
+        "uvx",
+        "--from",
+        "mlx-vlm",
+        "mlx_vlm.server",
+        "--model",
+        "mlx-community/model-4bit",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8082",
+    ]
+
+
 def test_build_server_command_uses_llama_hf_file_short_flag():
     config = TuneConfig.from_mapping(
         {

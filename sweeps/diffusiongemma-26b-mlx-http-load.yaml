@@ -1,0 +1,75 @@
+name: diffusiongemma-26b-mlx-http-load
+
+database: results/llm_refinery.duckdb
+
+targets:
+  - name: mlx-diffusiongemma-26b-4bit
+    provider: openai
+    base_url: http://127.0.0.1:8082/v1
+    model: mlx-community/diffusiongemma-26B-A4B-it-4bit
+
+  - name: mlx-diffusiongemma-26b-mxfp4
+    provider: openai
+    base_url: http://127.0.0.1:8082/v1
+    model: mlx-community/diffusiongemma-26B-A4B-it-mxfp4
+
+  - name: mlx-diffusiongemma-26b-nvfp4
+    provider: openai
+    base_url: http://127.0.0.1:8082/v1
+    model: mlx-community/diffusiongemma-26B-A4B-it-nvfp4
+
+  - name: mlx-diffusiongemma-26b-5bit
+    provider: openai
+    base_url: http://127.0.0.1:8082/v1
+    model: mlx-community/diffusiongemma-26B-A4B-it-5bit
+
+scenarios:
+  - name: interactive-short
+    system: You are concise, accurate, and practical.
+    prompt: |
+      Explain the tradeoff between f16 KV cache and q8_0 KV cache for a local LLM server.
+      Give a recommendation for a user who prefers quality over raw speed.
+    max_tokens: [128]
+    concurrency: [1]
+    requests: 12
+    warmup_requests: 1
+    temperature: 0
+    seed: 42
+    stream: true
+    timeout_s: 300
+
+  - name: coding-assistant
+    system: You are a careful coding assistant. Prefer simple, maintainable code.
+    prompt: |
+      Write a small Python function named percentile(values, p) that returns the pth percentile
+      using linear interpolation. Include only the function and a minimal docstring.
+    max_tokens: [512]
+    concurrency: [1]
+    requests: 6
+    warmup_requests: 1
+    temperature: 0
+    seed: 42
+    stream: true
+    timeout_s: 600
+    expected_contains: ["def percentile"]
+
+  - name: long-context-recall
+    system: Answer using only the information in the user message.
+    prompt: |
+      Reference note: the deployment codename is DIFFUSIONGEMMA26-MLX. The selected server settings are
+      MLX-VLM, prefill step size 4096, maximum KV size 8192 tokens, max tokens 1280,
+      thinking disabled, and port 8082.
+
+      After reading all repeated notes, answer with exactly two lines:
+      codename: <codename>
+      settings: <server settings>
+    prompt_repeat: 64
+    max_tokens: [128]
+    concurrency: [1]
+    requests: 3
+    warmup_requests: 1
+    temperature: 0
+    seed: 42
+    stream: true
+    timeout_s: 900
+    expected_contains: ["DIFFUSIONGEMMA26-MLX", "4096", "8192"]

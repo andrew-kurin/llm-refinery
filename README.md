@@ -126,6 +126,7 @@ Important notes:
 - `sweep` is a cartesian product over shared values.
 - Model-level `params` override `defaults` before `sweep` values are applied.
 - `bench.params` / `server.params` add command-specific flags. This matters because `llama bench` does not accept server-only flags like `--ctx-size`, `--mlock`, `--perf`, `--parallel`, `--flash-attn auto`, or `--n-gpu-layers all`.
+- For non-llama servers that use a different model-source flag, set `server.model_flag`. Example: `mlx_vlm.server` uses `--model` instead of llama.cpp `-hf` / `-m`.
 - `bench.omit_params` / `server.omit_params` remove shared flags for one command type.
 - Snake-case keys become llama.cpp kebab-case flags. Example: `ctx_size` -> `--ctx-size`.
 - Boolean `true` values become flags. Boolean `false` values are omitted.
@@ -148,7 +149,7 @@ Important notes:
 1. Start with `llm-refinery plan` to verify exact llama.cpp commands.
 2. Run a small `--limit` first for low-level benchmark sweeps.
 3. Launch candidates with `llm-refinery server` or an external Ollama/MLX server.
-4. Run `llm-refinery suite` for lm-eval + HTTP load checks.
+4. Run `llm-refinery suite` for lm-eval + HTTP load checks. For OpenAI-compatible servers that require the real model id in requests, set `eval.api_model` in YAML or pass `--api-model`.
 5. Compare parsed metrics with `llm-refinery compare`.
 
 This scaffold intentionally avoids Make. YAML is the source of truth, and Python handles expansion, execution, parsing, and storage.

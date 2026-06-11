@@ -52,7 +52,7 @@ def build_bench_command(config: TuneConfig, trial: Trial) -> list[str]:
 
 def build_server_command(config: TuneConfig, trial: Trial) -> list[str]:
     cmd = list(config.commands["server"])
-    cmd.extend(model_args(trial))
+    cmd.extend(model_args(trial, model_flag=config.server.model_flag))
     params = effective_params(trial.params, config.server.params, config.server.omit_params)
     cmd.extend(params_args(params))
     cmd.extend(trial.model.extra_args)
@@ -70,7 +70,11 @@ def effective_params(
     return params
 
 
-def model_args(trial: Trial) -> list[str]:
+def model_args(trial: Trial, *, model_flag: str | None = None) -> list[str]:
+    if model_flag:
+        model_source = trial.model.hf or trial.model.path
+        if model_source:
+            return [model_flag, model_source]
     if trial.model.hf:
         return ["-hf", trial.model.hf]
     if trial.model.path:
