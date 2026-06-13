@@ -397,12 +397,14 @@ Verdict: reject for daily use on the 32 GB Mac. It is ~5x slower than Qwen3.6 35
 
 GeoAnalystBench smoke baselines use five open-source tasks and both `workflow` and `code` response types (`10` total requests). This is an automatic harness check, not a judged workflow-similarity score.
 
-| Model / runtime | Tasks / requests | success rate | latency p50 | latency p95 | workflow step abs err avg | code syntax pass | completion tok/s | duration | memory note |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| llama.cpp Gemma 4 26B Unsloth `UD-Q4_K_XL` | 5 / 10 | 1.000 | 22.677s | 55.250s | 0.800 | 0.400 | 19.858 | 299s | Swap did not grow: ~1.78 GB before and after; wired/compressor rose. |
-| Ollama Gemma 4 12B Q8 | 5 / 10 | 1.000 | 70.419s | 160.988s | 2.200 | 0.800 | 6.435 | 921s | Swap did not grow: ~1.82 GB before, ~1.81 GB after; Ollama reported ~13 GB GPU allocation with 32k context. |
+| Model / runtime | Max tokens | Tasks / requests | success rate | latency p50 | latency p95 | workflow step abs err avg | code syntax pass | completion tok/s | duration | memory note |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| llama.cpp Gemma 4 26B Unsloth `UD-Q4_K_XL` | 8192 | 5 / 10 | 1.000 | 24.530s | 93.501s | 0.800 | 1.000 | 16.823 | 413s | Swap did not grow: ~1.77 GB before and after; 16k server context. |
+| Ollama Gemma 4 12B Q8 | 8192 | 5 / 10 | 1.000 | 88.560s | 212.418s | 2.200 | 0.800 | 5.010 | 1200s | Swap did not grow: ~1.77 GB before, ~1.76 GB after; Ollama 32k context. |
+| llama.cpp Gemma 4 26B Unsloth `UD-Q4_K_XL` | 1024 | 5 / 10 | 1.000 | 22.677s | 55.250s | 0.800 | 0.400 | 19.858 | 299s | Swap did not grow: ~1.78 GB before and after; wired/compressor rose. |
+| Ollama Gemma 4 12B Q8 | 1024 | 5 / 10 | 1.000 | 70.419s | 160.988s | 2.200 | 0.800 | 6.435 | 921s | Swap did not grow: ~1.82 GB before, ~1.81 GB after; Ollama reported ~13 GB GPU allocation with 32k context. |
 
-On this smoke, the 26B llama.cpp run was roughly 3x faster and produced workflow lengths closer to the human references. Its code syntax pass rate was worse at the 1024-token cap: three code responses hit `completion_tokens=1024` and were truncated mid-statement. The Ollama 12B Q8 run had one true syntax failure on task `3` (`unmatched ')'`). For future code-generation comparison, rerun both with `max_tokens: 2048` or score workflow and code separately.
+With `max_tokens: 8192`, the 26B llama.cpp run fixed the truncation-driven syntax failures from the 1024-token run and remained much faster than Ollama 12B Q8. The Ollama 12B Q8 run still had the same true syntax failure on task `3` (`unmatched ')'`). The 26B run is now the stronger GeoAnalystBench smoke baseline: lower latency, better workflow-length match, and 5/5 syntactically valid code responses, with no observed swap growth in this session.
 
 ## Memory observations
 
