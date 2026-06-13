@@ -8,6 +8,7 @@ It gives you a `llm-refinery` command that can:
 - run llama.cpp benchmark trials with repetitions and token dimensions
 - run lm-eval quality checks against local chat-completions endpoints
 - run HTTP latency/TTFT/load checks against llama.cpp, Ollama, MLX, and similar servers
+- run agent/data benchmarks such as GeoAnalystBench against OpenAI-compatible endpoints
 - store commands, stdout/stderr artifacts, params, parsed metrics, and structured host metadata in DuckDB
 - compare local model/server candidates in one workflow
 
@@ -103,6 +104,26 @@ If the parser improved after old runs, refresh stored metrics from artifacts:
 uv run llm-refinery reparse results/llm_refinery.duckdb
 ```
 
+Run a GeoAnalystBench smoke benchmark against an already-running OpenAI-compatible server (see [`docs/geoanalystbench.md`](docs/geoanalystbench.md)):
+
+```bash
+uv run llm-refinery agent-eval benchmarks/geoanalystbench-smoke.yaml --dry-run
+uv run llm-refinery agent-eval benchmarks/geoanalystbench-smoke.yaml --limit 5
+```
+
+Compare GeoAnalystBench runs:
+
+```bash
+uv run llm-refinery compare results/llm_refinery.duckdb \
+  --suite geoanalystbench-smoke \
+  --metric success_rate \
+  --metric workflow_step_abs_error_avg \
+  --metric code_syntax_pass_rate \
+  --sort success_rate \
+  --param target \
+  --param system.hardware.memory_gb
+```
+
 If old runs predate structured host metadata, backfill them by assuming they ran on the current machine:
 
 ```bash
@@ -159,6 +180,7 @@ Important notes:
 2. Run a small `--limit` first for low-level benchmark sweeps.
 3. Launch candidates with `llm-refinery server` or an external Ollama/MLX server.
 4. Run `llm-refinery suite` for lm-eval + HTTP load checks. For OpenAI-compatible servers that require the real model id in requests, set `eval.api_model` in YAML or pass `--api-model`.
-5. Compare parsed metrics with `llm-refinery compare`.
+5. Use `llm-refinery agent-eval` for agent/data benchmarks like GeoAnalystBench.
+6. Compare parsed metrics with `llm-refinery compare`.
 
 This scaffold intentionally avoids Make. YAML is the source of truth, and Python handles expansion, execution, parsing, and storage.

@@ -1,0 +1,27 @@
+name: geoanalystbench-smoke
+
+database: results/llm_refinery.duckdb
+
+benchmark:
+  kind: geoanalystbench
+  dataset: https://raw.githubusercontent.com/GeoDS/GeoAnalystBench/master/dataset/GeoAnalystBench.csv
+  open_source_only: true
+  limit: 5
+  prompt_variants: [domain_and_dataset]
+  response_types: [workflow, code]
+
+request:
+  temperature: 0
+  max_tokens: 1024
+  timeout_s: 600
+  retries: 1
+  seed: 42
+  # Add provider-specific request fields only when the server supports them, e.g.:
+  # extra_body:
+  #   enable_thinking: false
+
+targets:
+  - name: local-llama
+    provider: openai
+    base_url: http://127.0.0.1:8080/v1
+    model: local-model
