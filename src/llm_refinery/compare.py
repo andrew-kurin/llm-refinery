@@ -95,10 +95,22 @@ def _build_compare_row(
     }
 
     for key in param_keys:
-        row[key] = trial_params.get(key, "")
+        if key.startswith("system."):
+            row[key] = _lookup_dotted(run.get("system_json") or {}, key.removeprefix("system."))
+        else:
+            row[key] = trial_params.get(key, "")
     for key in metric_keys:
         row[key] = metric_value(key, metrics, prompt_tokens=prompt_tokens, gen_tokens=gen_tokens)
     return row
+
+
+def _lookup_dotted(data: dict[str, Any], key: str) -> object:
+    current: object = data
+    for part in key.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return ""
+        current = current[part]
+    return current
 
 
 def _dedupe_latest_configs(

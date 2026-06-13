@@ -68,6 +68,7 @@ def test_compare_command_shows_params_and_sorts_by_generation_tps(tmp_path):
                     "gen_tokens": 128,
                 },
                 metrics={"pp512.tokens_per_second": 100.0, "tg128.tokens_per_second": 10.0},
+                system_json={"hardware": {"model": "Mac-slow", "memory_gb": 32.0}},
             )
         )
         store.record_run(
@@ -87,6 +88,7 @@ def test_compare_command_shows_params_and_sorts_by_generation_tps(tmp_path):
                     "gen_tokens": 128,
                 },
                 metrics={"pp512.tokens_per_second": 200.0, "tg128.tokens_per_second": 20.0},
+                system_json={"hardware": {"model": "Mac-fast", "memory_gb": 128.0}},
             )
         )
 
@@ -97,3 +99,21 @@ def test_compare_command_shows_params_and_sorts_by_generation_tps(tmp_path):
     assert "cache_type_k" in result.output
     assert "q8_0" in result.output
     assert result.output.index("fast-run") < result.output.index("slow-run")
+
+    system_result = CliRunner().invoke(
+        main,
+        [
+            "compare",
+            str(database),
+            "--limit",
+            "2",
+            "--param",
+            "system.hardware.model",
+            "--param",
+            "system.hardware.memory_gb",
+        ],
+    )
+
+    assert system_result.exit_code == 0
+    assert "Mac-fast" in system_result.output
+    assert "128.0" in system_result.output

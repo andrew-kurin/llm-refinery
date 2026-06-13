@@ -8,7 +8,7 @@ It gives you a `llm-refinery` command that can:
 - run llama.cpp benchmark trials with repetitions and token dimensions
 - run lm-eval quality checks against local chat-completions endpoints
 - run HTTP latency/TTFT/load checks against llama.cpp, Ollama, MLX, and similar servers
-- store commands, stdout/stderr artifacts, params, and parsed metrics in DuckDB
+- store commands, stdout/stderr artifacts, params, parsed metrics, and structured host metadata in DuckDB
 - compare local model/server candidates in one workflow
 
 ## Install
@@ -80,7 +80,7 @@ uv run llm-refinery http-load sweeps/gemma-http-load-ollama-compare.yaml --targe
 uv run llm-refinery http-load sweeps/gemma-http-load-ollama-compare.yaml --target ollama-gemma
 ```
 
-Compare HTTP load results by latency, TTFT, and throughput:
+Compare HTTP load results by latency, TTFT, throughput, and optionally host metadata:
 
 ```bash
 uv run llm-refinery compare results/llm_refinery.duckdb \
@@ -92,7 +92,9 @@ uv run llm-refinery compare results/llm_refinery.duckdb \
   --param target \
   --param provider \
   --param scenario \
-  --param concurrency
+  --param concurrency \
+  --param system.hardware.model \
+  --param system.hardware.memory_gb
 ```
 
 If the parser improved after old runs, refresh stored metrics from artifacts:
@@ -130,6 +132,7 @@ Important notes:
 - `bench.omit_params` / `server.omit_params` remove shared flags for one command type.
 - Snake-case keys become llama.cpp kebab-case flags. Example: `ctx_size` -> `--ctx-size`.
 - Boolean `true` values become flags. Boolean `false` values are omitted.
+- Bench and HTTP-load runs record structured host metadata in `runs.system_json` for cross-machine history: macOS version, hardware model, chip/CPU fields when available, memory size, Python path/version, project version, and git head/dirty state. `llm-refinery compare --param system.hardware.model --param system.hardware.memory_gb` can display it.
 - Server params support an `mtp_head` helper for Gemma/Qwen MTP draft heads. It expands to `--model-draft <path>` and, in `llm-refinery server`, auto-downloads when `hf` + `file` or `url` is provided:
 
   ```yaml

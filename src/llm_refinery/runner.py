@@ -19,6 +19,7 @@ from llm_refinery.llama_cmd import (
     shell_join,
 )
 from llm_refinery.storage import ResultStore, RunRecord, utc_now
+from llm_refinery.utils.system import get_system_profile
 
 PROGRESS_INTERVAL_S = 0.5
 TRIAL_DESCRIPTION_WIDTH = 72
@@ -283,6 +284,7 @@ def _run_one_bench(
             cwd=str(Path.cwd()),
             config_json=trial.as_jsonable(),
             metrics=metrics,
+            system_json=get_system_profile(),
             stdout_path=str(stdout_path),
             stderr_path=str(stderr_path),
             llama_version=detect_llama_version(config.commands["bench"]),

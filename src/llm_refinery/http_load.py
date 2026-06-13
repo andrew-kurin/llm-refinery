@@ -15,6 +15,7 @@ import yaml
 
 from llm_refinery.config import ConfigError, coerce_list, stable_hash
 from llm_refinery.storage import ResultStore, RunRecord, utc_now
+from llm_refinery.utils.system import get_system_profile
 
 PROVIDERS = {"openai", "ollama"}
 PERCENTILES = (50, 90, 95, 99)
@@ -526,6 +527,7 @@ def _run_one_http_load(
             cwd=str(Path.cwd()),
             config_json=trial.as_jsonable(),
             metrics=metrics,
+            system_json=get_system_profile(),
             stdout_path=str(stdout_path),
             stderr_path=str(stderr_path),
             error=error,

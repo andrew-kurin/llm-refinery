@@ -1,10 +1,28 @@
 from __future__ import annotations
 
+import platform
 import shutil
+import socket
 import subprocess
+import sys
+from datetime import UTC, datetime
+from typing import Any
+
+from llm_refinery import __version__
 
 MODEL_PROCESS_MARKERS = ("llama", "ollama", "mlx", "python")
 PROCESS_EXCLUDE_MARKERS = ("rg", "pi-bash")
+SYSCTL_PROFILE_KEYS = (
+    "hw.model",
+    "hw.machine",
+    "hw.memsize",
+    "hw.ncpu",
+    "hw.physicalcpu",
+    "hw.logicalcpu",
+    "hw.perflevel0.physicalcpu",
+    "hw.perflevel1.physicalcpu",
+    "machdep.cpu.brand_string",
+)
 
 
 def is_port_listening(port: int) -> bool:
@@ -32,6 +50,147 @@ def get_system_snapshot() -> str:
     snapshot.extend(_swap_snapshot())
     snapshot.extend(_process_snapshot())
     return "\n".join(snapshot)
+
+
+def get_system_profile() -> dict[str, Any]:
+    """Return structured host metadata for historical benchmark comparison."""
+    sysctl_values = _sysctl_values(SYSCTL_PROFILE_KEYS)
+    memsize = _int_or_none(sysctl_values.get("hw.memsize"))
+    profile: dict[str, Any] = {
+        "schema_version": 1,
+        "captured_at": datetime.now(UTC).isoformat(),
+        "hostname": socket.gethostname(),
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "version": platform.version(),
+            "machine": platform.machine(),
+            "processor": platform.processor(),
+            "python_version": platform.python_version(),
+            "python_executable": sys.executable,
+        },
+        "macos": _sw_vers(),
+        "hardware": {
+            "model": sysctl_values.get("hw.model"),
+            "machine": sysctl_values.get("hw.machine"),
+            "chip": sysctl_values.get("machdep.cpu.brand_string"),
+            "memory_bytes": memsize,
+            "memory_gb": round(memsize / 1024**3, 1) if memsize is not None else None,
+            "ncpu": _int_or_none(sysctl_values.get("hw.ncpu")),
+            "physicalcpu": _int_or_none(sysctl_values.get("hw.physicalcpu")),
+            "logicalcpu": _int_or_none(sysctl_values.get("hw.logicalcpu")),
+            "perflevel0_physicalcpu": _int_or_none(
+                sysctl_values.get("hw.perflevel0.physicalcpu")
+            ),
+            "perflevel1_physicalcpu": _int_or_none(
+                sysctl_values.get("hw.perflevel1.physicalcpu")
+            ),
+        },
+        "project": {
+            "llm_refinery_version": __version__,
+            "git_head": _git_output("rev-parse", "HEAD"),
+            "git_dirty": _git_dirty(),
+        },
+    }
+    return _drop_none(profile)
+
+
+def _sw_vers() -> dict[str, str]:
+    sw_vers_path = shutil.which("sw_vers")
+    if not sw_vers_path:
+        return {}
+    try:
+        result = subprocess.run(
+            [sw_vers_path],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+
+    values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition(":")
+        if separator:
+            values[key.strip()] = value.strip()
+    return values
+
+
+def _sysctl_values(keys: tuple[str, ...]) -> dict[str, str]:
+    sysctl_path = shutil.which("sysctl")
+    if not sysctl_path:
+        return {}
+
+    values: dict[str, str] = {}
+    for key in keys:
+        try:
+            result = subprocess.run(
+                [sysctl_path, "-n", key],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=2,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            values[key] = result.stdout.strip()
+    return values
+
+
+def _git_output(*args: str) -> str | None:
+    git_path = shutil.which("git")
+    if not git_path:
+        return None
+    try:
+        result = subprocess.run(
+            [git_path, *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
+
+
+def _git_dirty() -> bool | None:
+    git_path = shutil.which("git")
+    if not git_path:
+        return None
+    try:
+        result = subprocess.run(
+            [git_path, "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return bool(result.stdout.strip())
+
+
+def _int_or_none(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _drop_none(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _drop_none(child) for key, child in value.items() if child is not None}
+    if isinstance(value, list):
+        return [_drop_none(child) for child in value]
+    return value
 
 
 def _vm_stat_snapshot() -> list[str]:

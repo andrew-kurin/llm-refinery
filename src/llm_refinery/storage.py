@@ -22,6 +22,7 @@ class RunRecord:
     cwd: str
     config_json: dict[str, Any]
     metrics: dict[str, float] = field(default_factory=dict)
+    system_json: dict[str, Any] = field(default_factory=dict)
     stdout_path: str | None = None
     stderr_path: str | None = None
     llama_version: str | None = None
@@ -50,8 +51,8 @@ class ResultStore:
             INSERT OR REPLACE INTO runs (
                 run_id, suite, trial_name, status, started_at, ended_at, duration_s,
                 command, cwd, llama_version, config_json, stdout_path, stderr_path,
-                metrics_json, error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                metrics_json, system_json, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 record.run_id,
@@ -68,6 +69,7 @@ class ResultStore:
                 record.stdout_path,
                 record.stderr_path,
                 json.dumps(record.metrics, sort_keys=True, default=str),
+                json.dumps(record.system_json, sort_keys=True, default=str),
                 record.error,
             ],
         )
@@ -146,7 +148,7 @@ class ResultStore:
             SELECT
                 run_id, suite, trial_name, status, started_at, ended_at, duration_s,
                 command, cwd, llama_version, config_json, stdout_path, stderr_path,
-                error
+                system_json, error
             FROM runs
             {status_filter}
             ORDER BY ended_at DESC
@@ -178,7 +180,8 @@ class ResultStore:
                 "config_json": json.loads(row[10]),
                 "stdout_path": row[11],
                 "stderr_path": row[12],
-                "error": row[13],
+                "system_json": json.loads(row[13] or "{}"),
+                "error": row[14],
                 "metrics": metrics_by_run_id.get(row[0], {}),
             }
             for row in selected_rows
@@ -239,10 +242,12 @@ class ResultStore:
                 stdout_path TEXT,
                 stderr_path TEXT,
                 metrics_json TEXT NOT NULL,
+                system_json TEXT,
                 error TEXT
             )
             """
         )
+        self._ensure_column("runs", "system_json", "TEXT")
         self.connection.execute(
             """
             CREATE TABLE IF NOT EXISTS metrics (
@@ -253,6 +258,12 @@ class ResultStore:
             )
             """
         )
+
+    def _ensure_column(self, table: str, column: str, column_type: str) -> None:
+        rows = self.connection.execute(f"PRAGMA table_info('{table}')").fetchall()
+        existing = {str(row[1]) for row in rows}
+        if column not in existing:
+            self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
 
 
 def utc_now() -> datetime:
