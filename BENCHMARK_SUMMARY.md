@@ -393,6 +393,16 @@ HTTP load was run with `sweeps/qwen36-27b-http-load.yaml` against `unsloth/Qwen3
 
 Verdict: reject for daily use on the 32 GB Mac. It is ~5x slower than Qwen3.6 35B-A3B in HTTP coding throughput and does not improve IFEval.
 
+## GeoAnalystBench agent/data baseline
+
+A first GeoAnalystBench smoke baseline was run with `benchmarks/geoanalystbench-ollama-gemma4-12b-q8.yaml` against Ollama `hf.co/ggml-org/gemma-4-12B-it-GGUF:Q8_0`, `reasoning_effort: none`, five open-source tasks, and both `workflow` and `code` response types (`10` total requests). This is an automatic harness check, not a judged workflow-similarity score.
+
+| Model / runtime | Tasks / requests | success rate | latency p50 | latency p95 | workflow step abs err avg | code syntax pass | completion tok/s | duration | memory note |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| Ollama Gemma 4 12B Q8 | 5 / 10 | 1.000 | 70.419s | 160.988s | 2.200 | 0.800 | 6.435 | 921s | Swap did not grow: ~1.82 GB before, ~1.81 GB after; Ollama reported ~13 GB GPU allocation with 32k context. |
+
+One code-generation request failed Python syntax parsing: task `3` produced an unmatched `)` in the generated burn-scar analysis code. Overall this is a useful low-swap baseline, but latency is high enough that future GeoAnalystBench comparisons should include Gemma 4 26B `UD-Q4_K_XL` and Qwen3-Coder 30B for practical agent behavior.
+
 ## Memory observations
 
 Activity Monitor “App Memory” can understate Metal/unified-memory allocations; watch system memory pressure, wired memory, compressed memory, and swap.
