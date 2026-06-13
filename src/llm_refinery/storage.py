@@ -224,6 +224,16 @@ class ResultStore:
             rows = [(run_id, key, float(value)) for key, value in metrics.items()]
             self.connection.executemany("INSERT INTO metrics VALUES (?, ?, ?)", rows)
 
+    def backfill_system_json(self, system_json: dict[str, Any], *, overwrite: bool = False) -> int:
+        where_clause = "" if overwrite else _missing_system_json_where_clause()
+        count = self.connection.execute(f"SELECT COUNT(*) FROM runs {where_clause}").fetchone()[0]
+        if count:
+            self.connection.execute(
+                f"UPDATE runs SET system_json = ? {where_clause}",
+                [json.dumps(system_json, sort_keys=True, default=str)],
+            )
+        return int(count)
+
     def _init_schema(self) -> None:
         self.connection.execute(
             """
@@ -264,6 +274,10 @@ class ResultStore:
         existing = {str(row[1]) for row in rows}
         if column not in existing:
             self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+
+def _missing_system_json_where_clause() -> str:
+    return "WHERE system_json IS NULL OR trim(system_json) = '' OR trim(system_json) = '{}'"
 
 
 def utc_now() -> datetime:

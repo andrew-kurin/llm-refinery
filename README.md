@@ -103,6 +103,12 @@ If the parser improved after old runs, refresh stored metrics from artifacts:
 uv run llm-refinery reparse results/llm_refinery.duckdb
 ```
 
+If old runs predate structured host metadata, backfill them by assuming they ran on the current machine:
+
+```bash
+uv run llm-refinery backfill-system-metadata results/llm_refinery.duckdb
+```
+
 Launch the server for one expanded config:
 
 ```bash
