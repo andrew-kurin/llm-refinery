@@ -5,7 +5,8 @@ from typing import Any
 
 import click
 
-from llm_refinery.agent_eval import load_agent_eval_config, run_agent_eval
+from llm_refinery.benchmarks.agent.config import load_agent_eval_config
+from llm_refinery.benchmarks.agent.runner import run_agent_eval
 from llm_refinery.commands.common import parse_lm_eval_limit
 
 
