@@ -33,7 +33,7 @@ def test_launch_server_downloads_mtp_head(tmp_path, monkeypatch):
         calls.append(cmd)
         return subprocess.CompletedProcess(cmd, 0)
 
-    monkeypatch.setattr("llm_refinery.runner.subprocess.run", fake_run)
+    monkeypatch.setattr("llm_refinery.providers.llama_cpp.subprocess.run", fake_run)
 
     assert launch_server(config) == 0
     assert destination.read_bytes() == b"draft-head"
