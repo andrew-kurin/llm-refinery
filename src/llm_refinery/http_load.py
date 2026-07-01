@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 import urllib.error
 import urllib.request
@@ -15,6 +14,7 @@ import yaml
 
 from llm_refinery.config import ConfigError, coerce_list, stable_hash
 from llm_refinery.core.metrics import add_distribution_metrics
+from llm_refinery.providers.openai import chat_completions_url, json_headers, openai_choice_text
 from llm_refinery.storage import ResultStore, RunRecord, utc_now
 from llm_refinery.utils.system import get_system_profile
 
@@ -589,7 +589,7 @@ def _execute_openai_request(trial: HttpLoadTrial, index: int) -> RequestResult:
     return _post_json(
         trial,
         index,
-        url=f"{trial.target.base_url}/chat/completions",
+        url=chat_completions_url(trial.target.base_url),
         payload=payload,
         stream_reader=_read_openai_stream if scenario.stream else None,
         body_reader=_read_openai_body,
@@ -684,7 +684,7 @@ def _read_openai_stream(
         chunk = json.loads(data)
         usage = chunk.get("usage") or usage
         for choice in chunk.get("choices") or []:
-            content = _openai_choice_text(choice)
+            content = openai_choice_text(choice)
             if content:
                 if ttft_s is None:
                     ttft_s = time.perf_counter() - start
@@ -708,7 +708,7 @@ def _read_openai_body(index: int, body: str, start: float, status_code: int) -> 
     payload = json.loads(body)
     text_parts: list[str] = []
     for choice in payload.get("choices") or []:
-        content = _openai_choice_text(choice)
+        content = openai_choice_text(choice)
         if content:
             text_parts.append(content)
     response_text = "".join(text_parts)
@@ -786,18 +786,6 @@ def _read_ollama_body(index: int, body: str, start: float, status_code: int) -> 
     )
 
 
-def _openai_choice_text(choice: dict[str, Any]) -> str:
-    parts: list[str] = []
-    for mapping in (choice.get("delta"), choice.get("message"), choice):
-        if not isinstance(mapping, dict):
-            continue
-        for key in ("content", "reasoning_content", "thinking", "text"):
-            value = mapping.get(key)
-            if value:
-                parts.append(str(value))
-    return "".join(parts)
-
-
 def _with_check_result(result: RequestResult, scenario: HttpScenario) -> RequestResult:
     if not result.ok or not scenario.expected_contains:
         return result
@@ -815,16 +803,7 @@ def _messages_for_scenario(scenario: HttpScenario) -> list[dict[str, str]]:
 
 
 def _headers_for_target(target: HttpTarget) -> dict[str, str]:
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        **target.headers,
-    }
-    if target.api_key_env and "Authorization" not in headers:
-        token = os.environ.get(target.api_key_env)
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-    return headers
+    return json_headers(target.headers, api_key_env=target.api_key_env)
 
 
 def _scenario_prompt(raw: dict[str, Any], *, base_dir: Path) -> str:

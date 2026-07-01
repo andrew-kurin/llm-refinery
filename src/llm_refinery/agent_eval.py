@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
 import time
-import urllib.error
-import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +20,7 @@ from llm_refinery.benchmarks.agent.base import (
     LimitOverride,
 )
 from llm_refinery.config import ConfigError, stable_hash
+from llm_refinery.providers.openai import OpenAICompatibleChatClient
 from llm_refinery.storage import ResultStore, RunRecord, utc_now
 from llm_refinery.utils.system import get_system_profile
 
@@ -113,6 +111,9 @@ def load_agent_eval_config(path: str | Path) -> AgentEvalConfig:
 
 
 class OpenAIChatClient:
+    def __init__(self, client: OpenAICompatibleChatClient | None = None) -> None:
+        self.client = client or OpenAICompatibleChatClient()
+
     def complete(self, target: AgentEvalTarget, request: AgentEvalRequest) -> AgentEvalResult:
         started = time.perf_counter()
         last_error: str | None = None
@@ -133,53 +134,30 @@ class OpenAIChatClient:
     def _complete_once(
         self, target: AgentEvalTarget, request: AgentEvalRequest, *, started_at: float
     ) -> AgentEvalResult:
-        payload: dict[str, Any] = {
-            "model": target.model,
-            "messages": [
+        response = self.client.complete(
+            base_url=target.base_url,
+            model=target.model,
+            messages=[
                 {"role": "system", "content": request.system},
                 {"role": "user", "content": request.prompt},
             ],
-            "temperature": request.config.temperature,
-            "max_tokens": request.config.max_tokens,
-            "stream": False,
-        }
-        if request.config.seed is not None:
-            payload["seed"] = request.config.seed
-        payload.update(request.config.extra_body)
-
-        headers = {"Content-Type": "application/json", **target.headers}
-        if target.api_key_env and os.environ.get(target.api_key_env):
-            headers.setdefault("Authorization", f"Bearer {os.environ[target.api_key_env]}")
-        url = _chat_completions_url(target.base_url)
-        http_request = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode(),
-            headers=headers,
-            method="POST",
+            temperature=request.config.temperature,
+            max_tokens=request.config.max_tokens,
+            timeout_s=request.config.timeout_s,
+            seed=request.config.seed,
+            extra_body=request.config.extra_body,
+            headers=target.headers,
+            api_key_env=target.api_key_env,
         )
-        try:
-            with urllib.request.urlopen(  # noqa: S310 - benchmark target is user-configured
-                http_request,
-                timeout=request.config.timeout_s,
-            ) as response:
-                body = response.read().decode(errors="replace")
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode(errors="replace")[-2000:]
-            raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
-
-        data = json.loads(body)
-        choice = data["choices"][0]
-        message = choice.get("message") or {}
-        content = str(message.get("content") or "")
-        usage = data.get("usage") or {}
+        content = response.content
         return AgentEvalResult(
             request=request,
             ok=bool(content.strip()),
             latency_s=time.perf_counter() - started_at,
             response_text=content,
-            prompt_tokens=_int_or_none(usage.get("prompt_tokens")),
-            completion_tokens=_int_or_none(usage.get("completion_tokens")),
-            total_tokens=_int_or_none(usage.get("total_tokens")),
+            prompt_tokens=response.prompt_tokens,
+            completion_tokens=response.completion_tokens,
+            total_tokens=response.total_tokens,
             error=None if content.strip() else "empty response content",
         )
 
@@ -330,25 +308,11 @@ def _selected_targets(
     return selected
 
 
-def _chat_completions_url(base_url: str) -> str:
-    stripped = base_url.rstrip("/")
-    if stripped.endswith("/chat/completions"):
-        return stripped
-    return f"{stripped}/chat/completions"
-
-
 def _first_error(results: list[AgentEvalResult]) -> str | None:
     for result in results:
         if result.error:
             return result.error
     return None
-
-
-def _int_or_none(value: object) -> int | None:
-    try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
 
 
 def _metric_summary(metrics: dict[str, float]) -> str:
