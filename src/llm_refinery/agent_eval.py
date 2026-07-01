@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import time
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,9 +19,9 @@ from llm_refinery.benchmarks.agent.base import (
     LimitOverride,
 )
 from llm_refinery.config import ConfigError, stable_hash
+from llm_refinery.core.runs import make_run_id, prepare_artifact_dir, record_benchmark_run
 from llm_refinery.providers.openai import OpenAICompatibleChatClient
-from llm_refinery.storage import ResultStore, RunRecord, utc_now
-from llm_refinery.utils.system import get_system_profile
+from llm_refinery.storage import ResultStore, utc_now
 
 
 @dataclass(frozen=True)
@@ -189,10 +188,9 @@ def run_agent_eval(
 
     chat_client = client or OpenAIChatClient()
     database = config.database
-    artifact_root = database.parent / "artifacts"
     with ResultStore(database) as store:
         for target in targets:
-            _run_target(config, benchmark, target, requests, chat_client, artifact_root, store)
+            _run_target(config, benchmark, target, requests, chat_client, store)
     return 0
 
 
@@ -202,7 +200,6 @@ def _run_target(
     target: AgentEvalTarget,
     requests: list[AgentEvalRequest],
     client: ChatClient,
-    artifact_root: Path,
     store: ResultStore,
 ) -> None:
     key = stable_hash(
@@ -214,9 +211,8 @@ def _run_target(
             "request": config.request.safe_json(),
         }
     )
-    run_id = f"{key}-{uuid.uuid4().hex[:8]}"
-    artifact_dir = artifact_root / run_id
-    artifact_dir.mkdir(parents=True, exist_ok=True)
+    run_id = make_run_id(key)
+    artifact_dir = prepare_artifact_dir(store.database, run_id)
     responses_path = artifact_dir / f"{benchmark.kind}-responses.jsonl"
     errors_path = artifact_dir / "errors.txt"
 
@@ -252,47 +248,44 @@ def _run_target(
     )
 
     trial_name = f"{config.name}/{target.name}/{benchmark.kind}/{key}"
-    store.record_run(
-        RunRecord(
-            run_id=run_id,
-            suite=config.name,
-            trial_name=trial_name,
-            status=status,
-            started_at=started,
-            ended_at=ended,
-            duration_s=duration_s,
-            command=(
-                f"agent-eval benchmark={benchmark.kind} target={target.name} "
-                f"model={target.model} requests={len(requests)}"
-            ),
-            cwd=str(Path.cwd()),
-            config_json={
-                "benchmark": benchmark.safe_json(),
-                "target": target.safe_json(),
-                "request": config.request.safe_json(),
-                "params": {
-                    "benchmark": benchmark.kind,
-                    "target": target.name,
-                    "model": target.model,
-                    "prompt_variants": ",".join(
-                        sorted({request.prompt_variant for request in requests})
-                    ),
-                    "response_types": ",".join(
-                        sorted({request.response_type for request in requests})
-                    ),
-                    "task_count": len({request.task_key for request in requests}),
-                    "request_count": len(requests),
-                },
-                "model": {"name": target.model},
-                "prompt_tokens": None,
-                "gen_tokens": config.request.max_tokens,
+    record_benchmark_run(
+        store,
+        run_id=run_id,
+        suite=config.name,
+        trial_name=trial_name,
+        status=status,
+        started_at=started,
+        ended_at=ended,
+        duration_s=duration_s,
+        command=(
+            f"agent-eval benchmark={benchmark.kind} target={target.name} "
+            f"model={target.model} requests={len(requests)}"
+        ),
+        config_json={
+            "benchmark": benchmark.safe_json(),
+            "target": target.safe_json(),
+            "request": config.request.safe_json(),
+            "params": {
+                "benchmark": benchmark.kind,
+                "target": target.name,
+                "model": target.model,
+                "prompt_variants": ",".join(
+                    sorted({request.prompt_variant for request in requests})
+                ),
+                "response_types": ",".join(
+                    sorted({request.response_type for request in requests})
+                ),
+                "task_count": len({request.task_key for request in requests}),
+                "request_count": len(requests),
             },
-            metrics=metrics,
-            system_json=get_system_profile(),
-            stdout_path=str(responses_path),
-            stderr_path=str(errors_path),
-            error=error,
-        )
+            "model": {"name": target.model},
+            "prompt_tokens": None,
+            "gen_tokens": config.request.max_tokens,
+        },
+        metrics=metrics,
+        stdout_path=responses_path,
+        stderr_path=errors_path,
+        error=error,
     )
     print(f"stored {status}: {run_id} ({_metric_summary(metrics)})")
 

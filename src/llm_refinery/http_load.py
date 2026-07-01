@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import time
-import uuid
 from pathlib import Path
 
 from llm_refinery.benchmarks.http_load import (
@@ -17,8 +16,8 @@ from llm_refinery.benchmarks.http_load import (
     summarize_request_results,
 )
 from llm_refinery.benchmarks.http_load.transport import run_requests
-from llm_refinery.storage import ResultStore, RunRecord, utc_now
-from llm_refinery.utils.system import get_system_profile
+from llm_refinery.core.runs import make_run_id, prepare_artifact_dir, record_benchmark_run
+from llm_refinery.storage import ResultStore, utc_now
 
 __all__ = [
     "HttpLoadConfig",
@@ -86,9 +85,8 @@ def _run_one_http_load(
     index: int,
     total: int,
 ) -> None:
-    run_id = f"{trial.key}-{uuid.uuid4().hex[:8]}"
-    artifact_dir = config.database.parent / "artifacts" / run_id
-    artifact_dir.mkdir(parents=True, exist_ok=True)
+    run_id = make_run_id(trial.key)
+    artifact_dir = prepare_artifact_dir(store.database, run_id)
     stdout_path = artifact_dir / "responses.jsonl"
     stderr_path = artifact_dir / "errors.txt"
 
@@ -122,24 +120,21 @@ def _run_one_http_load(
         encoding="utf-8",
     )
 
-    store.record_run(
-        RunRecord(
-            run_id=run_id,
-            suite=trial.suite,
-            trial_name=trial.name,
-            status=status,
-            started_at=started,
-            ended_at=ended,
-            duration_s=duration_s,
-            command=trial.command_text,
-            cwd=str(Path.cwd()),
-            config_json=trial.as_jsonable(),
-            metrics=metrics,
-            system_json=get_system_profile(),
-            stdout_path=str(stdout_path),
-            stderr_path=str(stderr_path),
-            error=error,
-        )
+    record_benchmark_run(
+        store,
+        run_id=run_id,
+        suite=trial.suite,
+        trial_name=trial.name,
+        status=status,
+        started_at=started,
+        ended_at=ended,
+        duration_s=duration_s,
+        command=trial.command_text,
+        config_json=trial.as_jsonable(),
+        metrics=metrics,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        error=error,
     )
 
     summary = _http_metric_summary(metrics)

@@ -8,8 +8,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from llm_refinery.storage import ResultStore, RunRecord, utc_now
-from llm_refinery.utils.system import get_system_profile
+from llm_refinery.core.runs import record_benchmark_run
+from llm_refinery.storage import ResultStore, utc_now
 
 TARGET_CHOICES = ("llama_cpp", "ollama", "mlx_e4b", "mlx_26b", "both", "all")
 TARGET_ORDER = ("llama_cpp", "ollama", "mlx_e4b", "mlx_26b")
@@ -167,43 +167,36 @@ def run_lm_eval(config: LmEvalConfig, *, dry_run: bool = False) -> None:
         result_json = latest_lm_eval_result(output_path, newer_than=result_started_mtime)
         metrics = parse_lm_eval_metrics(result_json) if result_json else {}
         with ResultStore(config.database) as store:
-            store.record_run(
-                RunRecord(
-                    run_id=(
-                        f"{config.suite_name}-{target.name}-"
-                        f"{started_at.strftime('%Y%m%d%H%M%S%f')}"
-                    ),
-                    suite=config.suite_name,
-                    trial_name=f"{config.suite_name}/{target.name}",
-                    status="ok" if completed.returncode == 0 else "failed",
-                    started_at=started_at,
-                    ended_at=ended_at,
-                    duration_s=(ended_at - started_at).total_seconds(),
-                    command=shlex.join(cmd),
-                    cwd=os.getcwd(),
-                    config_json={
-                        "benchmark": "lm-eval",
-                        "model_backend": config.model_backend,
-                        "apply_chat_template": config.apply_chat_template,
-                        "target": target.name,
-                        "model": target.model,
-                        "base_url": target.base_url,
-                        "tasks": config.tasks,
-                        "limit": config.limit,
-                        "max_length": config.max_length,
-                        "eos_string": config.eos_string,
-                        "gen_kwargs": config.gen_kwargs,
-                        "include_path": str(config.include_path) if config.include_path else None,
-                    },
-                    metrics=metrics,
-                    system_json=get_system_profile(),
-                    stdout_path=str(result_json) if result_json else None,
-                    error=(
-                        None
-                        if completed.returncode == 0
-                        else f"exit code {completed.returncode}"
-                    ),
-                )
+            record_benchmark_run(
+                store,
+                run_id=(
+                    f"{config.suite_name}-{target.name}-"
+                    f"{started_at.strftime('%Y%m%d%H%M%S%f')}"
+                ),
+                suite=config.suite_name,
+                trial_name=f"{config.suite_name}/{target.name}",
+                status="ok" if completed.returncode == 0 else "failed",
+                started_at=started_at,
+                ended_at=ended_at,
+                duration_s=(ended_at - started_at).total_seconds(),
+                command=shlex.join(cmd),
+                config_json={
+                    "benchmark": "lm-eval",
+                    "model_backend": config.model_backend,
+                    "apply_chat_template": config.apply_chat_template,
+                    "target": target.name,
+                    "model": target.model,
+                    "base_url": target.base_url,
+                    "tasks": config.tasks,
+                    "limit": config.limit,
+                    "max_length": config.max_length,
+                    "eos_string": config.eos_string,
+                    "gen_kwargs": config.gen_kwargs,
+                    "include_path": str(config.include_path) if config.include_path else None,
+                },
+                metrics=metrics,
+                stdout_path=result_json,
+                error=None if completed.returncode == 0 else f"exit code {completed.returncode}",
             )
         if completed.returncode != 0:
             raise RuntimeError(

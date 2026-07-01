@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import subprocess
 import time
-import uuid
 from pathlib import Path
 
 from rich.console import Console
@@ -12,14 +11,14 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn
 from llm_refinery.assets import ensure_mtp_head
 from llm_refinery.bench_parser import parse_llama_bench_metrics
 from llm_refinery.config import Trial, TuneConfig, expand_trials
+from llm_refinery.core.runs import make_run_id, prepare_artifact_dir, record_benchmark_run
 from llm_refinery.llama_cmd import (
     build_bench_command,
     build_server_command,
     effective_params,
     shell_join,
 )
-from llm_refinery.storage import ResultStore, RunRecord, utc_now
-from llm_refinery.utils.system import get_system_profile
+from llm_refinery.storage import ResultStore, utc_now
 
 PROGRESS_INTERVAL_S = 0.5
 TRIAL_DESCRIPTION_WIDTH = 72
@@ -230,11 +229,10 @@ def _run_one_bench(
     progress_task_id: TaskID | None,
     progress_interval_s: float,
 ) -> None:
-    run_id = f"{trial.key}-{uuid.uuid4().hex[:8]}"
+    run_id = make_run_id(trial.key)
     cmd = build_bench_command(config, trial)
     command_text = shell_join(cmd)
-    artifact_dir = _artifact_dir(config, run_id)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir = prepare_artifact_dir(config.database, run_id)
     stdout_path = artifact_dir / "stdout.txt"
     stderr_path = artifact_dir / "stderr.txt"
 
@@ -271,25 +269,22 @@ def _run_one_bench(
     status = "ok" if completed.returncode == 0 else "failed"
     error = None if completed.returncode == 0 else f"exit code {completed.returncode}"
 
-    store.record_run(
-        RunRecord(
-            run_id=run_id,
-            suite=trial.suite,
-            trial_name=trial.name,
-            status=status,
-            started_at=started,
-            ended_at=ended,
-            duration_s=duration_s,
-            command=command_text,
-            cwd=str(Path.cwd()),
-            config_json=trial.as_jsonable(),
-            metrics=metrics,
-            system_json=get_system_profile(),
-            stdout_path=str(stdout_path),
-            stderr_path=str(stderr_path),
-            llama_version=detect_llama_version(config.commands["bench"]),
-            error=error,
-        )
+    record_benchmark_run(
+        store,
+        run_id=run_id,
+        suite=trial.suite,
+        trial_name=trial.name,
+        status=status,
+        started_at=started,
+        ended_at=ended,
+        duration_s=duration_s,
+        command=command_text,
+        config_json=trial.as_jsonable(),
+        metrics=metrics,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        llama_version=detect_llama_version(config.commands["bench"]),
+        error=error,
     )
 
     progress_state.record_completion(duration_s)
@@ -493,7 +488,3 @@ def detect_llama_version(command: list[str]) -> str | None:
         if completed.returncode == 0 and output:
             return output.splitlines()[0]
     return None
-
-
-def _artifact_dir(config: TuneConfig, run_id: str) -> Path:
-    return config.database.parent / "artifacts" / run_id
