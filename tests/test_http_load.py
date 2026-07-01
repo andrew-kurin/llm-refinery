@@ -1,10 +1,12 @@
-from llm_refinery.http_load import (
+from llm_refinery.benchmarks.http_load import (
     HttpLoadConfig,
     RequestResult,
-    _read_ollama_stream,
-    _read_openai_stream,
     expand_http_load_trials,
     summarize_request_results,
+)
+from llm_refinery.benchmarks.http_load.transport import (
+    read_ollama_stream,
+    read_openai_stream,
 )
 
 
@@ -110,7 +112,7 @@ def test_read_openai_stream_extracts_content_text_and_reasoning_content():
         ]
     )
 
-    result = _read_openai_stream(0, response, 0.0, 200)
+    result = read_openai_stream(0, response, 0.0, 200)
 
     assert result.response_text == "think more hello world"
     assert result.completion_chars == len("think more hello world")
@@ -128,7 +130,7 @@ def test_read_ollama_stream_extracts_thinking_content():
         ]
     )
 
-    result = _read_ollama_stream(0, response, 0.0, 200)
+    result = read_ollama_stream(0, response, 0.0, 200)
 
     assert result.response_text == "think answer"
     assert result.completion_chars == len("think answer")
