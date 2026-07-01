@@ -148,6 +148,37 @@ def _parse_lm_eval_limit(value: str) -> int | None:
 @click.option("--max-length", type=int, default=16384, show_default=True)
 @click.option("--eos-string", default="<turn|>", show_default=True)
 @click.option("--gen-kwargs", help="Extra lm-eval generation kwargs for API backends.")
+@click.option(
+    "--model-backend",
+    default="local-chat-completions",
+    show_default=True,
+    type=click.Choice(["local-chat-completions", "local-completions"]),
+    help="lm-eval API model backend.",
+)
+@click.option(
+    "--apply-chat-template/--no-apply-chat-template",
+    default=True,
+    show_default=True,
+    help="Pass --apply_chat_template to lm-eval.",
+)
+@click.option(
+    "--include-path",
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Additional lm-eval task directory, e.g. evals/lm_eval_tasks.",
+)
+@click.option(
+    "--suite-name",
+    default="lm-eval",
+    show_default=True,
+    help="Suite name for DuckDB records.",
+)
+@click.option(
+    "--db",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=Path("results/llm_refinery.duckdb"),
+    show_default=True,
+    help="DuckDB path for parsed lm-eval metrics.",
+)
 @click.option("--log-samples", is_flag=True, help="Pass --log_samples to lm-eval.")
 @click.option("--model", help="Override model name for a single target.")
 @click.option("--base-url", help="Override chat-completions URL for a single target.")
@@ -173,6 +204,11 @@ def lm_eval_command(
     max_length: int,
     eos_string: str,
     gen_kwargs: str | None,
+    model_backend: str,
+    apply_chat_template: bool,
+    include_path: Path | None,
+    suite_name: str,
+    db: Path,
     log_samples: bool,
     model: str | None,
     base_url: str | None,
@@ -205,6 +241,11 @@ def lm_eval_command(
             gen_kwargs=gen_kwargs,
             output_root=output_root,
             offline=offline,
+            model_backend=model_backend,
+            apply_chat_template=apply_chat_template,
+            include_path=include_path,
+            suite_name=suite_name,
+            database=db,
             targets=targets,
         ),
         dry_run=dry_run,
@@ -228,6 +269,11 @@ def lm_eval_command(
 @click.option(
     "--gen-kwargs",
     help="Extra lm-eval generation kwargs. Defaults to config eval.gen_kwargs.",
+)
+@click.option(
+    "--include-path",
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Additional lm-eval task directory. Defaults to config eval.include_path.",
 )
 @click.option("--run-lm-eval/--no-run-lm-eval", default=True, help="Whether to run lm-eval.")
 @click.option(
@@ -262,6 +308,7 @@ def suite(
     max_length: int | None,
     eos_string: str | None,
     gen_kwargs: str | None,
+    include_path: Path | None,
     run_lm_eval: bool,
     run_http_load: bool | None,
     require_clean: bool,
@@ -282,6 +329,7 @@ def suite(
         max_length=max_length or tune_config.eval.max_length,
         eos_string=eos_string or tune_config.eval.eos_string,
         gen_kwargs=gen_kwargs if gen_kwargs is not None else tune_config.eval.gen_kwargs,
+        include_path=include_path if include_path is not None else tune_config.eval.include_path,
         run_lm_eval=run_lm_eval,
         run_http_load=effective_run_http_load,
         require_clean=require_clean,

@@ -1,0 +1,3 @@
+dataset_name: gpqa_extended
+include: _gpqa_fixed_generative_yaml
+task: gpqa_extended_fixed_generative

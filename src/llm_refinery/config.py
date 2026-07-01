@@ -95,6 +95,7 @@ class EvalSpec:
     max_length: int = 8192
     eos_string: str = "<turn|>"
     gen_kwargs: str | None = None
+    include_path: Path | None = None
     api_model: str = "local-model"
 
     @classmethod
@@ -114,6 +115,7 @@ class EvalSpec:
             max_length=int(raw.get("max_length", 8192)),
             eos_string=str(raw.get("eos_string") or "<turn|>"),
             gen_kwargs=str(raw["gen_kwargs"]) if raw.get("gen_kwargs") else None,
+            include_path=Path(str(raw["include_path"])) if raw.get("include_path") else None,
             api_model=str(raw.get("api_model") or "local-model"),
         )
 

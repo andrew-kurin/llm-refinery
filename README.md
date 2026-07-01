@@ -104,6 +104,17 @@ If the parser improved after old runs, refresh stored metrics from artifacts:
 uv run llm-refinery reparse results/llm_refinery.duckdb
 ```
 
+Run a broader lm-eval reasoning/knowledge scoreboard, including the fixed GPQA task override:
+
+```bash
+uv run llm-refinery lm-eval ollama all \
+  --suite-name quality-reasoning \
+  --tasks gsm8k,arc_challenge_chat,ifeval,truthfulqa_gen,gpqa_main_fixed_generative \
+  --include-path evals/lm_eval_tasks
+```
+
+Parsed lm-eval aggregate metrics are stored in DuckDB and can be compared with `llm-refinery compare`. See [`evals/README.md`](evals/README.md).
+
 Run a GeoAnalystBench smoke benchmark against an already-running OpenAI-compatible server (see [`docs/geoanalystbench.md`](docs/geoanalystbench.md)):
 
 ```bash
@@ -159,7 +170,7 @@ Important notes:
 - `bench.omit_params` / `server.omit_params` remove shared flags for one command type.
 - Snake-case keys become llama.cpp kebab-case flags. Example: `ctx_size` -> `--ctx-size`.
 - Boolean `true` values become flags. Boolean `false` values are omitted.
-- Bench and HTTP-load runs record structured host metadata in `runs.system_json` for cross-machine history: macOS version, hardware model, chip/CPU fields when available, memory size, Python path/version, project version, and git head/dirty state. `llm-refinery compare --param system.hardware.model --param system.hardware.memory_gb` can display it.
+- Bench, lm-eval, HTTP-load, and agent-eval runs record structured host metadata in `runs.system_json` for cross-machine history: macOS version, hardware model, chip/CPU fields when available, memory size, Python path/version, project version, and git head/dirty state. `llm-refinery compare --param system.hardware.model --param system.hardware.memory_gb` can display it.
 - Server params support an `mtp_head` helper for Gemma/Qwen MTP draft heads. It expands to `--model-draft <path>` and, in `llm-refinery server`, auto-downloads when `hf` + `file` or `url` is provided:
 
   ```yaml

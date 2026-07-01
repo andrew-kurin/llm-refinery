@@ -87,7 +87,7 @@ def _build_compare_row(
         "trial_name": run["trial_name"],
         "status": run["status"],
         "duration_s": run["duration_s"],
-        "model": (config.get("model") or {}).get("name", ""),
+        "model": _model_name(config.get("model")),
         "prompt_tokens": prompt_tokens if prompt_tokens is not None else "",
         "gen_tokens": gen_tokens if gen_tokens is not None else "",
         "_metric_keys": metric_keys,
@@ -98,10 +98,18 @@ def _build_compare_row(
         if key.startswith("system."):
             row[key] = _lookup_dotted(run.get("system_json") or {}, key.removeprefix("system."))
         else:
-            row[key] = trial_params.get(key, "")
+            row[key] = trial_params.get(key, config.get(key, ""))
     for key in metric_keys:
         row[key] = metric_value(key, metrics, prompt_tokens=prompt_tokens, gen_tokens=gen_tokens)
     return row
+
+
+def _model_name(value: object) -> str:
+    if isinstance(value, dict):
+        return str(value.get("name") or "")
+    if value is None:
+        return ""
+    return str(value)
 
 
 def _lookup_dotted(data: dict[str, Any], key: str) -> object:

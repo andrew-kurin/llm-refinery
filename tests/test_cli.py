@@ -49,6 +49,33 @@ def test_lm_eval_command_dry_run_uses_python_cli():
     assert 'reasoning_effort="none"' in result.output
 
 
+def test_lm_eval_command_dry_run_supports_include_path_and_suite_db(tmp_path):
+    include_path = tmp_path / "tasks"
+    include_path.mkdir()
+    result = CliRunner().invoke(
+        main,
+        [
+            "lm-eval",
+            "llama_cpp",
+            "5",
+            "--tasks",
+            "gpqa_main_fixed_generative",
+            "--include-path",
+            str(include_path),
+            "--suite-name",
+            "quality-reasoning",
+            "--db",
+            str(tmp_path / "runs.duckdb"),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "--include_path" in result.output
+    assert str(include_path) in result.output
+    assert "gpqa_main_fixed_generative" in result.output
+
+
 def test_compare_command_shows_params_and_sorts_by_generation_tps(tmp_path):
     database = tmp_path / "runs.duckdb"
     now = utc_now()

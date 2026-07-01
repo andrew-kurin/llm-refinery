@@ -1,6 +1,27 @@
 from llm_refinery.compare import build_compare_rows
 
 
+def test_build_compare_rows_supports_lm_eval_root_model_and_params():
+    rows = build_compare_rows(
+        [
+            {
+                "run_id": "quality-12b",
+                "trial_name": "quality/12b",
+                "status": "ok",
+                "duration_s": 10.0,
+                "config_json": {"benchmark": "lm-eval", "model": "gemma-12b", "target": "ollama"},
+                "metrics": {"gpqa_main_fixed_generative.flexible-extract.exact_match": 0.529},
+                "system_json": {},
+            }
+        ],
+        metrics=("gpqa_main_fixed_generative.flexible-extract.exact_match",),
+        params=("target",),
+    )
+
+    assert rows[0]["model"] == "gemma-12b"
+    assert rows[0]["target"] == "ollama"
+
+
 def test_compare_sort_keeps_missing_metrics_last_when_ascending():
     runs = [
         {

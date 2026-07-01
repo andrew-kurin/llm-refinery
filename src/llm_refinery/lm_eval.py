@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from llm_refinery.storage import ResultStore, RunRecord, utc_now
+from llm_refinery.utils.system import get_system_profile
 
 TARGET_CHOICES = ("llama_cpp", "ollama", "mlx_e4b", "mlx_26b", "both", "all")
 TARGET_ORDER = ("llama_cpp", "ollama", "mlx_e4b", "mlx_26b")
@@ -30,6 +35,11 @@ class LmEvalConfig:
     gen_kwargs: str | None = None
     output_root: Path = Path("results/lm_eval")
     offline: bool = True
+    model_backend: str = "local-chat-completions"
+    apply_chat_template: bool = True
+    include_path: Path | None = None
+    suite_name: str = "lm-eval"
+    database: Path = Path("results/llm_refinery.duckdb")
     targets: dict[str, LmEvalTarget] = field(default_factory=dict)
 
 
@@ -92,7 +102,7 @@ def build_lm_eval_command(config: LmEvalConfig, target: LmEvalTarget) -> list[st
         "immutabledict",
         "lm_eval",
         "--model",
-        "local-chat-completions",
+        config.model_backend,
         "--model_args",
         model_args,
         "--tasks",
@@ -104,8 +114,11 @@ def build_lm_eval_command(config: LmEvalConfig, target: LmEvalTarget) -> list[st
     if config.limit is not None:
         cmd.extend(["--limit", str(config.limit)])
 
-    cmd.append("--apply_chat_template")
+    if config.apply_chat_template:
+        cmd.append("--apply_chat_template")
 
+    if config.include_path is not None:
+        cmd.extend(["--include_path", str(config.include_path)])
     if config.log_samples:
         cmd.append("--log_samples")
     if config.gen_kwargs:
@@ -122,7 +135,6 @@ def run_lm_eval(config: LmEvalConfig, *, dry_run: bool = False) -> None:
 
     env = os.environ.copy()
     env["HF_DATASETS_OFFLINE"] = "1" if config.offline else "0"
-
     for target_name in selected:
         target = targets[target_name]
         limit_text = str(config.limit) if config.limit is not None else "all"
@@ -136,7 +148,10 @@ def run_lm_eval(config: LmEvalConfig, *, dry_run: bool = False) -> None:
         )
         output_path = config.output_root / target.name
 
-        print(f"==> Running lm-eval target={target.name} tasks={config.tasks} limit={limit_text}")
+        print(
+            f"==> Running lm-eval target={target.name} "
+            f"tasks={config.tasks} limit={limit_text}"
+        )
         print(f"    model_args={model_args}")
         print(f"    output_path={output_path}")
 
@@ -145,8 +160,86 @@ def run_lm_eval(config: LmEvalConfig, *, dry_run: bool = False) -> None:
             print(shlex.join(cmd))
             continue
 
+        started_at = utc_now()
+        result_started_mtime = time.time()
         completed = subprocess.run(cmd, env=env, check=False)
+        ended_at = utc_now()
+        result_json = latest_lm_eval_result(output_path, newer_than=result_started_mtime)
+        metrics = parse_lm_eval_metrics(result_json) if result_json else {}
+        with ResultStore(config.database) as store:
+            store.record_run(
+                RunRecord(
+                    run_id=(
+                        f"{config.suite_name}-{target.name}-"
+                        f"{started_at.strftime('%Y%m%d%H%M%S%f')}"
+                    ),
+                    suite=config.suite_name,
+                    trial_name=f"{config.suite_name}/{target.name}",
+                    status="ok" if completed.returncode == 0 else "failed",
+                    started_at=started_at,
+                    ended_at=ended_at,
+                    duration_s=(ended_at - started_at).total_seconds(),
+                    command=shlex.join(cmd),
+                    cwd=os.getcwd(),
+                    config_json={
+                        "benchmark": "lm-eval",
+                        "model_backend": config.model_backend,
+                        "apply_chat_template": config.apply_chat_template,
+                        "target": target.name,
+                        "model": target.model,
+                        "base_url": target.base_url,
+                        "tasks": config.tasks,
+                        "limit": config.limit,
+                        "max_length": config.max_length,
+                        "eos_string": config.eos_string,
+                        "gen_kwargs": config.gen_kwargs,
+                        "include_path": str(config.include_path) if config.include_path else None,
+                    },
+                    metrics=metrics,
+                    system_json=get_system_profile(),
+                    stdout_path=str(result_json) if result_json else None,
+                    error=(
+                        None
+                        if completed.returncode == 0
+                        else f"exit code {completed.returncode}"
+                    ),
+                )
+            )
         if completed.returncode != 0:
             raise RuntimeError(
                 f"lm-eval failed for {target.name}: exit code {completed.returncode}"
             )
+
+
+def latest_lm_eval_result(output_path: Path, *, newer_than: float | None = None) -> Path | None:
+    if not output_path.exists():
+        return None
+    result_candidates = [p for p in output_path.rglob("*.json") if "result" in p.name.lower()]
+    candidates = result_candidates or list(output_path.rglob("*.json"))
+    if newer_than is not None:
+        candidates = [path for path in candidates if path.stat().st_mtime >= newer_than]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def parse_lm_eval_metrics(result_path: Path) -> dict[str, float]:
+    raw = json.loads(result_path.read_text(encoding="utf-8"))
+    results = raw.get("results") or {}
+    metrics: dict[str, float] = {}
+    for task_name, task_results in results.items():
+        if not isinstance(task_results, dict):
+            continue
+        for raw_name, value in task_results.items():
+            if not isinstance(value, (int, float)):
+                continue
+            metric_name = normalize_lm_eval_metric_name(str(task_name), str(raw_name))
+            metrics[metric_name] = float(value)
+    return metrics
+
+
+def normalize_lm_eval_metric_name(task_name: str, raw_name: str) -> str:
+    if "," not in raw_name:
+        return f"{task_name}.{raw_name}"
+    metric, filter_name = raw_name.split(",", 1)
+    return f"{task_name}.{filter_name}.{metric}"

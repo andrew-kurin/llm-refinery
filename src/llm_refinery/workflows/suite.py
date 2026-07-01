@@ -24,6 +24,7 @@ class BenchmarkSuiteWorkflow:
         max_length: int = 8192,
         eos_string: str = "<turn|>",
         gen_kwargs: str | None = None,
+        include_path: Path | None = None,
         run_lm_eval: bool = True,
         run_http_load: bool = False,
         require_clean: bool = True,
@@ -38,6 +39,7 @@ class BenchmarkSuiteWorkflow:
         self.max_length = max_length
         self.eos_string = eos_string
         self.gen_kwargs = gen_kwargs
+        self.include_path = include_path
         self.run_lm_eval = run_lm_eval
         self.run_http_load = run_http_load
         self.require_clean = require_clean
@@ -101,6 +103,9 @@ class BenchmarkSuiteWorkflow:
                     max_length=self.max_length,
                     eos_string=self.eos_string,
                     gen_kwargs=self.gen_kwargs,
+                    include_path=self.include_path,
+                    suite_name=self.config.name,
+                    database=self.config.database,
                     targets={
                         "llama_cpp": LmEvalTarget(
                             name="llama_cpp",
