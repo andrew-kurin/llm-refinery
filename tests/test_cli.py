@@ -183,7 +183,7 @@ def test_backfill_system_metadata_command(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(
-        "llm_refinery.cli.get_system_profile",
+        "llm_refinery.commands.system.get_system_profile",
         lambda: {"hardware": {"model": "Mac16,12", "memory_gb": 32.0}},
     )
 
