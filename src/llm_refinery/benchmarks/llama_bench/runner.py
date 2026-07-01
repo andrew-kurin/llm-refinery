@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-import subprocess
 import time
 from pathlib import Path
 
@@ -9,15 +7,18 @@ from rich.console import Console
 from rich.progress import Progress, TaskID
 
 from llm_refinery.bench_parser import parse_llama_bench_metrics
+from llm_refinery.benchmarks.llama_bench.command import print_plan
+from llm_refinery.benchmarks.llama_bench.process import run_bench_process
 from llm_refinery.benchmarks.llama_bench.progress import (
     BenchProgress,
     make_bench_progress,
     trial_description,
     update_rich_progress,
 )
+from llm_refinery.benchmarks.llama_bench.reporting import metric_summary, tail
 from llm_refinery.config import Trial, TuneConfig, expand_trials
 from llm_refinery.core.runs import make_run_id, prepare_artifact_dir, record_benchmark_run
-from llm_refinery.llama_cmd import build_bench_command, build_server_command, shell_join
+from llm_refinery.llama_cmd import build_bench_command, shell_join
 from llm_refinery.providers.llama_cpp import detect_llama_version
 from llm_refinery.storage import ResultStore, utc_now
 
@@ -26,25 +27,6 @@ PROGRESS_INTERVAL_S = 0.5
 
 class RunFailed(RuntimeError):
     pass
-
-
-def print_plan(config: TuneConfig, *, kind: str = "bench", limit: int | None = None) -> None:
-    trials = expand_trials(config, include_bench_dimensions=(kind == "bench"))
-    if limit is not None:
-        trials = trials[:limit]
-
-    for index, trial in enumerate(trials):
-        if kind == "bench":
-            cmd = build_bench_command(config, trial)
-        else:
-            cmd = build_server_command(config, trial)
-        print(f"# [{index}] {trial.name}")
-        print(shell_join(cmd))
-        print()
-
-    total = len(expand_trials(config, include_bench_dimensions=(kind == "bench")))
-    shown = len(trials)
-    print(f"planned {shown} of {total} {kind} command(s)")
 
 
 def run_bench(
@@ -184,7 +166,7 @@ def _run_one_bench(
             trial_started_monotonic=monotonic_start,
         )
 
-    completed = _run_process(
+    completed = run_bench_process(
         cmd,
         progress_state=progress_state,
         rich_progress=rich_progress,
@@ -231,86 +213,16 @@ def _run_one_bench(
             trial_started_monotonic=None,
         )
 
-    metric_summary = _metric_summary(metrics)
-    if metric_summary:
-        console.print(f"stored {status}: {run_id} ({metric_summary})", markup=False)
+    summary = metric_summary(metrics)
+    if summary:
+        console.print(f"stored {status}: {run_id} ({summary})", markup=False)
     else:
         console.print(f"stored {status}: {run_id} (no metrics parsed)", markup=False)
 
     if completed.returncode != 0:
-        stderr_tail = _tail(completed.stderr or completed.stdout)
+        stderr_tail = tail(completed.stderr or completed.stdout)
         details = f"; stderr tail: {stderr_tail}" if stderr_tail else ""
         raise RunFailed(
             f"{trial.name} failed with exit code {completed.returncode}{details}; "
             f"artifacts: {stdout_path}, {stderr_path}"
         )
-
-
-def _metric_summary(metrics: dict[str, float], *, limit: int = 4) -> str:
-    if not metrics:
-        return ""
-
-    preferred = [
-        (key, value) for key, value in metrics.items() if key.endswith(".tokens_per_second")
-    ]
-    remaining = [(key, value) for key, value in metrics.items() if (key, value) not in preferred]
-    selected = [*preferred, *remaining][:limit]
-    return ", ".join(f"{key}={value:.3f}" for key, value in selected)
-
-
-def _tail(output: str, *, lines: int = 6) -> str:
-    stripped_lines = [line.strip() for line in output.splitlines() if line.strip()]
-    return " | ".join(stripped_lines[-lines:])
-
-
-def _run_process(
-    cmd: list[str],
-    *,
-    progress_state: BenchProgress,
-    rich_progress: Progress | None,
-    progress_task_id: TaskID | None,
-    trial_started_monotonic: float,
-    progress_interval_s: float,
-) -> subprocess.CompletedProcess[str]:
-    if rich_progress is None or progress_task_id is None:
-        return subprocess.run(  # noqa: S603 - command is user config
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-            env=os.environ.copy(),
-        )
-
-    process = subprocess.Popen(  # noqa: S603 - command is user config
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=os.environ.copy(),
-    )
-
-    poll_interval_s = max(progress_interval_s, 0.1)
-    while True:
-        try:
-            stdout, stderr = process.communicate(timeout=poll_interval_s)
-            update_rich_progress(
-                rich_progress,
-                progress_task_id,
-                progress_state,
-                trial_started_monotonic=trial_started_monotonic,
-            )
-            return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
-        except subprocess.TimeoutExpired:
-            update_rich_progress(
-                rich_progress,
-                progress_task_id,
-                progress_state,
-                trial_started_monotonic=trial_started_monotonic,
-            )
-        except KeyboardInterrupt:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-            raise
