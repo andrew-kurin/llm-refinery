@@ -6,13 +6,9 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from llm_refinery.agent_eval import (
-    AgentEvalConfig,
-    AgentEvalResult,
-    AgentEvalTarget,
-    GeoAnalystBenchSpec,
-    run_agent_eval,
-)
+from llm_refinery.agent_eval import AgentEvalConfig, AgentEvalTarget, run_agent_eval
+from llm_refinery.benchmarks.agent.base import AgentEvalResult
+from llm_refinery.benchmarks.agent.geoanalystbench import GeoAnalystBenchSpec
 from llm_refinery.cli import main
 from llm_refinery.storage import ResultStore
 

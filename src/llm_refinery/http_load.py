@@ -14,11 +14,11 @@ from typing import Any
 import yaml
 
 from llm_refinery.config import ConfigError, coerce_list, stable_hash
+from llm_refinery.core.metrics import add_distribution_metrics
 from llm_refinery.storage import ResultStore, RunRecord, utc_now
 from llm_refinery.utils.system import get_system_profile
 
 PROVIDERS = {"openai", "ollama"}
-PERCENTILES = (50, 90, 95, 99)
 
 
 @dataclass(frozen=True)
@@ -414,8 +414,8 @@ def summarize_request_results(
         else 0.0,
     }
 
-    _add_distribution_metrics(metrics, "latency", [result.latency_s for result in successes])
-    _add_distribution_metrics(
+    add_distribution_metrics(metrics, "latency", [result.latency_s for result in successes])
+    add_distribution_metrics(
         metrics,
         "ttft",
         [result.ttft_s for result in successes if result.ttft_s is not None],
@@ -457,7 +457,7 @@ def summarize_request_results(
         and result.server_eval_duration_s is not None
         and result.server_eval_duration_s > 0
     ]
-    _add_distribution_metrics(metrics, "server_eval_tps", eval_tps)
+    add_distribution_metrics(metrics, "server_eval_tps", eval_tps, unit_suffix="")
 
     prompt_eval_tps = [
         result.prompt_tokens / result.server_prompt_eval_duration_s
@@ -466,7 +466,7 @@ def summarize_request_results(
         and result.server_prompt_eval_duration_s is not None
         and result.server_prompt_eval_duration_s > 0
     ]
-    _add_distribution_metrics(metrics, "server_prompt_eval_tps", prompt_eval_tps)
+    add_distribution_metrics(metrics, "server_prompt_eval_tps", prompt_eval_tps, unit_suffix="")
     return metrics
 
 
@@ -839,34 +839,6 @@ def _scenario_prompt(raw: dict[str, Any], *, base_dir: Path) -> str:
     if not prompt_path.is_absolute():
         prompt_path = base_dir / prompt_path
     return prompt_path.read_text(encoding="utf-8")
-
-
-def _add_distribution_metrics(
-    metrics: dict[str, float], prefix: str, values: list[float | None]
-) -> None:
-    clean_values = sorted(float(value) for value in values if value is not None)
-    if not clean_values:
-        return
-
-    unit_suffix = "" if prefix.endswith("tps") else "_s"
-    metrics[f"{prefix}_avg{unit_suffix}"] = sum(clean_values) / len(clean_values)
-    metrics[f"{prefix}_min{unit_suffix}"] = clean_values[0]
-    metrics[f"{prefix}_max{unit_suffix}"] = clean_values[-1]
-    for percentile in PERCENTILES:
-        metrics[f"{prefix}_p{percentile}{unit_suffix}"] = _percentile(
-            clean_values,
-            percentile / 100,
-        )
-
-
-def _percentile(sorted_values: list[float], fraction: float) -> float:
-    if len(sorted_values) == 1:
-        return sorted_values[0]
-    position = (len(sorted_values) - 1) * fraction
-    lower = int(position)
-    upper = min(lower + 1, len(sorted_values) - 1)
-    weight = position - lower
-    return sorted_values[lower] * (1 - weight) + sorted_values[upper] * weight
 
 
 def _int_from_mapping(mapping: dict[str, Any] | None, key: str) -> int | None:

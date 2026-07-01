@@ -11,12 +11,13 @@ benchmark path before full DABStep runs are reproducible.
   structured host metadata in DuckDB.
 - `http-load` stores OpenAI/Ollama-compatible latency, TTFT, throughput, response
   artifacts, parsed metrics, and structured host metadata in DuckDB.
-- `agent-eval` now provides a generic agent/data benchmark entry point with an
-  initial `geoanalystbench` adapter. It stores per-request artifacts, aggregate
-  metrics, and structured host metadata in DuckDB.
+- `agent-eval` now provides a generic agent/data benchmark entry point backed by
+  adapter modules under `llm_refinery.benchmarks.agent`. The initial
+  `geoanalystbench` adapter stores per-request artifacts, aggregate metrics, and
+  structured host metadata in DuckDB.
 - `suite` orchestrates preflight, sanity, `lm-eval`, HTTP load, and comparison.
-- `lm-eval` is invoked through Python, but its aggregate metrics are currently
-  left in `results/lm_eval/...` and are not normalized into DuckDB.
+- `lm-eval` is invoked through Python and now records aggregate metrics in DuckDB
+  while preserving the original `results/lm_eval/...` JSON artifact path.
 - `suite` prints pre/post memory snapshots, but the structured machine profile is
   recorded only by bench/http-load/agent-eval runs. Full suite-level pre/post
   snapshots are not yet stored as artifacts.
@@ -97,8 +98,8 @@ rows/artifacts when available. Minimum metrics to normalize:
 1. Extend `agent-eval` with a DABStep adapter once the output schema is confirmed
    locally.
 2. Add structured suite-level system snapshot artifacts.
-3. Normalize `lm-eval` JSON results into DuckDB so all quality benchmarks share
-   one reporting path.
+3. Split the large CLI and HTTP-load modules along the same adapter/lifecycle
+   boundaries.
 4. Run a 5-10 task DABStep smoke on the 32 GB Mac with Gemma 26B `UD-Q4_K_XL` and
    Ollama Gemma 12B Q8.
 5. Run larger/full DABStep comparisons on the 128 GB M5 Max.
