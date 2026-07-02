@@ -8,7 +8,7 @@ import yaml
 
 from llm_refinery.config import ConfigError, coerce_list, stable_hash
 
-PROVIDERS = {"openai", "ollama"}
+PROVIDERS = {"openai", "ollama", "cerebras"}
 
 
 @dataclass(frozen=True)

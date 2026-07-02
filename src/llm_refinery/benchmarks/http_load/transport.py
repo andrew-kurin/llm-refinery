@@ -38,7 +38,7 @@ def run_requests(trial: HttpLoadTrial, *, count: int) -> list[RequestResult]:
 
 
 def execute_http_request(trial: HttpLoadTrial, index: int) -> RequestResult:
-    if trial.target.provider == "openai":
+    if trial.target.provider in ("openai", "cerebras"):
         return execute_openai_request(trial, index)
     if trial.target.provider == "ollama":
         return execute_ollama_request(trial, index)
