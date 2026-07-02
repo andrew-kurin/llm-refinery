@@ -4,8 +4,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-TARGET_CHOICES = ("llama_cpp", "ollama", "mlx_e4b", "mlx_26b", "both", "all")
-TARGET_ORDER = ("llama_cpp", "ollama", "mlx_e4b", "mlx_26b")
+TARGET_CHOICES = ("llama_cpp", "ollama", "mlx_e4b", "mlx_26b", "ollama_31b", "ollama_31b_mlx", "cerebras_31b", "both", "all")
+TARGET_ORDER = ("llama_cpp", "ollama", "mlx_e4b", "mlx_26b", "ollama_31b", "ollama_31b_mlx", "cerebras_31b")
 
 
 @dataclass(frozen=True)
@@ -60,6 +60,21 @@ def default_targets(env: dict[str, str] | None = None) -> dict[str, LmEvalTarget
             name="mlx_26b",
             model=env.get("MLX_26B_MODEL", "mlx-community/gemma-4-26B-A4B-it-OptiQ-4bit"),
             base_url=env.get("MLX_26B_BASE_URL", "http://127.0.0.1:8082/v1/chat/completions"),
+        ),
+        "ollama_31b": LmEvalTarget(
+            name="ollama_31b",
+            model=env.get("OLLAMA_31B_MODEL", "gemma4:31b"),
+            base_url=env.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1/chat/completions"),
+        ),
+        "ollama_31b_mlx": LmEvalTarget(
+            name="ollama_31b_mlx",
+            model=env.get("OLLAMA_31B_MLX_MODEL", "gemma4:31b-mlx"),
+            base_url=env.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1/chat/completions"),
+        ),
+        "cerebras_31b": LmEvalTarget(
+            name="cerebras_31b",
+            model=env.get("CEREBRAS_31B_MODEL", "gemma-4-31b"),
+            base_url=env.get("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1/chat/completions"),
         ),
     }
 
