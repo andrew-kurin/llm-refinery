@@ -89,7 +89,11 @@ def json_headers(
     api_key_env: str | None = None,
     accept: bool = True,
 ) -> dict[str, str]:
-    resolved = {"Content-Type": "application/json", **(headers or {})}
+    resolved = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        **(headers or {}),
+    }
     if accept:
         resolved.setdefault("Accept", "application/json")
     if api_key_env and "Authorization" not in resolved:
