@@ -25,6 +25,7 @@ class LmEvalConfig:
     max_length: int = 16384
     eos_string: str = "<turn|>"
     log_samples: bool = False
+    num_fewshot: int | None = None
     gen_kwargs: str | None = None
     output_root: Path = Path("results/lm_eval")
     offline: bool = True

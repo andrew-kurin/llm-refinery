@@ -44,9 +44,9 @@ from llm_refinery.workflows.suite import BenchmarkSuiteWorkflow
     help="Fail if other model servers are running.",
 )
 @click.option(
-    "--llama-cpp-base-url",
+    "--base-url",
     default="http://127.0.0.1:8080/v1/chat/completions",
-    help="API URL for sanity check.",
+    help="API URL for sanity check and quality evals.",
 )
 @click.option(
     "--api-model",
@@ -69,7 +69,7 @@ def suite_command(
     run_lm_eval: bool,
     run_http_load: bool | None,
     require_clean: bool,
-    llama_cpp_base_url: str,
+    base_url: str,
     api_model: str | None,
     http_load_config: Path | None,
     target: str | None,
@@ -90,7 +90,7 @@ def suite_command(
         run_lm_eval=run_lm_eval,
         run_http_load=effective_run_http_load,
         require_clean=require_clean,
-        llama_cpp_base_url=llama_cpp_base_url,
+        base_url=base_url,
         http_load_config=http_load_config,
         target_name=target,
         api_model=api_model or tune_config.eval.api_model,

@@ -92,6 +92,7 @@ class ServerSpec:
 class EvalSpec:
     tasks: str = "ifeval,gsm8k"
     limit: int | None = 50
+    num_fewshot: int | None = None
     max_length: int = 8192
     eos_string: str = "<turn|>"
     gen_kwargs: str | None = None
@@ -112,6 +113,7 @@ class EvalSpec:
         return cls(
             tasks=str(raw.get("tasks") or "ifeval,gsm8k"),
             limit=limit,
+            num_fewshot=int(raw.get("num_fewshot")) if raw.get("num_fewshot") is not None else None,
             max_length=int(raw.get("max_length", 8192)),
             eos_string=str(raw.get("eos_string") or "<turn|>"),
             gen_kwargs=str(raw["gen_kwargs"]) if raw.get("gen_kwargs") else None,

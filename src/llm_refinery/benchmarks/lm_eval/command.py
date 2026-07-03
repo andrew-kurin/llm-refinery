@@ -36,6 +36,9 @@ def build_lm_eval_command(config: LmEvalConfig, target: LmEvalTarget) -> list[st
     if config.limit is not None:
         cmd.extend(["--limit", str(config.limit)])
 
+    if config.num_fewshot is not None:
+        cmd.extend(["--num_fewshot", str(config.num_fewshot)])
+
     if config.apply_chat_template:
         cmd.append("--apply_chat_template")
 

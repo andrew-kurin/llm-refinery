@@ -60,6 +60,7 @@ from llm_refinery.lm_eval import (
     help="DuckDB path for parsed lm-eval metrics.",
 )
 @click.option("--log-samples", is_flag=True, help="Pass --log_samples to lm-eval.")
+@click.option("--num-fewshot", type=int, help="Override task few-shot count for lm-eval.")
 @click.option("--model", help="Override model name for a single target.")
 @click.option("--base-url", help="Override chat-completions URL for a single target.")
 @click.option(
@@ -90,6 +91,7 @@ def lm_eval_command(
     suite_name: str,
     db: Path,
     log_samples: bool,
+    num_fewshot: int | None,
     model: str | None,
     base_url: str | None,
     output_root: Path,
@@ -118,6 +120,7 @@ def lm_eval_command(
             max_length=max_length,
             eos_string=eos_string,
             log_samples=log_samples,
+            num_fewshot=num_fewshot,
             gen_kwargs=gen_kwargs,
             output_root=output_root,
             offline=offline,

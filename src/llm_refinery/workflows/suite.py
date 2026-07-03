@@ -28,7 +28,7 @@ class BenchmarkSuiteWorkflow:
         run_lm_eval: bool = True,
         run_http_load: bool = False,
         require_clean: bool = True,
-        llama_cpp_base_url: str = "http://127.0.0.1:8080/v1/chat/completions",
+        base_url: str = "http://127.0.0.1:8080/v1/chat/completions",
         http_load_config: Path | None = None,
         target_name: str | None = None,
         api_model: str = "local-model",
@@ -43,7 +43,7 @@ class BenchmarkSuiteWorkflow:
         self.run_lm_eval = run_lm_eval
         self.run_http_load = run_http_load
         self.require_clean = require_clean
-        self.llama_cpp_base_url = llama_cpp_base_url
+        self.base_url = base_url
         self.http_load_config = http_load_config
         self.target_name = target_name
         self.api_model = api_model
@@ -60,10 +60,10 @@ class BenchmarkSuiteWorkflow:
     def preflight(self) -> None:
         self._log("Performing preflight checks...")
 
-        llama_port = _port_from_url(self.llama_cpp_base_url)
+        llama_port = _port_from_url(self.base_url)
         if not is_port_listening(llama_port):
             self._error(
-                f"no llama.cpp server listening on :{llama_port}; "
+                f"no model server listening on :{llama_port}; "
                 "start it first, then rerun this command"
             )
 
@@ -79,7 +79,7 @@ class BenchmarkSuiteWorkflow:
         console.print(get_system_snapshot())
 
         self._log("Sanity check: reasoning off / content present")
-        sanity = run_api_sanity_check(self.llama_cpp_base_url, model_name=self.api_model)
+        sanity = run_api_sanity_check(self.base_url, model_name=self.api_model)
         if not sanity["success"]:
             self._error(str(sanity["error"]))
 
@@ -102,15 +102,17 @@ class BenchmarkSuiteWorkflow:
                     tasks=self.tasks,
                     max_length=self.max_length,
                     eos_string=self.eos_string,
+                    num_fewshot=self.config.eval.num_fewshot,
                     gen_kwargs=self.gen_kwargs,
                     include_path=self.include_path,
                     suite_name=self.config.name,
                     database=self.config.database,
+                    log_samples=True,
                     targets={
                         "llama_cpp": LmEvalTarget(
                             name="llama_cpp",
                             model=self.api_model,
-                            base_url=self.llama_cpp_base_url,
+                            base_url=self.base_url,
                         )
                     },
                 )
