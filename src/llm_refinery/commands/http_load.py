@@ -4,7 +4,8 @@ from pathlib import Path
 
 import click
 
-from llm_refinery.http_load import load_http_load_config, run_http_load
+from llm_refinery.benchmarks.http_load.config import load_http_load_config
+from llm_refinery.benchmarks.http_load.runner import run_http_load
 
 
 @click.command("http-load", help="Run OpenAI/Ollama-compatible HTTP load evals.")
@@ -33,9 +34,9 @@ def http_load_command(
     keep_going: bool,
     db: Path | None,
 ) -> None:
-    load_config = load_http_load_config(config)
+    http_config = load_http_load_config(config)
     run_http_load(
-        load_config,
+        http_config,
         target_names=targets,
         scenario_names=scenarios,
         limit=limit,

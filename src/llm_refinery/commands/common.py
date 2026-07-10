@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+from collections.abc import Sequence
 
 import click
 
@@ -17,7 +18,7 @@ def parse_lm_eval_limit(value: str) -> int | None:
     return parsed
 
 
-def table(rows: list[tuple[object, ...]]) -> str:
+def table(rows: Sequence[Sequence[object]]) -> str:
     widths = [0] * max(len(row) for row in rows)
     rendered = [[str(cell) for cell in row] for row in rows]
     for row in rendered:

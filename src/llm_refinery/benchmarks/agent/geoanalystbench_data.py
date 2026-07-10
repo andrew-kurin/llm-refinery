@@ -5,9 +5,9 @@ import io
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
-from llm_refinery.config import ConfigError
+from llm_refinery.core.config import ConfigError
 
 DEFAULT_GEOANALYSTBENCH_DATASET = (
     "https://raw.githubusercontent.com/GeoDS/GeoAnalystBench/"
@@ -61,7 +61,20 @@ def load_geoanalyst_tasks(dataset: str) -> list[GeoAnalystTask]:
     return [GeoAnalystTask.from_row(row) for row in rows]
 
 
-def select_geoanalyst_tasks(tasks: list[GeoAnalystTask], benchmark: Any) -> list[GeoAnalystTask]:
+class GeoAnalystSelection(Protocol):
+    @property
+    def open_source_only(self) -> bool: ...
+
+    @property
+    def task_ids(self) -> tuple[int, ...]: ...
+
+    @property
+    def limit(self) -> int | None: ...
+
+
+def select_geoanalyst_tasks(
+    tasks: list[GeoAnalystTask], benchmark: GeoAnalystSelection
+) -> list[GeoAnalystTask]:
     selected = tasks
     if benchmark.open_source_only:
         selected = [task for task in selected if task.open_source]

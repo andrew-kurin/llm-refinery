@@ -10,23 +10,23 @@ database: results/llm_refinery.duckdb
 #   ollama list
 targets:
   - name: llama-f16-kv
-    provider: openai
+    protocol: openai_chat
     base_url: http://127.0.0.1:8080/v1
     # llama.cpp server usually accepts any model string for the local model.
     model: local-model
 
   - name: ollama-gemma
-    provider: ollama
+    protocol: ollama_chat
     base_url: http://127.0.0.1:11434
     model: gemma4:26b
 
   - name: mlx-gemma-e4b-optiq
-    provider: openai
+    protocol: openai_chat
     base_url: http://127.0.0.1:8081/v1
     model: mlx-community/gemma-4-e4b-it-OptiQ-4bit
 
   - name: mlx-gemma-26b-optiq
-    provider: openai
+    protocol: openai_chat
     base_url: http://127.0.0.1:8082/v1
     model: mlx-community/gemma-4-26B-A4B-it-OptiQ-4bit
 

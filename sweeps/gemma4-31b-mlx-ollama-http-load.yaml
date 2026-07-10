@@ -4,7 +4,7 @@ database: results/llm_refinery.duckdb
 
 targets:
   - name: ollama-gemma4-31b-mlx
-    provider: ollama
+    protocol: ollama_chat
     base_url: http://127.0.0.1:11434
     model: gemma4:31b-mlx
 

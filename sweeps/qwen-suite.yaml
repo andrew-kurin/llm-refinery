@@ -2,12 +2,23 @@ name: qwen-suite
 
 database: results/llm_refinery.duckdb
 
-models:
-  - name: local-qwen
-    hf: local/qwen
+endpoint:
+  name: local-qwen
+  protocol: openai_chat
+  base_url: http://127.0.0.1:8080/v1
+  model: local-model
 
-eval:
+quality:
+  enabled: true
   tasks: ifeval,gsm8k
   limit: 50
   max_length: 8192
   eos_string: "<|im_end|>"
+
+http_load:
+  enabled: false
+
+preflight:
+  enabled: true
+  require_clean: true
+  sanity_check: true

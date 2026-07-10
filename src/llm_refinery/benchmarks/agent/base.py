@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, Self
 
-from llm_refinery.config import stable_hash
+from llm_refinery.core.config import ConfigError, reject_unknown_keys
+from llm_refinery.core.endpoints import Endpoint
+from llm_refinery.core.runs import stable_hash
 
 
 class _Unset:
@@ -30,11 +32,25 @@ class AgentEvalRequestConfig:
     @classmethod
     def from_mapping(cls, raw: dict[str, Any] | None) -> AgentEvalRequestConfig:
         raw = raw or {}
+        reject_unknown_keys(
+            raw,
+            {"temperature", "max_tokens", "timeout_s", "retries", "seed", "extra_body"},
+            context="agent-eval request",
+        )
+        max_tokens = int(raw.get("max_tokens", 1024))
+        timeout_s = float(raw.get("timeout_s", 600.0))
+        retries = int(raw.get("retries", 1))
+        if max_tokens <= 0:
+            raise ConfigError("agent-eval request.max_tokens must be positive")
+        if timeout_s <= 0:
+            raise ConfigError("agent-eval request.timeout_s must be positive")
+        if retries < 0:
+            raise ConfigError("agent-eval request.retries cannot be negative")
         return cls(
             temperature=float(raw.get("temperature", 0.0)),
-            max_tokens=int(raw.get("max_tokens", 1024)),
-            timeout_s=float(raw.get("timeout_s", 600.0)),
-            retries=int(raw.get("retries", 1)),
+            max_tokens=max_tokens,
+            timeout_s=timeout_s,
+            retries=retries,
             seed=int(raw["seed"]) if raw.get("seed") is not None else None,
             extra_body=dict(raw.get("extra_body") or {}),
         )
@@ -73,6 +89,7 @@ class AgentEvalRequest:
                 "task": self.task.safe_json(),
                 "prompt_variant": self.prompt_variant,
                 "response_type": self.response_type,
+                "system": self.system,
                 "prompt": self.prompt,
                 "request": self.config.safe_json(),
             }
@@ -122,15 +139,16 @@ class AgentEvalResult:
 
 
 class ChatClient(Protocol):
-    def complete(self, target: Any, request: AgentEvalRequest) -> AgentEvalResult: ...
+    def complete(self, target: Endpoint, request: AgentEvalRequest) -> AgentEvalResult: ...
 
 
 class AgentBenchmarkSpec(Protocol):
-    kind: str
+    @property
+    def kind(self) -> str: ...
 
     def with_overrides(
         self, *, limit: LimitOverride = UNSET, task_ids: tuple[int, ...] | None = None
-    ) -> AgentBenchmarkSpec: ...
+    ) -> Self: ...
 
     def safe_json(self) -> dict[str, Any]: ...
 

@@ -1,13 +1,12 @@
-from llm_refinery.benchmarks.http_load import (
-    HttpLoadConfig,
-    RequestResult,
-    expand_http_load_trials,
-    summarize_request_results,
-)
+from llm_refinery.benchmarks.http_load.config import HttpLoadConfig, expand_http_load_trials
+from llm_refinery.benchmarks.http_load.metrics import summarize_request_results
+from llm_refinery.benchmarks.http_load.models import RequestResult
+from llm_refinery.benchmarks.http_load.runner import run_http_load
 from llm_refinery.benchmarks.http_load.transport import (
     read_ollama_stream,
     read_openai_stream,
 )
+from llm_refinery.storage.duckdb import ResultStore
 
 
 def test_expand_http_load_trials_crosses_targets_scenarios_concurrency_and_tokens():
@@ -17,13 +16,13 @@ def test_expand_http_load_trials_crosses_targets_scenarios_concurrency_and_token
             "targets": [
                 {
                     "name": "llama",
-                    "provider": "openai",
+                    "protocol": "openai_chat",
                     "base_url": "http://127.0.0.1:8080/v1",
                     "model": "local",
                 },
                 {
                     "name": "ollama",
-                    "provider": "ollama",
+                    "protocol": "ollama_chat",
                     "base_url": "http://127.0.0.1:11434",
                     "model": "gemma",
                 },
@@ -47,6 +46,54 @@ def test_expand_http_load_trials_crosses_targets_scenarios_concurrency_and_token
     assert {trial.concurrency for trial in trials} == {1, 2}
     assert {trial.max_tokens for trial in trials} == {32, 64}
     assert all("params" in trial.as_jsonable() for trial in trials)
+
+
+def test_http_load_runner_records_samples_and_typed_artifacts(tmp_path, monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "name": "suite",
+            "database": str(tmp_path / "runs.duckdb"),
+            "targets": [
+                {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "model": "local",
+                }
+            ],
+            "scenarios": [
+                {
+                    "name": "chat",
+                    "prompt": "hello",
+                    "max_tokens": 8,
+                    "concurrency": 1,
+                    "requests": 1,
+                }
+            ],
+        }
+    )
+    fake_result = RequestResult(
+        index=0,
+        ok=True,
+        status_code=200,
+        latency_s=1.0,
+        completion_tokens=8,
+        completion_chars=16,
+    )
+    monkeypatch.setattr(
+        "llm_refinery.benchmarks.http_load.runner.run_requests",
+        lambda _trial, *, count: [fake_result for _ in range(count)],
+    )
+
+    outcomes = run_http_load(config)
+
+    assert len(outcomes) == 1
+    with ResultStore(config.database) as store:
+        run = store.comparison_runs()[0]
+        samples = store.samples_for_run(run["run_id"])
+    assert set(run["artifacts"]) == {"errors", "measurement", "responses"}
+    assert len(samples) == 1
+    assert samples[0]["metrics"] == {"latency_s": 1.0}
 
 
 def test_summarize_request_results_calculates_latency_and_throughput_metrics():

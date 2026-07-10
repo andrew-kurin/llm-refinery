@@ -4,7 +4,7 @@ from pathlib import Path
 
 import click
 
-from llm_refinery.storage import ResultStore, utc_now
+from llm_refinery.storage.duckdb import ResultStore, utc_now
 from llm_refinery.utils.system import get_system_profile
 
 
@@ -30,14 +30,7 @@ def backfill_system_metadata_command(database: Path, overwrite: bool, dry_run: b
 
     with ResultStore(database) as store:
         if dry_run:
-            missing_clause = (
-                "WHERE system_json IS NULL OR trim(system_json) = '' "
-                "OR trim(system_json) = '{}'"
-            )
-            where_clause = "" if overwrite else missing_clause
-            count = store.connection.execute(
-                f"SELECT COUNT(*) FROM runs {where_clause}"
-            ).fetchone()[0]
+            count = store.system_json_backfill_count(overwrite=overwrite)
         else:
             count = store.backfill_system_json(profile, overwrite=overwrite)
 

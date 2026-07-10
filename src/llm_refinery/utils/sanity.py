@@ -1,46 +1,35 @@
 from __future__ import annotations
 
-import json
 import re
-import time
-import urllib.error
-import urllib.request
 from typing import Any
+
+from llm_refinery.core.endpoints import Endpoint
+from llm_refinery.providers.openai_chat import OpenAICompatibleChatClient
 
 REASONING_TAG_RE = re.compile(r"</?(?:think|thinking)\b", re.IGNORECASE)
 
 
 def run_api_sanity_check(
-    url: str,
-    model_name: str = "local-model",
+    endpoint: Endpoint,
     timeout: int = 180,
+    *,
+    client: OpenAICompatibleChatClient | None = None,
 ) -> dict[str, Any]:
     """Perform a basic OpenAI-compatible chat-completions sanity check."""
-    payload = {
-        "model": model_name,
-        "messages": [{"role": "user", "content": "Say hello in exactly five words."}],
-        "max_tokens": 2048,
-        "temperature": 0,
-        "stream": False,
-    }
-
-    start = time.perf_counter()
+    chat_client = client or OpenAICompatibleChatClient()
     try:
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        response = chat_client.complete(
+            endpoint,
+            messages=[{"role": "user", "content": "Say hello in exactly five words."}],
+            temperature=0,
+            max_tokens=2048,
+            timeout_s=timeout,
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 local URL
-            body = response.read().decode(errors="replace")
-            elapsed = time.perf_counter() - start
-
-        data = json.loads(body)
-        choice = data["choices"][0]
+        choices = response.raw.get("choices") or []
+        choice = choices[0]
         message = choice.get("message") or {}
-        content = message.get("content") or ""
-        reasoning = (
+        content = str(message.get("content") or "")
+        reasoning = str(
             message.get("reasoning_content")
             or message.get("reasoning")
             or message.get("thinking")
@@ -48,45 +37,28 @@ def run_api_sanity_check(
         )
 
         if not content.strip():
-            # If content is empty, but reasoning is present, the API is at least responding.
-            # We consider this a success for connection sanity, even if the model is still thinking.
             if not reasoning.strip():
                 raise ValueError("empty content returned")
-
             return {
                 "success": True,
-                "elapsed_s": round(elapsed, 3),
+                "elapsed_s": round(response.latency_s, 3),
                 "content_len": 0,
                 "reasoning_len": len(reasoning),
                 "finish_reason": choice.get("finish_reason"),
                 "content_preview": "[Still thinking...]",
             }
-
-        # We allow reasoning content as long as we also got an actual answer.
-        # If the user wants to forbid reasoning, they can handle that via model params.
         if has_reasoning_tags(content):
             raise ValueError("reasoning/thinking tags present in content")
-
         return {
             "success": True,
-            "elapsed_s": round(elapsed, 3),
+            "elapsed_s": round(response.latency_s, 3),
             "content_len": len(content),
             "reasoning_len": len(reasoning),
             "finish_reason": choice.get("finish_reason"),
             "content_preview": content[:200],
         }
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode(errors="replace")[-1000:]
-        return {"success": False, "error": f"HTTP {exc.code}: {body}"}
-    except urllib.error.URLError as exc:
-        reason = getattr(exc, "reason", str(exc))
-        return {"success": False, "error": f"URL error: {reason}"}
-    except json.JSONDecodeError:
-        return {"success": False, "error": "failed to decode JSON response"}
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
+    except Exception as exc:  # noqa: BLE001 - sanity failures are returned as result data
         return {"success": False, "error": f"sanity failed: {exc}"}
-    except Exception as exc:  # noqa: BLE001 - convert unexpected sanity errors into result data
-        return {"success": False, "error": f"unexpected error: {exc}"}
 
 
 def has_reasoning_tags(text: str) -> bool:

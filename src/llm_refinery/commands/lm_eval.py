@@ -4,23 +4,15 @@ from pathlib import Path
 
 import click
 
+from llm_refinery.benchmarks.lm_eval.config import LmEvalConfig
+from llm_refinery.benchmarks.lm_eval.presets import default_targets
+from llm_refinery.benchmarks.lm_eval.runner import run_lm_eval
 from llm_refinery.commands.common import parse_lm_eval_limit
-from llm_refinery.lm_eval import (
-    TARGET_CHOICES,
-    LmEvalConfig,
-    LmEvalTarget,
-    default_targets,
-    run_lm_eval,
-)
+from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
 
 
 @click.command("lm-eval", help="Run lm-eval against local OpenAI-compatible endpoints.")
-@click.argument(
-    "target",
-    required=False,
-    default="llama_cpp",
-    type=click.Choice(TARGET_CHOICES),
-)
+@click.argument("target", required=False, default="llama_cpp")
 @click.argument("limit_text", required=False)
 @click.option("--tasks", default="ifeval,gsm8k", show_default=True, help="Comma-separated tasks.")
 @click.option("--num-concurrent", type=int, default=1, show_default=True)
@@ -34,6 +26,12 @@ from llm_refinery.lm_eval import (
     show_default=True,
     type=click.Choice(["local-chat-completions", "local-completions"]),
     help="lm-eval API model backend.",
+)
+@click.option(
+    "--package-spec",
+    default="lm-eval[api]",
+    show_default=True,
+    help="uvx package spec; pin a version for reproducible runs.",
 )
 @click.option(
     "--apply-chat-template/--no-apply-chat-template",
@@ -63,6 +61,7 @@ from llm_refinery.lm_eval import (
 @click.option("--num-fewshot", type=int, help="Override task few-shot count for lm-eval.")
 @click.option("--model", help="Override model name for a single target.")
 @click.option("--base-url", help="Override chat-completions URL for a single target.")
+@click.option("--api-key-env", help="Environment variable containing the endpoint API key.")
 @click.option(
     "--output-root",
     type=click.Path(file_okay=False, path_type=Path),
@@ -86,6 +85,7 @@ def lm_eval_command(
     eos_string: str,
     gen_kwargs: str | None,
     model_backend: str,
+    package_spec: str,
     apply_chat_template: bool,
     include_path: Path | None,
     suite_name: str,
@@ -94,20 +94,39 @@ def lm_eval_command(
     num_fewshot: int | None,
     model: str | None,
     base_url: str | None,
+    api_key_env: str | None,
     output_root: Path,
     offline: bool,
     dry_run: bool,
 ) -> None:
-    if (model or base_url) and target in {"both", "all"}:
-        raise click.BadParameter("--model/--base-url can only override a single target")
+    if (model or base_url or api_key_env) and target in {"both", "all"}:
+        raise click.BadParameter(
+            "--model/--base-url/--api-key-env can only override a single target"
+        )
 
+    presets = default_targets()
     targets = {}
-    if model or base_url:
-        target_defaults = default_targets()[target]
-        targets[target] = LmEvalTarget(
+    if target not in {*presets, "both", "all"}:
+        if not model or not base_url:
+            raise click.BadParameter(
+                "custom targets require both --model and --base-url",
+                param_hint="target",
+            )
+        targets[target] = Endpoint(
             name=target,
+            protocol=OPENAI_CHAT,
+            model=model,
+            base_url=base_url,
+            api_key_env=api_key_env,
+        )
+    elif target in presets and (model or base_url or api_key_env):
+        target_defaults = presets[target]
+        targets[target] = Endpoint(
+            name=target,
+            protocol=OPENAI_CHAT,
             model=model or target_defaults.model,
             base_url=base_url or target_defaults.base_url,
+            api_key_env=api_key_env or target_defaults.api_key_env,
         )
 
     run_lm_eval(
@@ -125,6 +144,7 @@ def lm_eval_command(
             output_root=output_root,
             offline=offline,
             model_backend=model_backend,
+            package_spec=package_spec,
             apply_chat_template=apply_chat_template,
             include_path=include_path,
             suite_name=suite_name,

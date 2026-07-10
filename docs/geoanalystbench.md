@@ -9,7 +9,8 @@ GeoAnalystBench source: <https://github.com/GeoDS/GeoAnalystBench>
 
 The adapter reads `dataset/GeoAnalystBench.csv`, selects tasks, builds workflow
 and/or code-generation prompts, calls the configured endpoint, and stores
-per-request JSONL artifacts plus aggregate metrics in DuckDB.
+per-request JSONL artifacts, checkpoint-friendly rows in the DuckDB `samples` table,
+and aggregate metrics.
 
 Current normalized metrics include:
 
@@ -76,7 +77,7 @@ request:
 
 targets:
   - name: local-llama
-    provider: openai
+    protocol: openai_chat
     base_url: http://127.0.0.1:8080/v1
     model: local-model
 ```
@@ -85,6 +86,6 @@ targets:
 
 - Add optional judge-based workflow similarity scoring.
 - Add code execution for tasks whose data can be downloaded locally.
-- Add task-level table/schema if we want cross-run per-task comparisons rather
-  than aggregate run metrics only.
-- Reuse the `agent-eval` interface for DABStep.
+- Add resume semantics on top of the existing task-level `samples` table.
+- Add a separate external-process adapter for DABStep rather than forcing it
+  through the chat-request-specific agent interface.

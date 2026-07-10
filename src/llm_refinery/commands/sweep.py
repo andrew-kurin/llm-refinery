@@ -4,8 +4,10 @@ from pathlib import Path
 
 import click
 
-from llm_refinery.config import load_config
-from llm_refinery.runner import launch_server, print_plan, run_bench
+from llm_refinery.benchmarks.llama_bench.command import print_plan
+from llm_refinery.benchmarks.llama_bench.config import load_llama_config
+from llm_refinery.benchmarks.llama_bench.runner import run_bench
+from llm_refinery.benchmarks.llama_bench.server import launch_server
 
 EXAMPLE_CONFIG = """name: gemma-cache-sweep
 
@@ -79,8 +81,8 @@ def init_command(path: Path, force: bool) -> None:
 )
 @click.option("--limit", type=int, help="Only show the first N planned commands.")
 def plan_command(config: Path, kind: str, limit: int | None) -> None:
-    tune_config = load_config(config)
-    print_plan(tune_config, kind=kind, limit=limit)
+    llama_config = load_llama_config(config)
+    print_plan(llama_config, kind=kind, limit=limit)
 
 
 @click.command("bench", help="Run llama-bench trials and store results.")
@@ -116,9 +118,9 @@ def bench_command(
     progress_interval: float,
     db: Path | None,
 ) -> None:
-    tune_config = load_config(config)
+    llama_config = load_llama_config(config)
     run_bench(
-        tune_config,
+        llama_config,
         limit=limit,
         dry_run=dry_run,
         keep_going=keep_going,
@@ -140,5 +142,5 @@ def bench_command(
 @click.option("--dry-run", is_flag=True, help="Print the server command without running it.")
 @click.pass_context
 def server_command(ctx: click.Context, config: Path, index: int, dry_run: bool) -> None:
-    tune_config = load_config(config)
-    ctx.exit(launch_server(tune_config, index=index, dry_run=dry_run))
+    llama_config = load_llama_config(config)
+    ctx.exit(launch_server(llama_config, index=index, dry_run=dry_run))

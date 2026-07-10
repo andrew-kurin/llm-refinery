@@ -8,6 +8,13 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
+
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
 
 @dataclass(frozen=True)
 class ChatCompletionResponse:
@@ -32,20 +39,21 @@ class ChatCompletionResponse:
 class OpenAICompatibleChatClient:
     def complete(
         self,
+        endpoint: Endpoint,
         *,
-        base_url: str,
-        model: str,
         messages: list[dict[str, str]],
         temperature: float,
         max_tokens: int,
         timeout_s: float,
         seed: int | None = None,
         extra_body: dict[str, Any] | None = None,
-        headers: dict[str, str] | None = None,
-        api_key_env: str | None = None,
     ) -> ChatCompletionResponse:
+        if endpoint.protocol != OPENAI_CHAT:
+            raise ValueError(
+                f"OpenAI chat client cannot execute protocol {endpoint.protocol!r}"
+            )
         payload: dict[str, Any] = {
-            "model": model,
+            "model": endpoint.model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -57,9 +65,9 @@ class OpenAICompatibleChatClient:
 
         started = time.perf_counter()
         body = post_json_body(
-            chat_completions_url(base_url),
+            endpoint.chat_completions_url,
             payload,
-            headers=json_headers(headers, api_key_env=api_key_env),
+            headers=json_headers(endpoint.headers, api_key_env=endpoint.api_key_env),
             timeout_s=timeout_s,
         )
         data = json.loads(body)
@@ -76,13 +84,6 @@ class OpenAICompatibleChatClient:
         )
 
 
-def chat_completions_url(base_url: str) -> str:
-    stripped = base_url.rstrip("/")
-    if stripped.endswith("/chat/completions"):
-        return stripped
-    return f"{stripped}/chat/completions"
-
-
 def json_headers(
     headers: dict[str, str] | None = None,
     *,
@@ -91,7 +92,7 @@ def json_headers(
 ) -> dict[str, str]:
     resolved = {
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "User-Agent": DEFAULT_USER_AGENT,
         **(headers or {}),
     }
     if accept:
@@ -140,7 +141,9 @@ def openai_choice_text(choice: dict[str, Any]) -> str:
 
 
 def int_or_none(value: object) -> int | None:
+    if not isinstance(value, str | bytes | bytearray | int | float):
+        return None
     try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
+        return int(value)
+    except (ValueError, OverflowError):
         return None

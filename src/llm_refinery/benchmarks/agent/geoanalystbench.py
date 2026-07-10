@@ -31,7 +31,7 @@ from llm_refinery.benchmarks.agent.geoanalystbench_scoring import (
     score_geoanalyst_result,
     summarize_geoanalyst_results,
 )
-from llm_refinery.config import ConfigError, coerce_list
+from llm_refinery.core.config import ConfigError, coerce_list, reject_unknown_keys
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,20 @@ class GeoAnalystBenchSpec:
     def from_mapping(
         cls, raw: dict[str, Any], *, source_path: Path | None = None
     ) -> GeoAnalystBenchSpec:
+        reject_unknown_keys(
+            raw,
+            {
+                "kind",
+                "dataset",
+                "dataset_url",
+                "task_ids",
+                "limit",
+                "open_source_only",
+                "prompt_variants",
+                "response_types",
+            },
+            context="GeoAnalystBench configuration",
+        )
         dataset = str(
             raw.get("dataset") or raw.get("dataset_url") or DEFAULT_GEOANALYSTBENCH_DATASET
         )

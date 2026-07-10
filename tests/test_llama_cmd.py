@@ -1,9 +1,13 @@
-from llm_refinery.config import TuneConfig, expand_trials
-from llm_refinery.llama_cmd import build_bench_command, build_server_command, shell_join
+from llm_refinery.benchmarks.llama_bench.command_builder import (
+    build_bench_command,
+    build_server_command,
+    shell_join,
+)
+from llm_refinery.benchmarks.llama_bench.config import LlamaSweepConfig, expand_trials
 
 
 def test_build_bench_command_uses_unified_llama_cli_and_flags():
-    config = TuneConfig.from_mapping(
+    config = LlamaSweepConfig.from_mapping(
         {
             "name": "suite",
             "commands": {"bench": ["llama", "bench"], "server": ["llama", "server"]},
@@ -46,7 +50,7 @@ def test_build_bench_command_uses_unified_llama_cli_and_flags():
 
 
 def test_build_server_command_omits_bench_dimensions():
-    config = TuneConfig.from_mapping(
+    config = LlamaSweepConfig.from_mapping(
         {
             "name": "suite",
             "models": [{"name": "m", "path": "/models/model.gguf"}],
@@ -54,7 +58,7 @@ def test_build_server_command_omits_bench_dimensions():
             "server": {"extra_args": ["--host", "127.0.0.1"]},
         }
     )
-    trial = expand_trials(config, include_bench_dimensions=False)[0]
+    trial = expand_trials(config, kind="server")[0]
 
     cmd = build_server_command(config, trial)
 
@@ -63,7 +67,7 @@ def test_build_server_command_omits_bench_dimensions():
 
 def test_build_server_command_resolves_mtp_head(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
-    config = TuneConfig.from_mapping(
+    config = LlamaSweepConfig.from_mapping(
         {
             "name": "suite",
             "models": [{"name": "m", "hf": "repo/model"}],
@@ -78,7 +82,7 @@ def test_build_server_command_resolves_mtp_head(monkeypatch, tmp_path):
             },
         }
     )
-    trial = expand_trials(config, include_bench_dimensions=False)[0]
+    trial = expand_trials(config, kind="server")[0]
 
     cmd = build_server_command(config, trial)
 
@@ -90,7 +94,7 @@ def test_build_server_command_resolves_mtp_head(monkeypatch, tmp_path):
 
 
 def test_build_server_command_uses_custom_model_flag_for_non_llama_servers():
-    config = TuneConfig.from_mapping(
+    config = LlamaSweepConfig.from_mapping(
         {
             "name": "suite",
             "commands": {"server": ["uvx", "--from", "mlx-vlm", "mlx_vlm.server"]},
@@ -101,7 +105,7 @@ def test_build_server_command_uses_custom_model_flag_for_non_llama_servers():
             },
         }
     )
-    trial = expand_trials(config, include_bench_dimensions=False)[0]
+    trial = expand_trials(config, kind="server")[0]
 
     cmd = build_server_command(config, trial)
 
@@ -120,7 +124,7 @@ def test_build_server_command_uses_custom_model_flag_for_non_llama_servers():
 
 
 def test_build_server_command_uses_llama_hf_file_short_flag():
-    config = TuneConfig.from_mapping(
+    config = LlamaSweepConfig.from_mapping(
         {
             "name": "suite",
             "models": [
@@ -132,7 +136,7 @@ def test_build_server_command_uses_llama_hf_file_short_flag():
             ],
         }
     )
-    trial = expand_trials(config, include_bench_dimensions=False)[0]
+    trial = expand_trials(config, kind="server")[0]
 
     cmd = build_server_command(config, trial)
 

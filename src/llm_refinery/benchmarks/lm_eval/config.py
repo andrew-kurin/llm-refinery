@@ -1,18 +1,11 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-TARGET_CHOICES = ("llama_cpp", "ollama", "mlx_e4b", "mlx_26b", "ollama_31b", "ollama_31b_mlx", "cerebras_31b", "both", "all")
-TARGET_ORDER = ("llama_cpp", "ollama", "mlx_e4b", "mlx_26b", "ollama_31b", "ollama_31b_mlx", "cerebras_31b")
-
-
-@dataclass(frozen=True)
-class LmEvalTarget:
-    name: str
-    model: str
-    base_url: str
+from llm_refinery.benchmarks.lm_eval.presets import TARGET_ORDER
+from llm_refinery.core.config import ConfigError
+from llm_refinery.core.endpoints import Endpoint
 
 
 @dataclass(frozen=True)
@@ -30,61 +23,37 @@ class LmEvalConfig:
     output_root: Path = Path("results/lm_eval")
     offline: bool = True
     model_backend: str = "local-chat-completions"
+    package_spec: str = "lm-eval[api]"
     apply_chat_template: bool = True
     include_path: Path | None = None
     suite_name: str = "lm-eval"
     database: Path = Path("results/llm_refinery.duckdb")
-    targets: dict[str, LmEvalTarget] = field(default_factory=dict)
+    targets: dict[str, Endpoint] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.target.strip():
+            raise ConfigError("lm-eval target cannot be empty")
+        if self.limit is not None and self.limit <= 0:
+            raise ConfigError("lm-eval limit must be positive or None")
+        if self.num_concurrent <= 0:
+            raise ConfigError("lm-eval num_concurrent must be positive")
+        if self.max_retries < 0:
+            raise ConfigError("lm-eval max_retries cannot be negative")
+        if self.max_length <= 0:
+            raise ConfigError("lm-eval max_length must be positive")
+        if not self.package_spec.strip():
+            raise ConfigError("lm-eval package_spec cannot be empty")
 
 
-def default_targets(env: dict[str, str] | None = None) -> dict[str, LmEvalTarget]:
-    env = os.environ if env is None else env
-    return {
-        "llama_cpp": LmEvalTarget(
-            name="llama_cpp",
-            model=env.get("LLAMA_CPP_MODEL", "local-model"),
-            base_url=env.get(
-                "LLAMA_CPP_BASE_URL", "http://127.0.0.1:8080/v1/chat/completions"
-            ),
-        ),
-        "ollama": LmEvalTarget(
-            name="ollama",
-            model=env.get("OLLAMA_MODEL", "gemma4:26b"),
-            base_url=env.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1/chat/completions"),
-        ),
-        "mlx_e4b": LmEvalTarget(
-            name="mlx_e4b",
-            model=env.get("MLX_E4B_MODEL", "mlx-community/gemma-4-e4b-it-OptiQ-4bit"),
-            base_url=env.get("MLX_E4B_BASE_URL", "http://127.0.0.1:8081/v1/chat/completions"),
-        ),
-        "mlx_26b": LmEvalTarget(
-            name="mlx_26b",
-            model=env.get("MLX_26B_MODEL", "mlx-community/gemma-4-26B-A4B-it-OptiQ-4bit"),
-            base_url=env.get("MLX_26B_BASE_URL", "http://127.0.0.1:8082/v1/chat/completions"),
-        ),
-        "ollama_31b": LmEvalTarget(
-            name="ollama_31b",
-            model=env.get("OLLAMA_31B_MODEL", "gemma4:31b"),
-            base_url=env.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1/chat/completions"),
-        ),
-        "ollama_31b_mlx": LmEvalTarget(
-            name="ollama_31b_mlx",
-            model=env.get("OLLAMA_31B_MLX_MODEL", "gemma4:31b-mlx"),
-            base_url=env.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1/chat/completions"),
-        ),
-        "cerebras_31b": LmEvalTarget(
-            name="cerebras_31b",
-            model=env.get("CEREBRAS_31B_MODEL", "gemma-4-31b"),
-            base_url=env.get("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1/chat/completions"),
-        ),
-    }
-
-
-def resolve_target_names(target: str) -> list[str]:
+def resolve_target_names(target: str, available: set[str] | None = None) -> list[str]:
+    available = set(TARGET_ORDER) if available is None else available
     if target == "both":
-        return ["llama_cpp", "ollama"]
-    if target == "all":
-        return list(TARGET_ORDER)
-    if target not in TARGET_ORDER:
-        raise ValueError(f"unknown lm-eval target: {target}")
-    return [target]
+        selected = ["llama_cpp", "ollama"]
+    elif target == "all":
+        selected = [name for name in TARGET_ORDER if name in available]
+    else:
+        selected = [target]
+    missing = set(selected) - available
+    if missing:
+        raise ValueError(f"unknown lm-eval target(s): {', '.join(sorted(missing))}")
+    return selected

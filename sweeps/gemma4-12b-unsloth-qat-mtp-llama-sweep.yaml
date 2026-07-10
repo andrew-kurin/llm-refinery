@@ -53,9 +53,3 @@ server:
       file: MTP/gemma-4-12B-it-MTP-Q8_0.gguf
   extra_args: []
   env: {}
-
-eval:
-  tasks: ifeval,gsm8k
-  limit: 50
-  max_length: 8192
-  eos_string: "<turn|>"

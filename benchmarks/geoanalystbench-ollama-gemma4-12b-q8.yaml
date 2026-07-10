@@ -21,6 +21,6 @@ request:
 
 targets:
   - name: ollama-gemma4-12b-q8
-    provider: openai
+    protocol: openai_chat
     base_url: http://127.0.0.1:11434/v1
     model: hf.co/ggml-org/gemma-4-12B-it-GGUF:Q8_0

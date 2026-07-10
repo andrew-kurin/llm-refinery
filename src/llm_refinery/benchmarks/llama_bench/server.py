@@ -3,13 +3,13 @@ from __future__ import annotations
 import os
 import subprocess
 
-from llm_refinery.assets import ensure_mtp_head
-from llm_refinery.config import Trial, TuneConfig, expand_trials
-from llm_refinery.llama_cmd import build_server_command, effective_params, shell_join
+from llm_refinery.benchmarks.llama_bench.assets import ensure_mtp_head
+from llm_refinery.benchmarks.llama_bench.command_builder import build_server_command, shell_join
+from llm_refinery.benchmarks.llama_bench.config import LlamaSweepConfig, LlamaTrial, expand_trials
 
 
-def launch_server(config: TuneConfig, *, index: int = 0, dry_run: bool = False) -> int:
-    trials = expand_trials(config, include_bench_dimensions=False)
+def launch_server(config: LlamaSweepConfig, *, index: int = 0, dry_run: bool = False) -> int:
+    trials = expand_trials(config, kind="server")
     if index < 0 or index >= len(trials):
         raise IndexError(f"server trial index {index} outside 0..{len(trials) - 1}")
 
@@ -20,7 +20,7 @@ def launch_server(config: TuneConfig, *, index: int = 0, dry_run: bool = False) 
     if dry_run:
         return 0
 
-    prepare_server_assets(config, trial)
+    prepare_server_assets(trial)
 
     env = os.environ.copy()
     env.update(config.server.env)
@@ -28,9 +28,8 @@ def launch_server(config: TuneConfig, *, index: int = 0, dry_run: bool = False) 
     return completed.returncode
 
 
-def prepare_server_assets(config: TuneConfig, trial: Trial) -> None:
-    params = effective_params(trial.params, config.server.params, config.server.omit_params)
-    mtp_head = params.get("mtp_head")
+def prepare_server_assets(trial: LlamaTrial) -> None:
+    mtp_head = trial.params.get("mtp_head")
     if mtp_head is None:
         return
     spec = ensure_mtp_head(mtp_head)

@@ -4,7 +4,7 @@ database: results/llm_refinery.duckdb
 
 targets:
   - name: llama-gemma4-12b-unsloth-ud-q4-k-xl
-    provider: openai
+    protocol: openai_chat
     base_url: http://127.0.0.1:8080/v1
     model: local-model
 

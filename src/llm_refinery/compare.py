@@ -84,6 +84,7 @@ def _build_compare_row(
 
     row: dict[str, Any] = {
         "run_id": run["run_id"],
+        "spec_hash": run.get("spec_hash", ""),
         "trial_name": run["trial_name"],
         "status": run["status"],
         "duration_s": run["duration_s"],
@@ -127,7 +128,11 @@ def _dedupe_latest_configs(
     seen: set[tuple[object, ...]] = set()
     deduped: list[dict[str, Any]] = []
     for row in rows:
-        signature = tuple(row.get(key, "") for key in (*IDENTITY_COLUMNS, *param_keys))
+        signature = (
+            ("spec_hash", row["spec_hash"])
+            if row.get("spec_hash")
+            else tuple(row.get(key, "") for key in (*IDENTITY_COLUMNS, *param_keys))
+        )
         if signature in seen:
             continue
         seen.add(signature)

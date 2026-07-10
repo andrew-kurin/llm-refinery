@@ -47,15 +47,3 @@ server:
     # Full limit=50 IFEval+GSM8K on 4bit repeatedly hit the default 600s
     # no-token queue timeout after ~28 requests. Fail stuck requests faster.
     MLX_VLM_TOKEN_QUEUE_TIMEOUT: "300"
-
-# Smoke defaults only. For full quality reruns on a larger Mac, override with:
-#   --tasks ifeval,gsm8k --limit 50 --max-length 8192 --gen-kwargs enable_thinking=False
-# On the 32 GB Mac, the full run is currently a practical reject.
-eval:
-  tasks: ifeval
-  limit: 10
-  max_length: 4096
-  eos_string: "<turn|>"
-  gen_kwargs: "enable_thinking=False,max_gen_toks=256"
-  # Default for index 0. Pass --api-model for other server-sweep indices.
-  api_model: mlx-community/diffusiongemma-26B-A4B-it-4bit

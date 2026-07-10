@@ -1,190 +1,208 @@
 from __future__ import annotations
 
-import subprocess
-from pathlib import Path
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlparse
 
 from rich.console import Console
+from rich.table import Table
 
-from llm_refinery.config import TuneConfig
-from llm_refinery.http_load import load_http_load_config
-from llm_refinery.lm_eval import LmEvalConfig, LmEvalTarget, run_lm_eval
+from llm_refinery.application.run_session import RunSession
+from llm_refinery.benchmarks.http_load.config import load_http_load_config
+from llm_refinery.benchmarks.http_load.runner import run_http_load
+from llm_refinery.benchmarks.lm_eval.config import LmEvalConfig
+from llm_refinery.benchmarks.lm_eval.runner import run_lm_eval
+from llm_refinery.compare import build_compare_rows, build_compare_table_rows
+from llm_refinery.core.runs import CompletedRun, RunSpec
+from llm_refinery.storage.duckdb import ResultStore
 from llm_refinery.utils.sanity import run_api_sanity_check
 from llm_refinery.utils.system import get_system_snapshot, is_port_listening
+from llm_refinery.workflows.suite_config import SuiteConfig
 
-console = Console()
+LmEvalRunner = Callable[..., list[CompletedRun]]
+HttpLoadRunner = Callable[..., list[CompletedRun]]
+
+
+@dataclass(frozen=True)
+class SuiteResult:
+    run: CompletedRun
+    children: tuple[CompletedRun, ...]
 
 
 class BenchmarkSuiteWorkflow:
     def __init__(
         self,
-        config: TuneConfig,
-        limit: int | None = 50,
-        tasks: str = "ifeval,gsm8k",
-        max_length: int = 8192,
-        eos_string: str = "<turn|>",
-        gen_kwargs: str | None = None,
-        include_path: Path | None = None,
-        run_lm_eval: bool = True,
-        run_http_load: bool = False,
-        require_clean: bool = True,
-        base_url: str = "http://127.0.0.1:8080/v1/chat/completions",
-        http_load_config: Path | None = None,
-        target_name: str | None = None,
-        api_model: str = "local-model",
-    ):
+        config: SuiteConfig,
+        *,
+        console: Console | None = None,
+        lm_eval_runner: LmEvalRunner = run_lm_eval,
+        http_load_runner: HttpLoadRunner = run_http_load,
+        port_listener: Callable[[int], bool] = is_port_listening,
+        sanity_checker: Callable[..., dict[str, Any]] = run_api_sanity_check,
+        system_snapshot: Callable[[], str] = get_system_snapshot,
+    ) -> None:
         self.config = config
-        self.limit = limit
-        self.tasks = tasks
-        self.max_length = max_length
-        self.eos_string = eos_string
-        self.gen_kwargs = gen_kwargs
-        self.include_path = include_path
-        self.run_lm_eval = run_lm_eval
-        self.run_http_load = run_http_load
-        self.require_clean = require_clean
-        self.base_url = base_url
-        self.http_load_config = http_load_config
-        self.target_name = target_name
-        self.api_model = api_model
+        self.console = console or Console()
+        self.lm_eval_runner = lm_eval_runner
+        self.http_load_runner = http_load_runner
+        self.port_listener = port_listener
+        self.sanity_checker = sanity_checker
+        self.system_snapshot = system_snapshot
 
-        self.log_dir = Path("results/logs")
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+    def execute(self) -> SuiteResult:
+        command = f"llm-refinery suite {self.config.name}"
+        spec = RunSpec.create(
+            benchmark_kind="suite",
+            suite=self.config.name,
+            label=self.config.name,
+            command=command,
+            config_json=self.config.safe_json(),
+            database=self.config.database,
+        )
+        children: list[CompletedRun] = []
+        with ResultStore(self.config.database) as store, RunSession(store, spec) as run:
+            before_path = run.artifact("system_before", "system-before.txt", "text/plain")
+            after_path = run.artifact("system_after", "system-after.txt", "text/plain")
+            try:
+                before_snapshot = self.system_snapshot()
+                before_path.write_text(before_snapshot, encoding="utf-8")
+                self.preflight(before_snapshot)
+                children.extend(self.run_quality(store, parent_run_id=run.run_id))
+                children.extend(self.run_load(store, parent_run_id=run.run_id))
+            finally:
+                after_snapshot = self.system_snapshot()
+                after_path.write_text(after_snapshot, encoding="utf-8")
+                self._log("Memory/process snapshot after")
+                self.console.print(after_snapshot)
 
-    def _log(self, message: str) -> None:
-        console.print(f"[bold blue]==>[/bold blue] {message}")
+            failed_children = sum(child.status != "ok" for child in children)
+            outcome = run.complete(
+                status="ok" if failed_children == 0 else "failed",
+                metrics={
+                    "child_run_count": float(len(children)),
+                    "failed_child_count": float(failed_children),
+                },
+                error=None if failed_children == 0 else f"{failed_children} child run(s) failed",
+            )
+            if failed_children:
+                raise RuntimeError(f"{failed_children} suite child run(s) failed")
+        self._log("Done.")
+        return SuiteResult(run=outcome, children=tuple(children))
 
-    def _error(self, message: str) -> None:
-        raise RuntimeError(message)
-
-    def preflight(self) -> None:
+    def preflight(self, snapshot: str | None = None) -> None:
+        config = self.config.preflight
+        if not config.enabled:
+            return
         self._log("Performing preflight checks...")
-
-        llama_port = _port_from_url(self.base_url)
-        if not is_port_listening(llama_port):
-            self._error(
-                f"no model server listening on :{llama_port}; "
-                "start it first, then rerun this command"
+        endpoint = self.config.endpoint
+        parsed = urlparse(endpoint.base_url)
+        endpoint_port = _port_from_url(endpoint.base_url)
+        if parsed.hostname in {"127.0.0.1", "localhost", "::1"} and not self.port_listener(
+            endpoint_port
+        ):
+            raise RuntimeError(
+                f"no model server listening on :{endpoint_port}; start it first, then rerun"
             )
 
-        if self.require_clean:
-            for port in [8081, 8082, 8083]:
-                if port != llama_port and is_port_listening(port):
-                    self._error(
-                        f"port :{port} is listening; stop other MLX/model servers "
-                        "for clean timing"
+        if config.require_clean:
+            for port in config.forbidden_ports:
+                if port != endpoint_port and self.port_listener(port):
+                    raise RuntimeError(
+                        f"port :{port} is listening; stop other model servers for clean timing"
                     )
 
         self._log("Memory/process snapshot before")
-        console.print(get_system_snapshot())
+        self.console.print(snapshot if snapshot is not None else self.system_snapshot())
+        if not config.sanity_check:
+            return
 
-        self._log("Sanity check: reasoning off / content present")
-        sanity = run_api_sanity_check(self.base_url, model_name=self.api_model)
+        self._log("Sanity check: content present")
+        sanity = self.sanity_checker(endpoint)
         if not sanity["success"]:
-            self._error(str(sanity["error"]))
+            raise RuntimeError(str(sanity["error"]))
+        for key in (
+            "elapsed_s",
+            "content_len",
+            "reasoning_len",
+            "finish_reason",
+            "content_preview",
+        ):
+            self.console.print(f"    {key}={sanity.get(key)}")
 
-        console.print(f"    elapsed_s={sanity['elapsed_s']}")
-        console.print(f"    content_len={sanity['content_len']}")
-        console.print(f"    reasoning_len={sanity['reasoning_len']}")
-        console.print(f"    finish_reason={sanity['finish_reason']}")
-        console.print(f"    content_preview={sanity['content_preview']}")
+    def run_quality(self, store: ResultStore, *, parent_run_id: str) -> list[CompletedRun]:
+        quality = self.config.quality
+        if not quality.enabled:
+            return []
+        endpoint = self.config.endpoint
+        self._log(f"Running lm-eval quality (tasks={quality.tasks}, limit={quality.limit})")
+        lm_config = LmEvalConfig(
+            target=endpoint.name,
+            limit=quality.limit,
+            tasks=quality.tasks,
+            max_length=quality.max_length,
+            eos_string=quality.eos_string,
+            num_fewshot=quality.num_fewshot,
+            gen_kwargs=quality.gen_kwargs,
+            include_path=quality.include_path,
+            output_root=quality.output_root,
+            package_spec=quality.package_spec,
+            suite_name=self.config.name,
+            database=self.config.database,
+            log_samples=True,
+            targets={endpoint.name: endpoint},
+        )
+        return self.lm_eval_runner(
+            lm_config,
+            parent_run_id=parent_run_id,
+            store=store,
+        )
 
-    def run_quality(self) -> None:
-        if not self.run_lm_eval:
+    def run_load(self, store: ResultStore, *, parent_run_id: str) -> list[CompletedRun]:
+        step = self.config.http_load
+        if not step.enabled:
+            return []
+        assert step.config is not None
+        http_config = load_http_load_config(step.config)
+        targets = step.targets or (self.config.endpoint.name,)
+        self._log(f"Running HTTP load (targets={','.join(targets)})")
+        outcomes = self.http_load_runner(
+            http_config,
+            target_names=targets,
+            scenario_names=step.scenarios,
+            database_override=self.config.database,
+            parent_run_id=parent_run_id,
+            store=store,
+        )
+        self._print_http_comparison(store, http_config.name)
+        return outcomes
+
+    def _print_http_comparison(self, store: ResultStore, suite_name: str) -> None:
+        runs = [run for run in store.comparison_runs() if run["suite"] == suite_name]
+        rows = build_compare_rows(
+            runs,
+            metrics=(
+                "latency_p95_s",
+                "ttft_p95_s",
+                "completion_tokens_per_second",
+                "check_pass_rate",
+            ),
+            params=("target", "protocol", "scenario", "concurrency"),
+            sort_key="latency_p95_s",
+            ascending=True,
+            limit=20,
+        )
+        table_rows = build_compare_table_rows(rows)
+        if not table_rows:
             return
-
-        self._log(f"Running lm-eval quality (tasks={self.tasks}, limit={self.limit})")
-        try:
-            run_lm_eval(
-                LmEvalConfig(
-                    target="llama_cpp",
-                    limit=self.limit,
-                    tasks=self.tasks,
-                    max_length=self.max_length,
-                    eos_string=self.eos_string,
-                    num_fewshot=self.config.eval.num_fewshot,
-                    gen_kwargs=self.gen_kwargs,
-                    include_path=self.include_path,
-                    suite_name=self.config.name,
-                    database=self.config.database,
-                    log_samples=True,
-                    targets={
-                        "llama_cpp": LmEvalTarget(
-                            name="llama_cpp",
-                            model=self.api_model,
-                            base_url=self.base_url,
-                        )
-                    },
-                )
-            )
-        except RuntimeError as exc:
-            self._error(str(exc))
-
-    def run_load(self) -> None:
-        if not self.run_http_load:
-            return
-        if not self.http_load_config:
-            self._error("--http-load-config is required when HTTP load is enabled")
-
-        http_config = load_http_load_config(self.http_load_config)
-        self._log(f"Running HTTP load (target={self.target_name or 'all'})")
-
-        cmd = ["uv", "run", "llm-refinery", "http-load", str(self.http_load_config)]
-        if self.target_name:
-            cmd.extend(["--target", self.target_name])
-
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as exc:
-            self._error(f"HTTP load failed: {exc}")
-
         self._log("HTTP comparison for this suite")
-        compare_cmd = [
-            "uv",
-            "run",
-            "llm-refinery",
-            "compare",
-            str(http_config.database),
-            "--suite",
-            http_config.name,
-            "--metric",
-            "latency_p95_s",
-            "--metric",
-            "ttft_p95_s",
-            "--metric",
-            "completion_tokens_per_second",
-            "--metric",
-            "check_pass_rate",
-            "--sort",
-            "latency_p95_s",
-            "--ascending",
-            "--param",
-            "target",
-            "--param",
-            "provider",
-            "--param",
-            "scenario",
-            "--param",
-            "concurrency",
-            "--limit",
-            "20",
-        ]
+        table = Table(*[str(header) for header in table_rows[0]])
+        for row in table_rows[1:]:
+            table.add_row(*[str(cell) for cell in row])
+        self.console.print(table)
 
-        try:
-            subprocess.run(compare_cmd, check=True)
-        except subprocess.CalledProcessError as exc:
-            self._error(f"comparison failed: {exc}")
-
-    def run_post_analysis(self) -> None:
-        self._log("Memory/process snapshot after")
-        console.print(get_system_snapshot())
-        self._log("Done.")
-
-    def execute(self) -> None:
-        self.preflight()
-        self.run_quality()
-        self.run_load()
-        self.run_post_analysis()
+    def _log(self, message: str) -> None:
+        self.console.print(f"[bold blue]==>[/bold blue] {message}")
 
 
 def _port_from_url(url: str) -> int:

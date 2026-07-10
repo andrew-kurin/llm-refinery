@@ -1,13 +1,8 @@
-from llm_refinery.providers.openai import chat_completions_url, json_headers, openai_choice_text
-
-
-def test_chat_completions_url_accepts_base_or_endpoint():
-    assert chat_completions_url("http://localhost:8080/v1") == (
-        "http://localhost:8080/v1/chat/completions"
-    )
-    assert chat_completions_url("http://localhost:8080/v1/chat/completions") == (
-        "http://localhost:8080/v1/chat/completions"
-    )
+from llm_refinery.providers.openai_chat import (
+    DEFAULT_USER_AGENT,
+    json_headers,
+    openai_choice_text,
+)
 
 
 def test_json_headers_adds_bearer_token(monkeypatch):
@@ -17,6 +12,7 @@ def test_json_headers_adds_bearer_token(monkeypatch):
         "Accept": "application/json",
         "Authorization": "Bearer secret",
         "Content-Type": "application/json",
+        "User-Agent": DEFAULT_USER_AGENT,
         "X-Test": "1",
     }
 

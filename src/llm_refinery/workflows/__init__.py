@@ -1,1 +1,1 @@
-# Leave empty for now
+"""Composite benchmark workflows."""

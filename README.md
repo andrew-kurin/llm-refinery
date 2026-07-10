@@ -91,18 +91,22 @@ uv run llm-refinery compare results/llm_refinery.duckdb \
   --sort latency_p95_s \
   --ascending \
   --param target \
-  --param provider \
+  --param protocol \
   --param scenario \
   --param concurrency \
   --param system.hardware.model \
   --param system.hardware.memory_gb
 ```
 
-If the parser improved after old runs, refresh stored metrics from artifacts:
+If a benchmark parser improved, refresh stored metrics from typed artifacts:
 
 ```bash
 uv run llm-refinery reparse results/llm_refinery.duckdb
 ```
+
+Reparsing dispatches by `benchmark_kind`; llama-bench, lm-eval, HTTP-load, and
+agent-eval artifacts each use their own parser. Empty parser results are preserved
+unless `--force` is supplied.
 
 Run a broader lm-eval reasoning/knowledge scoreboard, including the fixed GPQA task override:
 
@@ -113,7 +117,7 @@ uv run llm-refinery lm-eval ollama all \
   --include-path evals/lm_eval_tasks
 ```
 
-Parsed lm-eval aggregate metrics are stored in DuckDB and can be compared with `llm-refinery compare`. See [`evals/README.md`](evals/README.md).
+Parsed lm-eval aggregate metrics are stored in DuckDB and can be compared with `llm-refinery compare`. Arbitrary OpenAI-compatible targets are accepted with a custom name plus `--model` and `--base-url`; use `--api-key-env` for authenticated endpoints. Pin `--package-spec` when exact lm-eval reproducibility matters. See [`evals/README.md`](evals/README.md).
 
 Run a GeoAnalystBench smoke benchmark against an already-running OpenAI-compatible server (see [`docs/geoanalystbench.md`](docs/geoanalystbench.md)):
 
@@ -147,7 +151,13 @@ Launch the server for one expanded config:
 uv run llm-refinery server sweeps/gemma-cache-sweep.yaml --index 0
 ```
 
-## Config model
+## Configuration models
+
+Configuration is strict: unknown YAML fields fail instead of being silently ignored.
+Each workflow has its own manifest shape. Existing users should read the
+[architecture cutover migration guide](docs/migration.md).
+
+### Llama sweep configuration
 
 See [`sweeps/gemma-cache-sweep.yaml`](sweeps/gemma-cache-sweep.yaml).
 
@@ -170,7 +180,7 @@ Important notes:
 - `bench.omit_params` / `server.omit_params` remove shared flags for one command type.
 - Snake-case keys become llama.cpp kebab-case flags. Example: `ctx_size` -> `--ctx-size`.
 - Boolean `true` values become flags. Boolean `false` values are omitted.
-- Bench, lm-eval, HTTP-load, and agent-eval runs record structured host metadata in `runs.system_json` for cross-machine history: macOS version, hardware model, chip/CPU fields when available, memory size, Python path/version, project version, and git head/dirty state. `llm-refinery compare --param system.hardware.model --param system.hardware.memory_gb` can display it.
+- Bench, lm-eval, HTTP-load, agent-eval, and suite runs record structured host metadata in `runs.system_json` for cross-machine history: macOS version, hardware model, chip/CPU fields when available, memory size, Python path/version, project version, and git head/dirty state. `llm-refinery compare --param system.hardware.model --param system.hardware.memory_gb` can display it.
 - Server params support an `mtp_head` helper for Gemma/Qwen MTP draft heads. It expands to `--model-draft <path>` and, in `llm-refinery server`, auto-downloads when `hf` + `file` or `url` is provided:
 
   ```yaml
@@ -185,13 +195,36 @@ Important notes:
 
   The default download location is `~/.local/share/llm-refinery/mtp/<filename>`. Set `path:` to override it.
 
+### Endpoint configuration
+
+HTTP-load, agent-eval, and suite manifests use a shared endpoint shape. `protocol`
+describes the wire protocol rather than the server vendor:
+
+```yaml
+endpoint:
+  name: local
+  protocol: openai_chat
+  base_url: http://127.0.0.1:8080/v1
+  model: local-model
+```
+
+HTTP-load also supports `ollama_chat`. Cerebras and other OpenAI-compatible vendors
+use `openai_chat` with `api_key_env` when needed.
+
+### Suite configuration
+
+Suite manifests are separate from llama sweep manifests. See
+[`sweeps/gemma4-31b-suite.yaml`](sweeps/gemma4-31b-suite.yaml). They contain an
+`endpoint`, `quality`, optional `http_load`, and `preflight` section. Referenced
+HTTP-load paths resolve relative to the suite manifest.
+
 ## Suggested workflow
 
 1. Start with `llm-refinery plan` to verify exact llama.cpp commands.
 2. Run a small `--limit` first for low-level benchmark sweeps.
 3. Launch candidates with `llm-refinery server` or an external Ollama/MLX server.
-4. Run `llm-refinery suite` for lm-eval + HTTP load checks. For OpenAI-compatible servers that require the real model id in requests, set `eval.api_model` in YAML or pass `--api-model`.
+4. Run `llm-refinery suite` with a suite manifest for recorded lm-eval + HTTP-load checks. Use `endpoint.model` in YAML or `--api-model` when the endpoint requires the real model id.
 5. Use `llm-refinery agent-eval` for agent/data benchmarks like GeoAnalystBench.
 6. Compare parsed metrics with `llm-refinery compare`.
 
-This scaffold intentionally avoids Make. YAML is the source of truth, and Python handles expansion, execution, parsing, and storage.
+This scaffold intentionally avoids Make. YAML is the source of truth, and Python handles expansion, execution, parsing, and storage. See [`docs/architecture.md`](docs/architecture.md) for module boundaries and extension points.

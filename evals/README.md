@@ -1,6 +1,6 @@
 # Quality eval suites
 
-Use `llm-refinery lm-eval` for lm-eval quality suites. Results are parsed into DuckDB and can be compared with `llm-refinery compare`.
+Use `llm-refinery lm-eval` for lm-eval quality suites. Results are parsed into DuckDB and can be compared with `llm-refinery compare`. Set `--package-spec` to a pinned `lm-eval[api]` version when reproducing a published run.
 
 ## Reasoning/knowledge scoreboard
 

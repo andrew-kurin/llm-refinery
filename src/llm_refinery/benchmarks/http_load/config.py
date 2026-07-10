@@ -4,60 +4,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import yaml
-
-from llm_refinery.config import ConfigError, coerce_list, stable_hash
-
-PROVIDERS = {"openai", "ollama", "cerebras"}
-
-
-@dataclass(frozen=True)
-class HttpTarget:
-    name: str
-    provider: str
-    base_url: str
-    model: str
-    api_key_env: str | None = None
-    headers: dict[str, str] = field(default_factory=dict)
-
-    @classmethod
-    def from_mapping(cls, raw: dict[str, Any]) -> HttpTarget:
-        name = str(raw.get("name") or "").strip()
-        if not name:
-            raise ConfigError("each HTTP target requires a non-empty 'name'")
-
-        provider = str(raw.get("provider") or "openai").strip().lower()
-        if provider not in PROVIDERS:
-            raise ConfigError(
-                f"target {name!r} provider must be one of {sorted(PROVIDERS)}, got {provider!r}"
-            )
-
-        base_url = str(raw.get("base_url") or "").strip().rstrip("/")
-        if not base_url:
-            raise ConfigError(f"target {name!r} requires 'base_url'")
-
-        model = str(raw.get("model") or "").strip()
-        if not model:
-            raise ConfigError(f"target {name!r} requires 'model'")
-
-        return cls(
-            name=name,
-            provider=provider,
-            base_url=base_url,
-            model=model,
-            api_key_env=str(raw["api_key_env"]) if raw.get("api_key_env") else None,
-            headers={str(key): str(value) for key, value in dict(raw.get("headers") or {}).items()},
-        )
-
-    def safe_json(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "provider": self.provider,
-            "base_url": self.base_url,
-            "model": self.model,
-            "api_key_env": self.api_key_env,
-            "header_names": sorted(self.headers),
-        }
+from llm_refinery.core.config import (
+    ConfigError,
+    coerce_list,
+    load_yaml_mapping,
+    reject_unknown_keys,
+)
+from llm_refinery.core.endpoints import CHAT_PROTOCOLS, Endpoint
+from llm_refinery.core.runs import stable_hash
 
 
 @dataclass(frozen=True)
@@ -78,6 +32,26 @@ class HttpScenario:
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any], *, base_dir: Path) -> HttpScenario:
+        reject_unknown_keys(
+            raw,
+            {
+                "name",
+                "prompt",
+                "prompt_file",
+                "system",
+                "max_tokens",
+                "concurrency",
+                "requests",
+                "warmup_requests",
+                "temperature",
+                "seed",
+                "stream",
+                "timeout_s",
+                "prompt_repeat",
+                "expected_contains",
+            },
+            context="HTTP scenario",
+        )
         name = str(raw.get("name") or "").strip()
         if not name:
             raise ConfigError("each HTTP scenario requires a non-empty 'name'")
@@ -148,12 +122,17 @@ class HttpScenario:
 class HttpLoadConfig:
     name: str
     database: Path
-    targets: list[HttpTarget]
+    targets: list[Endpoint]
     scenarios: list[HttpScenario]
     source_path: Path | None = None
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any], source_path: Path | None = None) -> HttpLoadConfig:
+        reject_unknown_keys(
+            raw,
+            {"name", "database", "targets", "scenarios"},
+            context="HTTP-load configuration",
+        )
         name = str(raw.get("name") or (source_path.stem if source_path else "http-load"))
         targets_raw = raw.get("targets") or []
         scenarios_raw = raw.get("scenarios") or []
@@ -162,14 +141,27 @@ class HttpLoadConfig:
         if not scenarios_raw:
             raise ConfigError("HTTP load config requires at least one scenario in 'scenarios'")
 
+        if any(not isinstance(item, dict) for item in targets_raw):
+            raise ConfigError("each HTTP target must be a mapping")
+        if any(not isinstance(item, dict) for item in scenarios_raw):
+            raise ConfigError("each HTTP scenario must be a mapping")
         base_dir = source_path.parent if source_path else Path.cwd()
+        targets = [
+            Endpoint.from_mapping(
+                item,
+                context="HTTP target",
+                allowed_protocols=CHAT_PROTOCOLS,
+            )
+            for item in targets_raw
+        ]
+        scenarios = [HttpScenario.from_mapping(item, base_dir=base_dir) for item in scenarios_raw]
+        _require_unique_names([target.name for target in targets], context="HTTP target")
+        _require_unique_names([scenario.name for scenario in scenarios], context="HTTP scenario")
         return cls(
             name=name,
             database=Path(str(raw.get("database") or "results/llm_refinery.duckdb")),
-            targets=[HttpTarget.from_mapping(dict(item)) for item in targets_raw],
-            scenarios=[
-                HttpScenario.from_mapping(dict(item), base_dir=base_dir) for item in scenarios_raw
-            ],
+            targets=targets,
+            scenarios=scenarios,
             source_path=source_path,
         )
 
@@ -179,7 +171,7 @@ class HttpLoadTrial:
     suite: str
     name: str
     key: str
-    target: HttpTarget
+    target: Endpoint
     scenario: HttpScenario
     concurrency: int
     max_tokens: int
@@ -187,7 +179,7 @@ class HttpLoadTrial:
     @property
     def command_text(self) -> str:
         return (
-            f"http-load provider={self.target.provider} base_url={self.target.base_url} "
+            f"http-load protocol={self.target.protocol} base_url={self.target.base_url} "
             f"model={self.target.model} scenario={self.scenario.name} "
             f"concurrency={self.concurrency} requests={self.scenario.requests} "
             f"max_tokens={self.max_tokens} stream={self.scenario.stream}"
@@ -205,7 +197,7 @@ class HttpLoadTrial:
             "gen_tokens": self.max_tokens,
             "params": {
                 "target": self.target.name,
-                "provider": self.target.provider,
+                "protocol": self.target.protocol,
                 "scenario": self.scenario.name,
                 "model": self.target.model,
                 "concurrency": self.concurrency,
@@ -218,11 +210,7 @@ class HttpLoadTrial:
 
 
 def load_http_load_config(path: str | Path) -> HttpLoadConfig:
-    config_path = Path(path)
-    with config_path.open("r", encoding="utf-8") as handle:
-        raw = yaml.safe_load(handle) or {}
-    if not isinstance(raw, dict):
-        raise ConfigError(f"{config_path} must contain a YAML mapping at the top level")
+    config_path, raw = load_yaml_mapping(path)
     return HttpLoadConfig.from_mapping(raw, source_path=config_path)
 
 
@@ -305,6 +293,11 @@ def print_http_load_plan(
         print(trial.command_text)
         print()
     print(f"planned {len(trials)} of {len(all_trials)} HTTP load trial(s)")
+
+
+def _require_unique_names(names: list[str], *, context: str) -> None:
+    if len(names) != len(set(names)):
+        raise ConfigError(f"{context} names must be unique")
 
 
 def _scenario_prompt(raw: dict[str, Any], *, base_dir: Path) -> str:

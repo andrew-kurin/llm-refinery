@@ -2,6 +2,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
+
+
+def reparse_lm_eval_run(run: dict[str, Any]) -> dict[str, float]:
+    artifact = (run.get("artifacts") or {}).get("result")
+    if not artifact:
+        raise FileNotFoundError("lm-eval run has no result artifact")
+    return parse_lm_eval_metrics(Path(artifact["path"]))
 
 
 def latest_lm_eval_result(output_path: Path, *, newer_than: float | None = None) -> Path | None:

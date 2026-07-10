@@ -16,6 +16,7 @@ llm-refinery = "llm_refinery.cli:main"
 
 [dependency-groups]
 dev = [
+  "mypy>=1.19.0",
   "pytest>=8.0.0",
   "ruff>=0.8.0",
 ]
@@ -27,8 +28,17 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/llm_refinery"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+files = ["src/llm_refinery"]
+
 [tool.ruff]
 line-length = 100
+target-version = "py311"
 src = ["src", "tests"]
 
 [tool.ruff.lint]

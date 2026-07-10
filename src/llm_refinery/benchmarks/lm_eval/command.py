@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from llm_refinery.benchmarks.lm_eval.config import LmEvalConfig, LmEvalTarget
+from llm_refinery.benchmarks.lm_eval.config import LmEvalConfig
+from llm_refinery.core.endpoints import Endpoint
 
 
-def build_lm_eval_command(config: LmEvalConfig, target: LmEvalTarget) -> list[str]:
+def build_lm_eval_command(config: LmEvalConfig, target: Endpoint) -> list[str]:
     output_path = str(config.output_root / target.name)
     model_args = (
         f"model={target.model},"
-        f"base_url={target.base_url},"
+        f"base_url={target.chat_completions_url},"
         f"num_concurrent={config.num_concurrent},"
         f"max_retries={config.max_retries},"
         f"eos_string={config.eos_string},"
@@ -17,7 +18,7 @@ def build_lm_eval_command(config: LmEvalConfig, target: LmEvalTarget) -> list[st
     cmd = [
         "uvx",
         "--from",
-        "lm-eval[api]",
+        config.package_spec,
         "--with",
         "langdetect",
         "--with",

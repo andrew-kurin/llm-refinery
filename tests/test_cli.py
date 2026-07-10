@@ -3,7 +3,8 @@ import json
 from click.testing import CliRunner
 
 from llm_refinery.cli import main
-from llm_refinery.storage import ResultStore, RunRecord, utc_now
+from llm_refinery.storage.duckdb import ResultStore, utc_now
+from llm_refinery.storage.models import RunRecord
 
 
 def test_click_version():
@@ -49,6 +50,27 @@ def test_lm_eval_command_dry_run_uses_python_cli():
     assert 'reasoning_effort="none"' in result.output
 
 
+def test_lm_eval_command_accepts_arbitrary_openai_compatible_target():
+    result = CliRunner().invoke(
+        main,
+        [
+            "lm-eval",
+            "custom-endpoint",
+            "5",
+            "--model",
+            "custom/model",
+            "--base-url",
+            "https://example.test/v1",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "target=custom-endpoint" in result.output
+    assert "custom/model" in result.output
+    assert "https://example.test/v1" in result.output
+
+
 def test_lm_eval_command_dry_run_supports_include_path_and_suite_db(tmp_path):
     include_path = tmp_path / "tasks"
     include_path.mkdir()
@@ -76,6 +98,37 @@ def test_lm_eval_command_dry_run_supports_include_path_and_suite_db(tmp_path):
     assert "gpqa_main_fixed_generative" in result.output
 
 
+def test_suite_command_uses_dedicated_manifest_and_records_parent_run(tmp_path):
+    database = tmp_path / "suite.duckdb"
+    manifest = tmp_path / "suite.yaml"
+    manifest.write_text(
+        f"""
+name: smoke-suite
+database: {database}
+endpoint:
+  name: local
+  protocol: openai_chat
+  base_url: http://127.0.0.1:8080/v1
+  model: local-model
+quality:
+  enabled: false
+http_load:
+  enabled: false
+preflight:
+  enabled: false
+""",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(main, ["suite", str(manifest)])
+
+    assert result.exit_code == 0, result.output
+    with ResultStore(database) as store:
+        run = store.comparison_runs()[0]
+    assert run["benchmark_kind"] == "suite"
+    assert run["metrics"]["child_run_count"] == 0.0
+
+
 def test_compare_command_shows_params_and_sorts_by_generation_tps(tmp_path):
     database = tmp_path / "runs.duckdb"
     now = utc_now()
@@ -83,6 +136,8 @@ def test_compare_command_shows_params_and_sorts_by_generation_tps(tmp_path):
         store.record_run(
             RunRecord(
                 run_id="slow-run",
+                benchmark_kind="llama_bench",
+                spec_hash="slow-spec",
                 suite="suite",
                 trial_name="suite/model/slow",
                 status="ok",
@@ -103,6 +158,8 @@ def test_compare_command_shows_params_and_sorts_by_generation_tps(tmp_path):
         store.record_run(
             RunRecord(
                 run_id="fast-run",
+                benchmark_kind="llama_bench",
+                spec_hash="fast-spec",
                 suite="suite",
                 trial_name="suite/model/fast",
                 status="ok",
@@ -155,6 +212,8 @@ def test_backfill_system_metadata_command(tmp_path, monkeypatch):
         store.record_run(
             RunRecord(
                 run_id="old-run",
+                benchmark_kind="llama_bench",
+                spec_hash="old-spec",
                 suite="suite",
                 trial_name="suite/model/old",
                 status="ok",
@@ -169,6 +228,8 @@ def test_backfill_system_metadata_command(tmp_path, monkeypatch):
         store.record_run(
             RunRecord(
                 run_id="new-run",
+                benchmark_kind="llama_bench",
+                spec_hash="new-spec",
                 suite="suite",
                 trial_name="suite/model/new",
                 status="ok",

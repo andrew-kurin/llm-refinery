@@ -1,8 +1,21 @@
-from llm_refinery.config import TuneConfig, expand_trials
+import pytest
+
+from llm_refinery.benchmarks.llama_bench.config import LlamaSweepConfig, expand_trials
+from llm_refinery.core.config import ConfigError
+
+
+def test_llama_config_rejects_unknown_fields():
+    with pytest.raises(ConfigError, match="unknown field.*http_load_config"):
+        LlamaSweepConfig.from_mapping(
+            {
+                "models": [{"name": "m", "hf": "repo:model"}],
+                "http_load_config": "ignored.yaml",
+            }
+        )
 
 
 def test_expand_trials_cartesian_product():
-    config = TuneConfig.from_mapping(
+    config = LlamaSweepConfig.from_mapping(
         {
             "name": "suite",
             "models": [{"name": "m", "hf": "repo:model"}],
@@ -22,7 +35,7 @@ def test_expand_trials_cartesian_product():
 
 
 def test_expand_server_trials_omit_bench_dimensions():
-    config = TuneConfig.from_mapping(
+    config = LlamaSweepConfig.from_mapping(
         {
             "name": "suite",
             "models": [{"name": "m", "hf": "repo:model"}],
@@ -31,40 +44,33 @@ def test_expand_server_trials_omit_bench_dimensions():
         }
     )
 
-    trials = expand_trials(config, include_bench_dimensions=False)
+    trials = expand_trials(config, kind="server")
 
     assert len(trials) == 2
     assert all(trial.prompt_tokens is None for trial in trials)
     assert all(trial.gen_tokens is None for trial in trials)
 
 
-def test_eval_config_defaults_and_overrides():
-    default_config = TuneConfig.from_mapping(
-        {"name": "suite", "models": [{"name": "m", "hf": "repo:model"}]}
-    )
-    assert default_config.eval.tasks == "ifeval,gsm8k"
-    assert default_config.eval.limit == 50
-    assert default_config.eval.max_length == 8192
-    assert default_config.eval.eos_string == "<turn|>"
-    assert default_config.eval.api_model == "local-model"
+def test_trial_identity_includes_effective_benchmark_configuration():
+    base = {
+        "name": "suite",
+        "models": [{"name": "m", "hf": "repo:model"}],
+        "bench": {
+            "prompt_tokens": [128],
+            "gen_tokens": [32],
+            "repetitions": 1,
+            "params": {"threads": 1},
+        },
+    }
+    first = expand_trials(LlamaSweepConfig.from_mapping(base))[0]
+    base["bench"] = {
+        "prompt_tokens": [128],
+        "gen_tokens": [32],
+        "repetitions": 9,
+        "params": {"threads": 8},
+        "extra_args": ["--verbose"],
+    }
+    second = expand_trials(LlamaSweepConfig.from_mapping(base))[0]
 
-    qwen_config = TuneConfig.from_mapping(
-        {
-            "name": "suite",
-            "models": [{"name": "m", "hf": "repo:model"}],
-            "eval": {
-                "tasks": "ifeval",
-                "limit": "all",
-                "max_length": 4096,
-                "eos_string": "<|im_end|>",
-                "gen_kwargs": "enable_thinking=False",
-                "api_model": "repo/model",
-            },
-        }
-    )
-    assert qwen_config.eval.tasks == "ifeval"
-    assert qwen_config.eval.limit is None
-    assert qwen_config.eval.max_length == 4096
-    assert qwen_config.eval.eos_string == "<|im_end|>"
-    assert qwen_config.eval.gen_kwargs == "enable_thinking=False"
-    assert qwen_config.eval.api_model == "repo/model"
+    assert first.key != second.key
+    assert first.as_jsonable() != second.as_jsonable()

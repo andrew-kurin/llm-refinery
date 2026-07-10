@@ -1,18 +1,26 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Protocol
 
 from llm_refinery.benchmarks.agent.base import AgentEvalRequest, AgentEvalRequestConfig
 from llm_refinery.benchmarks.agent.geoanalystbench_data import GeoAnalystTask
-from llm_refinery.config import ConfigError
+from llm_refinery.core.config import ConfigError
 
 PROMPT_VARIANTS = {"original", "domain", "dataset", "domain_and_dataset"}
 RESPONSE_TYPES = {"workflow", "code"}
 
 
+class GeoAnalystPromptSpec(Protocol):
+    @property
+    def prompt_variants(self) -> tuple[str, ...]: ...
+
+    @property
+    def response_types(self) -> tuple[str, ...]: ...
+
+
 def expand_geoanalyst_requests(
     tasks: list[GeoAnalystTask],
-    benchmark: Any,
+    benchmark: GeoAnalystPromptSpec,
     request_config: AgentEvalRequestConfig,
 ) -> list[AgentEvalRequest]:
     requests: list[AgentEvalRequest] = []

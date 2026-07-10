@@ -85,16 +85,15 @@ def update_rich_progress(
         eta_s = progress_state.eta_after_completed_s()
         current_elapsed_text = "-"
 
-    update_kwargs: dict[str, object] = {
-        "completed": progress_state.completed,
-        "suite_elapsed": format_duration(progress_state.elapsed_s),
-        "current_elapsed": current_elapsed_text,
-        "average": _duration_or_unknown(progress_state.average_duration_s),
-        "eta": _eta_text(eta_s, progress_state),
-    }
-    if description is not None:
-        update_kwargs["description"] = description
-    rich_progress.update(progress_task_id, **update_kwargs)
+    rich_progress.update(
+        progress_task_id,
+        completed=progress_state.completed,
+        description=description,
+        suite_elapsed=format_duration(progress_state.elapsed_s),
+        current_elapsed=current_elapsed_text,
+        average=_duration_or_unknown(progress_state.average_duration_s),
+        eta=_eta_text(eta_s, progress_state),
+    )
 
 
 def trial_description(index: int, total: int, trial_name: str) -> str:

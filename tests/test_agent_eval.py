@@ -6,11 +6,13 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from llm_refinery.agent_eval import AgentEvalConfig, AgentEvalTarget, run_agent_eval
 from llm_refinery.benchmarks.agent.base import AgentEvalResult
+from llm_refinery.benchmarks.agent.config import AgentEvalConfig
 from llm_refinery.benchmarks.agent.geoanalystbench import GeoAnalystBenchSpec
+from llm_refinery.benchmarks.agent.runner import run_agent_eval
 from llm_refinery.cli import main
-from llm_refinery.storage import ResultStore
+from llm_refinery.core.endpoints import Endpoint
+from llm_refinery.storage.duckdb import ResultStore
 
 
 def write_geoanalyst_csv(path: Path) -> None:
@@ -72,7 +74,7 @@ benchmark:
   response_types: [workflow]
 targets:
   - name: local
-    provider: openai
+    protocol: openai_chat
     base_url: http://127.0.0.1:8080/v1
     model: local-model
 """,
@@ -101,9 +103,9 @@ def test_geoanalystbench_agent_eval_records_metrics_and_artifacts(tmp_path: Path
             response_types=("workflow", "code"),
         ),
         targets=[
-            AgentEvalTarget(
+            Endpoint(
                 name="local",
-                provider="openai",
+                protocol="openai_chat",
                 base_url="http://127.0.0.1:8080/v1",
                 model="local-model",
             )
@@ -133,15 +135,18 @@ def test_geoanalystbench_agent_eval_records_metrics_and_artifacts(tmp_path: Path
 
     with ResultStore(config.database) as store:
         runs = store.comparison_runs()
+        samples = store.samples_for_run(runs[0]["run_id"])
     assert len(runs) == 1
+    assert len(samples) == 2
+    assert all(sample["status"] == "ok" for sample in samples)
     run = runs[0]
     metrics = run["metrics"]
     assert metrics["success_rate"] == 1.0
     assert metrics["workflow_step_abs_error_avg"] == 0.0
     assert metrics["code_syntax_pass_rate"] == 1.0
-    assert run["system_json"]["hardware"]
+    assert run["system_json"]["platform"]["python_version"]
 
-    responses_path = Path(run["stdout_path"])
+    responses_path = Path(run["artifacts"]["responses"]["path"])
     responses = [json.loads(line) for line in responses_path.read_text().splitlines()]
     assert len(responses) == 2
     assert responses[0]["request"]["task"]["task_id"] == 1

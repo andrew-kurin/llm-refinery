@@ -22,18 +22,21 @@ from llm_refinery.commands.common import parse_lm_eval_limit
     help="Only run specific task id(s).",
 )
 @click.option("--dry-run", is_flag=True, help="Print planned benchmark requests without running.")
+@click.option("--keep-going", is_flag=True, help="Continue after a target fails.")
 def agent_eval_command(
     config: Path,
     targets: tuple[str, ...],
     limit_text: str | None,
     task_ids: tuple[int, ...],
     dry_run: bool,
+    keep_going: bool,
 ) -> None:
     eval_config = load_agent_eval_config(config)
     kwargs: dict[str, Any] = {
         "target_names": targets,
         "task_ids": task_ids,
         "dry_run": dry_run,
+        "keep_going": keep_going,
     }
     if limit_text is not None:
         kwargs["limit"] = parse_lm_eval_limit(limit_text)

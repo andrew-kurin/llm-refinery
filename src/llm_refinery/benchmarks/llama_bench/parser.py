@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 TPS_RE = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>tok/s|tokens/s|t/s)\b", re.I)
@@ -15,6 +16,13 @@ NUMERIC_KEY_ALIASES = {
     "stddev_ts": "tokens_per_second_stddev",
     "samples_ts": "samples_tokens_per_second",
 }
+
+
+def reparse_llama_bench_run(run: dict[str, Any]) -> dict[str, float]:
+    artifact = (run.get("artifacts") or {}).get("stdout")
+    if not artifact:
+        raise FileNotFoundError("llama-bench run has no stdout artifact")
+    return parse_llama_bench_metrics(Path(artifact["path"]).read_text(encoding="utf-8"))
 
 
 def parse_llama_bench_metrics(stdout: str) -> dict[str, float]:

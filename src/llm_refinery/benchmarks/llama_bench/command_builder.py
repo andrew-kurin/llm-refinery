@@ -3,8 +3,8 @@ from __future__ import annotations
 import shlex
 from typing import Any
 
-from llm_refinery.assets import resolve_mtp_head
-from llm_refinery.config import Trial, TuneConfig
+from llm_refinery.benchmarks.llama_bench.assets import resolve_mtp_head
+from llm_refinery.benchmarks.llama_bench.config import LlamaSweepConfig, LlamaTrial
 
 # Explicit aliases for common llama.cpp flags. Unknown keys fall back to --kebab-case.
 FLAG_ALIASES = {
@@ -30,11 +30,10 @@ FLAG_ALIASES = {
 }
 
 
-def build_bench_command(config: TuneConfig, trial: Trial) -> list[str]:
+def build_bench_command(config: LlamaSweepConfig, trial: LlamaTrial) -> list[str]:
     cmd = list(config.commands["bench"])
     cmd.extend(model_args(trial))
-    params = effective_params(trial.params, config.bench.params, config.bench.omit_params)
-    cmd.extend(params_args(params))
+    cmd.extend(params_args(trial.params))
 
     if trial.prompt_tokens is not None:
         cmd.extend(["-p", str(trial.prompt_tokens)])
@@ -50,27 +49,16 @@ def build_bench_command(config: TuneConfig, trial: Trial) -> list[str]:
     return cmd
 
 
-def build_server_command(config: TuneConfig, trial: Trial) -> list[str]:
+def build_server_command(config: LlamaSweepConfig, trial: LlamaTrial) -> list[str]:
     cmd = list(config.commands["server"])
     cmd.extend(model_args(trial, model_flag=config.server.model_flag))
-    params = effective_params(trial.params, config.server.params, config.server.omit_params)
-    cmd.extend(params_args(params))
+    cmd.extend(params_args(trial.params))
     cmd.extend(trial.model.extra_args)
     cmd.extend(config.server.extra_args)
     return cmd
 
 
-def effective_params(
-    base_params: dict[str, Any], overrides: dict[str, Any], omit_params: set[str]
-) -> dict[str, Any]:
-    params = dict(base_params)
-    params.update(overrides)
-    for key in omit_params:
-        params.pop(key, None)
-    return params
-
-
-def model_args(trial: Trial, *, model_flag: str | None = None) -> list[str]:
+def model_args(trial: LlamaTrial, *, model_flag: str | None = None) -> list[str]:
     if model_flag:
         model_source = trial.model.hf or trial.model.path
         if model_source:

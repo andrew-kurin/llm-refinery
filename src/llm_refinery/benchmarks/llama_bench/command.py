@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from llm_refinery.config import TuneConfig, expand_trials
-from llm_refinery.llama_cmd import build_bench_command, build_server_command, shell_join
+from llm_refinery.benchmarks.llama_bench.command_builder import (
+    build_bench_command,
+    build_server_command,
+    shell_join,
+)
+from llm_refinery.benchmarks.llama_bench.config import LlamaSweepConfig, expand_trials
 
 
-def print_plan(config: TuneConfig, *, kind: str = "bench", limit: int | None = None) -> None:
-    trials = expand_trials(config, include_bench_dimensions=(kind == "bench"))
+def print_plan(config: LlamaSweepConfig, *, kind: str = "bench", limit: int | None = None) -> None:
+    trials = expand_trials(config, kind=kind)
     if limit is not None:
         trials = trials[:limit]
 
@@ -18,6 +22,6 @@ def print_plan(config: TuneConfig, *, kind: str = "bench", limit: int | None = N
         print(shell_join(cmd))
         print()
 
-    total = len(expand_trials(config, include_bench_dimensions=(kind == "bench")))
+    total = len(expand_trials(config, kind=kind))
     shown = len(trials)
     print(f"planned {shown} of {total} {kind} command(s)")

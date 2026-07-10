@@ -8,9 +8,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from typing import Any
 
-from llm_refinery.benchmarks.http_load.config import HttpLoadTrial, HttpScenario, HttpTarget
+from llm_refinery.benchmarks.http_load.config import HttpLoadTrial, HttpScenario
 from llm_refinery.benchmarks.http_load.models import RequestResult
-from llm_refinery.providers.openai import chat_completions_url, json_headers, openai_choice_text
+from llm_refinery.core.endpoints import OLLAMA_CHAT, OPENAI_CHAT, Endpoint
+from llm_refinery.providers.openai_chat import json_headers, openai_choice_text
 
 
 def run_requests(trial: HttpLoadTrial, *, count: int) -> list[RequestResult]:
@@ -38,11 +39,14 @@ def run_requests(trial: HttpLoadTrial, *, count: int) -> list[RequestResult]:
 
 
 def execute_http_request(trial: HttpLoadTrial, index: int) -> RequestResult:
-    if trial.target.provider in ("openai", "cerebras"):
-        return execute_openai_request(trial, index)
-    if trial.target.provider == "ollama":
-        return execute_ollama_request(trial, index)
-    raise ValueError(f"unsupported provider: {trial.target.provider}")
+    executors = {
+        OPENAI_CHAT: execute_openai_request,
+        OLLAMA_CHAT: execute_ollama_request,
+    }
+    executor = executors.get(trial.target.protocol)
+    if executor is None:
+        raise ValueError(f"unsupported chat protocol: {trial.target.protocol}")
+    return executor(trial, index)
 
 
 def execute_openai_request(trial: HttpLoadTrial, index: int) -> RequestResult:
@@ -62,7 +66,7 @@ def execute_openai_request(trial: HttpLoadTrial, index: int) -> RequestResult:
     return post_json(
         trial,
         index,
-        url=chat_completions_url(trial.target.base_url),
+        url=trial.target.chat_completions_url,
         payload=payload,
         stream_reader=read_openai_stream if scenario.stream else None,
         body_reader=read_openai_body,
@@ -278,7 +282,7 @@ def messages_for_scenario(scenario: HttpScenario) -> list[dict[str, str]]:
     return messages
 
 
-def headers_for_target(target: HttpTarget) -> dict[str, str]:
+def headers_for_target(target: Endpoint) -> dict[str, str]:
     return json_headers(target.headers, api_key_env=target.api_key_env)
 
 

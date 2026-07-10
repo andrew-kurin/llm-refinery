@@ -2,6 +2,9 @@
 __pycache__/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+dist/
+.coverage
 *.pyc
 results/
 .pi/

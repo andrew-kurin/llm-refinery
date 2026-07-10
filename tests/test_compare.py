@@ -22,6 +22,27 @@ def test_build_compare_rows_supports_lm_eval_root_model_and_params():
     assert rows[0]["target"] == "ollama"
 
 
+def test_compare_deduplicates_reruns_by_spec_hash_not_display_columns():
+    shared = {
+        "trial_name": "suite/model",
+        "status": "ok",
+        "duration_s": 1.0,
+        "config_json": {"model": "same-model", "params": {}},
+        "metrics": {"score": 1.0},
+    }
+    rows = build_compare_rows(
+        [
+            {**shared, "run_id": "config-a", "spec_hash": "spec-a"},
+            {**shared, "run_id": "config-b", "spec_hash": "spec-b"},
+            {**shared, "run_id": "rerun-a", "spec_hash": "spec-a"},
+        ],
+        metrics=("score",),
+        limit=10,
+    )
+
+    assert {row["run_id"] for row in rows} == {"config-a", "config-b"}
+
+
 def test_compare_sort_keeps_missing_metrics_last_when_ascending():
     runs = [
         {

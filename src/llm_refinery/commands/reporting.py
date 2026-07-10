@@ -5,10 +5,10 @@ from typing import Any
 
 import click
 
-from llm_refinery.bench_parser import parse_llama_bench_metrics
+from llm_refinery.benchmarks.registry import ReparseNotSupported, reparse_run
 from llm_refinery.commands.common import table
 from llm_refinery.compare import build_compare_rows, build_compare_table_rows
-from llm_refinery.storage import ResultStore
+from llm_refinery.storage.duckdb import ResultStore
 
 
 @click.command("report", help="Show recent runs or top runs by metric.")
@@ -39,27 +39,31 @@ def report_command(database: Path, metric: str | None, limit: int, list_metrics:
             if not rows:
                 click.echo(f"no rows for metric {metric!r}")
                 return
-            table_rows = [("value", "status", "trial", "run_id")]
-            table_rows.extend(
+            metric_table_rows = [("value", "kind", "status", "trial", "run_id")]
+            metric_table_rows.extend(
                 (
                     f"{row['value']:.3f}",
+                    row["benchmark_kind"],
                     row["status"],
                     row["trial_name"],
                     row["run_id"],
                 )
                 for row in rows
             )
-            click.echo(table(table_rows))
+            click.echo(table(metric_table_rows))
             return
 
         rows = store.recent_runs(limit=limit)
         if not rows:
             click.echo("no runs yet")
             return
-        table_rows = [("ended_at", "status", "duration_s", "trial", "run_id")]
-        table_rows.extend(
+        recent_table_rows = [
+            ("ended_at", "kind", "status", "duration_s", "trial", "run_id")
+        ]
+        recent_table_rows.extend(
             (
                 str(row["ended_at"]),
+                row["benchmark_kind"],
                 row["status"],
                 f"{row['duration_s']:.1f}",
                 row["trial_name"],
@@ -67,7 +71,7 @@ def report_command(database: Path, metric: str | None, limit: int, list_metrics:
             )
             for row in rows
         )
-        click.echo(table(table_rows))
+        click.echo(table(recent_table_rows))
         click.echo(
             "\nUse --metrics to list metric names, --metric NAME to rank runs, "
             "or `llm-refinery compare` to compare configs."
@@ -154,7 +158,7 @@ def compare_command(
     click.echo(table(table_rows))
 
 
-@click.command("reparse", help="Reparse stored stdout artifacts and refresh parsed metrics.")
+@click.command("reparse", help="Reparse typed benchmark artifacts and refresh metrics.")
 @click.argument(
     "database",
     required=False,
@@ -162,26 +166,46 @@ def compare_command(
     type=click.Path(dir_okay=False, path_type=Path),
 )
 @click.option("--include-failed", is_flag=True, help="Also reparse failed runs.")
-def reparse_command(database: Path, include_failed: bool) -> None:
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Replace existing metrics even when the benchmark parser returns no metrics.",
+)
+def reparse_command(database: Path, include_failed: bool, force: bool) -> None:
     if not database.exists():
         raise FileNotFoundError(f"database not found: {database}")
 
     updated = 0
+    skipped = 0
     missing = 0
     empty = 0
+    errors = 0
     with ResultStore(database) as store:
-        for run in store.runs_with_artifacts(include_failed=include_failed):
-            stdout_path = run.get("stdout_path")
-            if not stdout_path or not Path(stdout_path).exists():
+        for run in store.reparse_candidates(include_failed=include_failed):
+            try:
+                metrics = reparse_run(run)
+            except ReparseNotSupported:
+                skipped += 1
+                continue
+            except FileNotFoundError:
                 missing += 1
                 continue
-            metrics = parse_llama_bench_metrics(Path(stdout_path).read_text(encoding="utf-8"))
-            if not metrics:
+            except Exception as exc:  # noqa: BLE001 - preserve metrics and continue other runs
+                errors += 1
+                click.echo(f"failed to reparse {run['run_id']}: {exc}", err=True)
+                continue
+            if not metrics and not force:
                 empty += 1
+                continue
             store.update_run_metrics(run["run_id"], metrics)
             updated += 1
 
-    click.echo(f"reparsed {updated} run(s); missing_artifacts={missing}; empty_metrics={empty}")
+    click.echo(
+        f"reparsed {updated} run(s); skipped={skipped}; "
+        f"missing_artifacts={missing}; empty_metrics={empty}; errors={errors}"
+    )
+    if errors:
+        raise click.ClickException(f"failed to reparse {errors} run(s)")
 
 
 def _filter_compare_runs(

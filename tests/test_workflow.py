@@ -1,30 +1,19 @@
-from __future__ import annotations
-
-import subprocess
 from pathlib import Path
 
-from llm_refinery.config import ModelSpec, TuneConfig
+from llm_refinery.storage.duckdb import ResultStore
 from llm_refinery.workflows.suite import BenchmarkSuiteWorkflow
-
-
-def _minimal_tune_config(tmp_path: Path) -> TuneConfig:
-    return TuneConfig(
-        name="tune-suite",
-        database=tmp_path / "tune.duckdb",
-        commands={"bench": ["llama", "bench"], "server": ["llama", "server"]},
-        models=[ModelSpec(name="model", hf="repo/model")],
-    )
+from llm_refinery.workflows.suite_config import SuiteConfig, load_suite_config
 
 
 def _write_http_load_config(tmp_path: Path) -> Path:
     config_path = tmp_path / "http-load.yaml"
     config_path.write_text(
-        """
+        f"""
 name: http-suite
-database: {database}
+database: {tmp_path / 'http.duckdb'}
 targets:
   - name: local
-    provider: openai
+    protocol: openai_chat
     base_url: http://127.0.0.1:8080/v1
     model: local-model
 scenarios:
@@ -33,92 +22,85 @@ scenarios:
     max_tokens: [8]
     concurrency: [1]
     requests: 1
-""".format(database=tmp_path / "http.duckdb"),
+""",
         encoding="utf-8",
     )
     return config_path
 
 
-def test_suite_http_load_without_target_runs_all_targets(tmp_path, monkeypatch):
-    calls: list[list[str]] = []
-
-    def fake_run(cmd, check):
-        calls.append(cmd)
-        return subprocess.CompletedProcess(cmd, 0)
-
-    monkeypatch.setattr("llm_refinery.workflows.suite.subprocess.run", fake_run)
-
-    workflow = BenchmarkSuiteWorkflow(
-        config=_minimal_tune_config(tmp_path),
-        run_lm_eval=False,
-        run_http_load=True,
-        http_load_config=_write_http_load_config(tmp_path),
+def test_suite_config_resolves_http_config_relative_to_manifest(tmp_path: Path):
+    _write_http_load_config(tmp_path)
+    manifest = tmp_path / "suite.yaml"
+    manifest.write_text(
+        f"""
+name: suite
+database: {tmp_path / 'runs.duckdb'}
+endpoint:
+  name: local
+  protocol: openai_chat
+  base_url: http://127.0.0.1:8080/v1
+  model: local-model
+quality:
+  enabled: false
+http_load:
+  config: http-load.yaml
+  targets: [local]
+preflight:
+  enabled: false
+""",
+        encoding="utf-8",
     )
 
-    workflow.run_load()
+    config = load_suite_config(manifest)
 
-    assert len(calls) == 2
-    assert calls[0][:4] == ["uv", "run", "llm-refinery", "http-load"]
-    assert "--target" not in calls[0]
-    assert calls[1][:4] == ["uv", "run", "llm-refinery", "compare"]
-    assert "--suite" in calls[1]
-    assert calls[1][calls[1].index("--suite") + 1] == "http-suite"
-    assert calls[1][4] == str(tmp_path / "http.duckdb")
+    assert config.http_load.enabled is True
+    assert config.http_load.config == tmp_path / "http-load.yaml"
+    assert config.http_load.targets == ("local",)
 
 
-def test_suite_http_load_with_target_passes_target(tmp_path, monkeypatch):
-    calls: list[list[str]] = []
-
-    def fake_run(cmd, check):
-        calls.append(cmd)
-        return subprocess.CompletedProcess(cmd, 0)
-
-    monkeypatch.setattr("llm_refinery.workflows.suite.subprocess.run", fake_run)
-
-    workflow = BenchmarkSuiteWorkflow(
-        config=_minimal_tune_config(tmp_path),
-        run_lm_eval=False,
-        run_http_load=True,
-        http_load_config=_write_http_load_config(tmp_path),
-        target_name="local",
+def test_suite_calls_services_directly_and_links_child_runs(tmp_path: Path):
+    http_config = _write_http_load_config(tmp_path)
+    config = SuiteConfig.from_mapping(
+        {
+            "name": "suite",
+            "database": str(tmp_path / "runs.duckdb"),
+            "endpoint": {
+                "name": "local",
+                "protocol": "openai_chat",
+                "base_url": "http://127.0.0.1:8080/v1",
+                "model": "local-model",
+            },
+            "quality": {"tasks": "ifeval", "limit": "all"},
+            "http_load": {"config": str(http_config), "targets": ["local"]},
+            "preflight": {"enabled": False},
+        }
     )
+    calls = []
 
-    workflow.run_load()
+    def fake_lm_eval(config, **kwargs):
+        calls.append(("quality", config, kwargs))
+        return []
 
-    assert "--target" in calls[0]
-    assert calls[0][calls[0].index("--target") + 1] == "local"
+    def fake_http_load(config, **kwargs):
+        calls.append(("load", config, kwargs))
+        return []
 
+    result = BenchmarkSuiteWorkflow(
+        config,
+        lm_eval_runner=fake_lm_eval,
+        http_load_runner=fake_http_load,
+        system_snapshot=lambda: "snapshot",
+    ).execute()
 
-def test_suite_quality_sets_eval_config(tmp_path, monkeypatch):
-    captured = {}
+    assert [call[0] for call in calls] == ["quality", "load"]
+    assert calls[0][1].limit is None
+    assert calls[0][1].tasks == "ifeval"
+    assert calls[0][2]["parent_run_id"] == result.run.run_id
+    assert calls[1][2]["parent_run_id"] == result.run.run_id
+    assert calls[1][2]["store"] is calls[0][2]["store"]
 
-    def fake_run_lm_eval(config, *, dry_run=False):
-        captured["config"] = config
-        captured["dry_run"] = dry_run
-
-    monkeypatch.setattr("llm_refinery.workflows.suite.run_lm_eval", fake_run_lm_eval)
-
-    workflow = BenchmarkSuiteWorkflow(
-        config=_minimal_tune_config(tmp_path),
-        limit=None,
-        tasks="ifeval",
-        max_length=4096,
-        eos_string="<|im_end|>",
-        gen_kwargs="enable_thinking=False",
-        run_lm_eval=True,
-        run_http_load=False,
-        api_model="repo/model",
-    )
-
-    workflow.run_quality()
-
-    config = captured["config"]
-    assert captured["dry_run"] is False
-    assert config.target == "llama_cpp"
-    assert config.limit is None
-    assert config.tasks == "ifeval"
-    assert config.max_length == 4096
-    assert config.eos_string == "<|im_end|>"
-    assert config.gen_kwargs == "enable_thinking=False"
-    assert config.targets["llama_cpp"].model == "repo/model"
-    assert config.targets["llama_cpp"].base_url == "http://127.0.0.1:8080/v1/chat/completions"
+    with ResultStore(config.database) as store:
+        runs = store.comparison_runs()
+    assert len(runs) == 1
+    assert runs[0]["benchmark_kind"] == "suite"
+    assert set(runs[0]["artifacts"]) == {"system_before", "system_after"}

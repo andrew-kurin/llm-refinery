@@ -1,21 +1,19 @@
 import json
 import os
 
-from llm_refinery.lm_eval import (
-    LmEvalConfig,
-    LmEvalTarget,
-    build_lm_eval_command,
-    latest_lm_eval_result,
-    parse_lm_eval_metrics,
-)
+from llm_refinery.benchmarks.lm_eval.command import build_lm_eval_command
+from llm_refinery.benchmarks.lm_eval.config import LmEvalConfig
+from llm_refinery.benchmarks.lm_eval.parser import latest_lm_eval_result, parse_lm_eval_metrics
+from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
 
 
 def test_lm_eval_command_supports_include_path_for_fixed_tasks(tmp_path):
     config = LmEvalConfig(tasks="gpqa_main_generative_n_shot", include_path=tmp_path)
     cmd = build_lm_eval_command(
         config,
-        LmEvalTarget(
+        Endpoint(
             name="llama_cpp",
+            protocol=OPENAI_CHAT,
             model="local-model",
             base_url="http://localhost/v1/chat/completions",
         ),

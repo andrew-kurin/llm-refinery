@@ -4,7 +4,7 @@ database: results/llm_refinery.duckdb
 
 targets:
   - name: llama-supergemma4-26b-uncensored-q4km
-    provider: openai
+    protocol: openai_chat
     base_url: http://127.0.0.1:8080/v1
     model: local-model
 

@@ -9,7 +9,7 @@ from typing import Any
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
-from llm_refinery.config import ConfigError
+from llm_refinery.core.config import ConfigError
 
 DEFAULT_MTP_HEAD_DIR = Path("~/.local/share/llm-refinery/mtp")
 

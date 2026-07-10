@@ -2,11 +2,14 @@ name: gemma4-31b-suite
 
 database: results/llm_refinery.duckdb
 
-# This uses the existing HTTP load config we already created
-http_load_config: sweeps/gemma4-31b-ollama-http-load.yaml
+endpoint:
+  name: ollama-gemma4-31b
+  protocol: openai_chat
+  base_url: http://127.0.0.1:11434/v1
+  model: gemma4:31b
 
-# Quality settings
-eval:
+quality:
+  enabled: true
   tasks: ifeval,gsm8k
   limit: 50
   # IFEval has num_fewshot fixed to 0 in the task config; this restores
@@ -15,18 +18,14 @@ eval:
   eos_string: "<end_of_turn>"
   max_length: 16384
   # Reasoning models spend part of this budget in hidden reasoning.
-  # 1024 caused empty/truncated visible IFEval outputs.
   gen_kwargs: '{"max_gen_toks": 4096}'
 
-# Local server settings
-server:
-  params:
-    ctx_size: 8192
-    n_gpu_layers: all
-    parallel: 1
-  extra_args: ["--reasoning", "off"]
+http_load:
+  enabled: true
+  config: gemma4-31b-ollama-http-load.yaml
+  targets: [ollama-gemma4-31b]
 
-# Model for the local server
-models:
-  - name: gemma4-31b-ollama
-    path: gemma4:31b
+preflight:
+  enabled: true
+  require_clean: true
+  sanity_check: true

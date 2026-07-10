@@ -4,22 +4,22 @@ database: results/llm_refinery.duckdb
 
 targets:
   - name: mlx-diffusiongemma-26b-4bit
-    provider: openai
+    protocol: openai_chat
     base_url: http://127.0.0.1:8082/v1
     model: mlx-community/diffusiongemma-26B-A4B-it-4bit
 
   - name: mlx-diffusiongemma-26b-mxfp4
-    provider: openai
+    protocol: openai_chat
     base_url: http://127.0.0.1:8082/v1
     model: mlx-community/diffusiongemma-26B-A4B-it-mxfp4
 
   - name: mlx-diffusiongemma-26b-nvfp4
-    provider: openai
+    protocol: openai_chat
     base_url: http://127.0.0.1:8082/v1
     model: mlx-community/diffusiongemma-26B-A4B-it-nvfp4
 
   - name: mlx-diffusiongemma-26b-5bit
-    provider: openai
+    protocol: openai_chat
     base_url: http://127.0.0.1:8082/v1
     model: mlx-community/diffusiongemma-26B-A4B-it-5bit
 
