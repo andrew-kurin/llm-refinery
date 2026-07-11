@@ -17,7 +17,7 @@ scenarios:
       Give a recommendation for a user who prefers quality over raw speed.
     max_tokens: [128]
     concurrency: [1, 4, 16]
-    requests: 12
+    requests: 16
     warmup_requests: 1
     temperature: 0
     seed: 42
@@ -52,7 +52,7 @@ scenarios:
     prompt_repeat: 64
     max_tokens: [128]
     concurrency: [1, 4]
-    requests: 3
+    requests: 4
     warmup_requests: 1
     temperature: 0
     seed: 42

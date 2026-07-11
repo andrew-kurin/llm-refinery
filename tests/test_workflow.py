@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from llm_refinery.storage.duckdb import ResultStore
 from llm_refinery.workflows.suite import BenchmarkSuiteWorkflow
 from llm_refinery.workflows.suite_config import SuiteConfig, load_suite_config
@@ -10,7 +12,7 @@ def _write_http_load_config(tmp_path: Path) -> Path:
     config_path.write_text(
         f"""
 name: http-suite
-database: {tmp_path / 'http.duckdb'}
+database: {tmp_path / "http.duckdb"}
 targets:
   - name: local
     protocol: openai_chat
@@ -34,7 +36,7 @@ def test_suite_config_resolves_http_config_relative_to_manifest(tmp_path: Path):
     manifest.write_text(
         f"""
 name: suite
-database: {tmp_path / 'runs.duckdb'}
+database: {tmp_path / "runs.duckdb"}
 endpoint:
   name: local
   protocol: openai_chat
@@ -56,6 +58,16 @@ preflight:
     assert config.http_load.enabled is True
     assert config.http_load.config == tmp_path / "http-load.yaml"
     assert config.http_load.targets == ("local",)
+
+
+def test_local_quality_core_is_pinned_and_release_sized():
+    config = load_suite_config(Path("sweeps/local-quality-core-suite.yaml"))
+
+    assert config.quality.limit is None
+    assert config.quality.package_spec == "lm-eval[api]==0.4.12"
+    assert {"ifeval_pinned", "ifbench"} <= set(config.quality.tasks.split(","))
+    assert any(package.startswith("ifbench @ git+") for package in config.quality.extra_packages)
+    assert config.quality.offline is False
 
 
 def test_suite_calls_services_directly_and_links_child_runs(tmp_path: Path):
@@ -103,4 +115,33 @@ def test_suite_calls_services_directly_and_links_child_runs(tmp_path: Path):
         runs = store.comparison_runs()
     assert len(runs) == 1
     assert runs[0]["benchmark_kind"] == "suite"
-    assert set(runs[0]["artifacts"]) == {"system_before", "system_after"}
+    assert set(runs[0]["artifacts"]) == {"system_before", "system_after", "preflight"}
+
+
+def test_suite_can_require_the_response_model_identity(tmp_path: Path):
+    config = SuiteConfig.from_mapping(
+        {
+            "name": "model-binding",
+            "database": str(tmp_path / "runs.duckdb"),
+            "endpoint": {
+                "name": "local",
+                "protocol": "openai_chat",
+                "base_url": "http://127.0.0.1:8080/v1",
+                "model": "request-alias",
+            },
+            "quality": {"enabled": False},
+            "http_load": {"enabled": False},
+            "preflight": {"expected_response_model": "expected-loaded-model"},
+        }
+    )
+    workflow = BenchmarkSuiteWorkflow(
+        config,
+        port_listener=lambda port: port == 8080,
+        sanity_checker=lambda _endpoint: {
+            "success": True,
+            "response_model": "wrong-loaded-model",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="expected-loaded-model"):
+        workflow.preflight("snapshot")

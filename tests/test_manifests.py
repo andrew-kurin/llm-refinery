@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from llm_refinery.benchmarks.agent.config import load_agent_eval_config
+from llm_refinery.benchmarks.dabstep.config import load_dabstep_config
 from llm_refinery.benchmarks.http_load.config import load_http_load_config
 from llm_refinery.benchmarks.llama_bench.config import load_llama_config
 from llm_refinery.workflows.suite_config import load_suite_config
@@ -18,7 +19,10 @@ def test_checked_in_manifests_match_their_strict_schemas():
         loaded.append(path)
 
     for path in Path("benchmarks").glob("*.yaml"):
-        load_agent_eval_config(path)
+        if path.name.startswith("dabstep-"):
+            load_dabstep_config(path)
+        else:
+            load_agent_eval_config(path)
         loaded.append(path)
 
     assert loaded

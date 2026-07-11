@@ -1,0 +1,53 @@
+name: local-http-load-recommended
+
+database: results/llm_refinery.duckdb
+
+# Point this target at the OpenAI-compatible server under test. Run the same manifest unchanged
+# on each host. Every cell has enough observations for meaningful P95/P99 inspection; repeat a
+# full run at least three times when comparing close configurations.
+targets:
+  - name: local-openai
+    protocol: openai_chat
+    base_url: http://127.0.0.1:8080/v1
+    model: local-model
+
+scenarios:
+  # Measures the deployment's warm/shared-prefix behavior. The runner automatically sends at
+  # least one warmup request per concurrency slot.
+  - name: shared-prefix
+    cache_mode: shared
+    system: You are a concise and accurate technical assistant.
+    prompt: |
+      Compare quantized and full-precision KV caches for local language-model inference.
+      Discuss memory, quality, prompt processing, and generation speed, then give a recommendation.
+    max_tokens: [128, 512]
+    concurrency: [1, 2, 4, 8]
+    requests: 100
+    warmup_requests: 0
+    temperature: 0
+    seed: 42
+    stream: true
+    timeout_s: 600
+
+  # Rotates a prompt pool and injects an early per-request nonce. This is the cold/unique lane;
+  # it prevents a repeated long user prefix from making cache hits dominate the comparison.
+  - name: unique-prompt-pool
+    cache_mode: unique
+    system: You are a concise and accurate technical assistant.
+    prompts:
+      - Explain continuous batching and when it improves local LLM serving throughput.
+      - Compare Metal and CUDA execution for memory-bound autoregressive decoding.
+      - Explain how context length and KV-cache precision affect concurrency.
+      - Describe a sound method for comparing time to first token across two local servers.
+      - Explain why throughput and per-user latency can move in opposite directions.
+      - Compare model-weight quantization with KV-cache quantization.
+      - Describe how to detect thermal throttling during a sustained inference benchmark.
+      - Explain why failures must remain represented in service-latency tail metrics.
+    max_tokens: [128, 512]
+    concurrency: [1, 2, 4, 8]
+    requests: 100
+    warmup_requests: 0
+    temperature: 0
+    seed: 42
+    stream: true
+    timeout_s: 600

@@ -1,0 +1,36 @@
+task: ifbench
+dataset_path: allenai/IFBench_test
+dataset_name: null
+dataset_kwargs:
+  revision: 2e8a48de45ff3bf41242f927254ca81b59ca3ae2
+output_type: generate_until
+training_split: null
+validation_split: null
+test_split: train
+num_fewshot: 0
+doc_to_text: prompt
+doc_to_target: 0
+generation_kwargs:
+  until: []
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 4096
+process_results: !function utils.process_results
+metric_list:
+  - metric: prompt_level_loose_acc
+    aggregation: mean
+    higher_is_better: true
+  - metric: inst_level_loose_acc
+    aggregation: !function utils.aggregate_instruction_accuracy
+    higher_is_better: true
+  - metric: prompt_level_strict_acc
+    aggregation: mean
+    higher_is_better: true
+  - metric: inst_level_strict_acc
+    aggregation: !function utils.aggregate_instruction_accuracy
+    higher_is_better: true
+metadata:
+  version: 1.0
+  benchmark_source: allenai/IFBench@1091c4c3de6c1f6ed12c012ed68f11ea450b0117
+  dataset_revision: 2e8a48de45ff3bf41242f927254ca81b59ca3ae2
+  primary_metric: prompt_level_loose_acc

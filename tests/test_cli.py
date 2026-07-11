@@ -45,7 +45,7 @@ def test_lm_eval_command_dry_run_uses_python_cli():
 
     assert result.exit_code == 0
     assert "==> Running lm-eval target=ollama" in result.output
-    assert "uvx --from 'lm-eval[api]'" in result.output
+    assert "uvx --from 'lm-eval[api]==0.4.12'" in result.output
     assert "hf.co/ggml-org/gemma-4-12B-it-GGUF:Q8_0" in result.output
     assert 'reasoning_effort="none"' in result.output
 
@@ -203,6 +203,52 @@ def test_compare_command_shows_params_and_sorts_by_generation_tps(tmp_path):
     assert system_result.exit_code == 0
     assert "Mac-fast" in system_result.output
     assert "128.0" in system_result.output
+
+
+def test_compare_command_keeps_same_trial_from_distinct_hosts(tmp_path):
+    database = tmp_path / "runs.duckdb"
+    now = utc_now()
+    shared = {
+        "benchmark_kind": "llama_bench",
+        "spec_hash": "same-spec",
+        "suite": "suite",
+        "trial_name": "suite/model/same-spec",
+        "status": "ok",
+        "started_at": now,
+        "ended_at": now,
+        "duration_s": 1.0,
+        "command": "llama-bench",
+        "cwd": str(tmp_path),
+        "config_json": {"model": "model", "params": {}},
+    }
+    with ResultStore(database) as store:
+        store.record_run(
+            RunRecord(
+                run_id="mac-run",
+                metrics={"tg128.tokens_per_second": 20.0},
+                system_json={"hostname": "mac", "host_fingerprint": "host-mac"},
+                **shared,
+            )
+        )
+        store.record_run(
+            RunRecord(
+                run_id="spark-run",
+                metrics={"tg128.tokens_per_second": 30.0},
+                system_json={"hostname": "spark", "host_fingerprint": "host-spark"},
+                **shared,
+            )
+        )
+
+    result = CliRunner().invoke(
+        main,
+        ["compare", str(database), "--metric", "tg128.tokens_per_second", "--limit", "10"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "mac-run" in result.output
+    assert "spark-run" in result.output
+    assert "mac" in result.output
+    assert "spark" in result.output
 
 
 def test_backfill_system_metadata_command(tmp_path, monkeypatch):

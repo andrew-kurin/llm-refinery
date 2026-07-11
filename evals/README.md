@@ -1,6 +1,50 @@
 # Quality eval suites
 
-Use `llm-refinery lm-eval` for lm-eval quality suites. Results are parsed into DuckDB and can be compared with `llm-refinery compare`. Set `--package-spec` to a pinned `lm-eval[api]` version when reproducing a published run.
+Use `llm-refinery lm-eval` for lm-eval quality suites. Results are parsed into DuckDB and can be compared with `llm-refinery compare`. The harness defaults to `lm-eval[api]==0.4.12`; keep that package and each task dataset revision fixed when reproducing a published run.
+
+Release-oriented suite runs use `--log_samples`. The harness copies every matching
+sample JSONL into the run artifact directory and records normalized per-item rows in
+DuckDB. A requested sample log that produces no sample records fails closed.
+
+## Local quality tiers
+
+The included manifests have deliberately different meanings:
+
+- `sweeps/local-quality-smoke-suite.yaml`: ten examples per task/subtask; pipeline check only.
+- `sweeps/local-quality-core-suite.yaml`: complete IFEval, IFBench, GPQA Diamond, and MuSR generative tasks.
+- `sweeps/local-quality-expanded-suite.yaml`: the core tier plus every MMLU-Pro domain.
+
+All tasks in those packs use generation and work through an OpenAI-compatible chat
+endpoint. IFBench uses its pinned official rule-based grader and dataset; the manifests
+install its exact scorer dependencies in the isolated `uvx` environment. The packs use
+local `ifeval_pinned` and `mmlu_pro_pinned` task names so their Hugging Face dataset
+commits are part of the executable configuration. The MuSR override converts the
+upstream multiple-choice task to deterministic number generation and pins dataset commit
+`7c365b439a222150f317764d4f16ae6c96d7d94a`.
+
+The first online run also needs access to the gated `Idavidrein/gpqa` dataset
+(accept its Hugging Face terms and provide `HF_TOKEN` if it is not already cached).
+After the uv, Hugging Face, and NLTK caches are populated, set `quality.offline: true`
+in the release manifest for network-isolated repeats.
+
+For long-context retrieval, RULER also works through this path, but its tokenizer must
+match the deployed model. Run it separately so context length is an explicit axis:
+
+```bash
+uv run llm-refinery lm-eval local all \
+  --model local-model \
+  --base-url http://127.0.0.1:8080/v1 \
+  --tasks ruler \
+  --tokenizer /path/to/the/deployed-model-tokenizer \
+  --metadata '{"max_seq_lengths":[4096,8192,16384,32768]}' \
+  --max-length 32768 \
+  --log-samples \
+  --online
+```
+
+After the task assets are cached, use the default offline mode for repeatability. Do
+not substitute a convenient tokenizer from a different model: that changes sequence
+construction and invalidates the context-length comparison.
 
 ## Reasoning/knowledge scoreboard
 
@@ -40,5 +84,6 @@ The default `llm-refinery lm-eval` path uses lm-eval's `local-chat-completions` 
 
 - keeps the explicit `Question: {{Question}}` marker in `doc_to_text`
 - removes `Question:` from `generation_kwargs.until`
+- derives answer-choice order from a stable question hash rather than global randomness
 
 The removed stop marker avoids truncating responses when chat models echo or restate `Question:` before answering, which can break strict/flexible answer extraction.

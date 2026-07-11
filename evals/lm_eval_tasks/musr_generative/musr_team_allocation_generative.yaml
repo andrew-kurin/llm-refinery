@@ -1,0 +1,3 @@
+include: _musr_generative_template_yaml
+task: musr_team_allocation_generative
+test_split: team_allocation

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -16,14 +17,17 @@ class LmEvalConfig:
     num_concurrent: int = 1
     max_retries: int = 3
     max_length: int = 16384
-    eos_string: str = "<turn|>"
+    eos_string: str | None = None
+    tokenizer: str | None = None
+    metadata: str | None = None
     log_samples: bool = False
     num_fewshot: int | None = None
     gen_kwargs: str | None = None
     output_root: Path = Path("results/lm_eval")
     offline: bool = True
     model_backend: str = "local-chat-completions"
-    package_spec: str = "lm-eval[api]"
+    package_spec: str = "lm-eval[api]==0.4.12"
+    extra_packages: tuple[str, ...] = ()
     apply_chat_template: bool = True
     include_path: Path | None = None
     suite_name: str = "lm-eval"
@@ -43,6 +47,15 @@ class LmEvalConfig:
             raise ConfigError("lm-eval max_length must be positive")
         if not self.package_spec.strip():
             raise ConfigError("lm-eval package_spec cannot be empty")
+        if any(not package.strip() for package in self.extra_packages):
+            raise ConfigError("lm-eval extra package specs cannot be empty")
+        if self.metadata is not None:
+            try:
+                metadata = json.loads(self.metadata)
+            except json.JSONDecodeError as exc:
+                raise ConfigError(f"lm-eval metadata must be valid JSON: {exc}") from exc
+            if not isinstance(metadata, dict):
+                raise ConfigError("lm-eval metadata must be a JSON object")
 
 
 def resolve_target_names(target: str, available: set[str] | None = None) -> list[str]:

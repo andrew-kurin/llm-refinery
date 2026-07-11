@@ -9,6 +9,7 @@ It gives you a `llm-refinery` command that can:
 - run lm-eval quality checks against local chat-completions endpoints
 - run HTTP latency/TTFT/load checks against llama.cpp, Ollama, MLX, and similar servers
 - run agent/data benchmarks such as GeoAnalystBench against OpenAI-compatible endpoints
+- supervise and resume the official external-process DABStep baseline
 - store commands, stdout/stderr artifacts, params, parsed metrics, and structured host metadata in DuckDB
 - compare local model/server candidates in one workflow
 
@@ -81,14 +82,22 @@ uv run llm-refinery http-load sweeps/gemma-http-load-ollama-compare.yaml --targe
 uv run llm-refinery http-load sweeps/gemma-http-load-ollama-compare.yaml --target ollama-gemma
 ```
 
+For cross-host service comparisons, start with the 100-request shared-prefix and
+cache-busted prompt-pool cells in
+[`sweeps/local-http-load-recommended.yaml`](sweeps/local-http-load-recommended.yaml).
+The runner warms every concurrency slot and warns when a cell is too small for useful
+tail inspection. It records all-request latency (including failures), visible and
+reasoning TTFT, TPOT, approximate streaming-event ITL, and explicit correctness failures.
+
 Compare HTTP load results by latency, TTFT, throughput, and optionally host metadata:
 
 ```bash
 uv run llm-refinery compare results/llm_refinery.duckdb \
-  --metric latency_p95_s \
-  --metric ttft_p95_s \
+  --metric observed_latency_p95_s \
+  --metric visible_ttft_p95_s \
+  --metric tpot_p95_s \
   --metric completion_tokens_per_second \
-  --sort latency_p95_s \
+  --sort observed_latency_p95_s \
   --ascending \
   --param target \
   --param protocol \
@@ -104,9 +113,9 @@ If a benchmark parser improved, refresh stored metrics from typed artifacts:
 uv run llm-refinery reparse results/llm_refinery.duckdb
 ```
 
-Reparsing dispatches by `benchmark_kind`; llama-bench, lm-eval, HTTP-load, and
-agent-eval artifacts each use their own parser. Empty parser results are preserved
-unless `--force` is supplied.
+Reparsing dispatches by `benchmark_kind`; llama-bench, lm-eval, HTTP-load,
+agent-eval, and DABStep artifacts each use their own parser. Empty parser results
+are preserved unless `--force` is supplied.
 
 Run a broader lm-eval reasoning/knowledge scoreboard, including the fixed GPQA task override:
 
@@ -118,6 +127,36 @@ uv run llm-refinery lm-eval ollama all \
 ```
 
 Parsed lm-eval aggregate metrics are stored in DuckDB and can be compared with `llm-refinery compare`. Arbitrary OpenAI-compatible targets are accepted with a custom name plus `--model` and `--base-url`; use `--api-key-env` for authenticated endpoints. Pin `--package-spec` when exact lm-eval reproducibility matters. See [`evals/README.md`](evals/README.md).
+
+For model selection, use the reproducible local tiers rather than drawing conclusions
+from a 50-item smoke run:
+
+```bash
+# Fast pipeline validation only
+uv run llm-refinery suite sweeps/local-quality-smoke-suite.yaml
+
+# Complete IFEval + IFBench + GPQA Diamond + generative MuSR
+uv run llm-refinery suite sweeps/local-quality-core-suite.yaml
+
+# Overnight/release tier, adding all MMLU-Pro domains
+uv run llm-refinery suite sweeps/local-quality-expanded-suite.yaml
+```
+
+Suite quality runs retain lm-eval's item-level JSONL artifacts and normalized sample
+rows in DuckDB. Aggregate standard errors are expanded to 95% intervals, and retained
+sample correctness includes Wilson intervals for auditability and paired follow-up analysis.
+
+Compare two quality runs on their exact shared items (including flip counts and an
+exact McNemar test):
+
+```bash
+uv run llm-refinery quality-compare results/llm_refinery.duckdb \
+  <baseline-run-id> <candidate-run-id> --task ifeval_pinned
+```
+
+`correct` is normalized to each task's primary binary score (IFBench uses loose prompt
+accuracy; IFEval uses strict prompt accuracy). Use `--sample-metric` to compare another
+retained binary item metric explicitly.
 
 Run a GeoAnalystBench smoke benchmark against an already-running OpenAI-compatible server (see [`docs/geoanalystbench.md`](docs/geoanalystbench.md)):
 
@@ -131,13 +170,26 @@ Compare GeoAnalystBench runs:
 ```bash
 uv run llm-refinery compare results/llm_refinery.duckdb \
   --suite geoanalystbench-smoke \
-  --metric success_rate \
+  --metric response_availability_rate \
   --metric workflow_step_abs_error_avg \
-  --metric code_syntax_pass_rate \
-  --sort success_rate \
+  --metric code_contract_pass_rate \
+  --metric code_reference_call_recall_avg \
+  --sort code_contract_pass_rate \
   --param target \
   --param system.hardware.memory_gb
 ```
+
+Run the official DABStep baseline from a prepared Hugging Face Space checkout:
+
+```bash
+uv run llm-refinery dabstep benchmarks/dabstep-smoke.yaml --dry-run
+uv run llm-refinery dabstep benchmarks/dabstep-smoke.yaml
+uv run llm-refinery dabstep benchmarks/dabstep-smoke.yaml --resume <failed-run-id>
+```
+
+DABStep answers are checkpointed as task samples and a canonical leaderboard-ready
+`answers.jsonl`. See [`docs/dabstep.md`](docs/dabstep.md) for upstream setup, scoring,
+and resume behavior.
 
 If old runs predate structured host metadata, backfill them by assuming they ran on the current machine:
 
@@ -180,7 +232,11 @@ Important notes:
 - `bench.omit_params` / `server.omit_params` remove shared flags for one command type.
 - Snake-case keys become llama.cpp kebab-case flags. Example: `ctx_size` -> `--ctx-size`.
 - Boolean `true` values become flags. Boolean `false` values are omitted.
-- Bench, lm-eval, HTTP-load, agent-eval, and suite runs record structured host metadata in `runs.system_json` for cross-machine history: macOS version, hardware model, chip/CPU fields when available, memory size, Python path/version, project version, and git head/dirty state. `llm-refinery compare --param system.hardware.model --param system.hardware.memory_gb` can display it.
+- Bench, lm-eval, HTTP-load, agent-eval, DABStep, and suite runs record structured host metadata in `runs.system_json` for cross-machine history: macOS version, hardware model, chip/CPU fields when available, memory size, Python path/version, project version, and git head/dirty state. `llm-refinery compare --param system.hardware.model --param system.hardware.memory_gb` can display it.
+- Linux/DGX profiles also capture OS/DMI, NVIDIA GPU/driver, CUDA runtime/toolkit, and
+  DGX release metadata best-effort. A hashed machine fingerprint keeps identical configs
+  from a Mac and DGX Spark as distinct comparison rows while collapsing reruns only on
+  the same host.
 - Server params support an `mtp_head` helper for Gemma/Qwen MTP draft heads. It expands to `--model-draft <path>` and, in `llm-refinery server`, auto-downloads when `hf` + `file` or `url` is provided:
 
   ```yaml
@@ -197,8 +253,8 @@ Important notes:
 
 ### Endpoint configuration
 
-HTTP-load, agent-eval, and suite manifests use a shared endpoint shape. `protocol`
-describes the wire protocol rather than the server vendor:
+HTTP-load, agent-eval, DABStep, and suite manifests use a shared endpoint shape.
+`protocol` describes the wire protocol rather than the server vendor:
 
 ```yaml
 endpoint:
@@ -218,13 +274,18 @@ Suite manifests are separate from llama sweep manifests. See
 `endpoint`, `quality`, optional `http_load`, and `preflight` section. Referenced
 HTTP-load paths resolve relative to the suite manifest.
 
+Successful suite preflight responses are retained as `preflight.json`, including the
+model identifier returned by the endpoint. When an endpoint exposes a stable model id,
+set `preflight.expected_response_model` to make an accidental model swap fail closed.
+
 ## Suggested workflow
 
 1. Start with `llm-refinery plan` to verify exact llama.cpp commands.
 2. Run a small `--limit` first for low-level benchmark sweeps.
 3. Launch candidates with `llm-refinery server` or an external Ollama/MLX server.
 4. Run `llm-refinery suite` with a suite manifest for recorded lm-eval + HTTP-load checks. Use `endpoint.model` in YAML or `--api-model` when the endpoint requires the real model id.
-5. Use `llm-refinery agent-eval` for agent/data benchmarks like GeoAnalystBench.
-6. Compare parsed metrics with `llm-refinery compare`.
+5. Use `llm-refinery agent-eval` for direct chat benchmarks like GeoAnalystBench.
+6. Use `llm-refinery dabstep` for the external multi-step DABStep agent baseline.
+7. Compare parsed metrics with `llm-refinery compare`.
 
 This scaffold intentionally avoids Make. YAML is the source of truth, and Python handles expansion, execution, parsing, and storage. See [`docs/architecture.md`](docs/architecture.md) for module boundaries and extension points.

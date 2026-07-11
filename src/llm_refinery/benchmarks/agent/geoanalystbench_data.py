@@ -8,10 +8,10 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from llm_refinery.core.config import ConfigError
+from llm_refinery.core.runs import stable_hash
 
 DEFAULT_GEOANALYSTBENCH_DATASET = (
-    "https://raw.githubusercontent.com/GeoDS/GeoAnalystBench/"
-    "master/dataset/GeoAnalystBench.csv"
+    "https://raw.githubusercontent.com/GeoDS/GeoAnalystBench/master/dataset/GeoAnalystBench.csv"
 )
 
 
@@ -47,6 +47,8 @@ class GeoAnalystTask:
             "open_source": self.open_source,
             "task": self.task,
             "task_length": self.task_length,
+            "reference_workflow_hash": stable_hash(self.human_workflow),
+            "reference_code_hash": stable_hash(self.code),
         }
 
 

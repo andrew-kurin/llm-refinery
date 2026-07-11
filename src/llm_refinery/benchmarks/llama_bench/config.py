@@ -298,4 +298,3 @@ def expand_trials(config: LlamaSweepConfig, *, kind: str = "bench") -> list[Llam
                         )
                     )
     return trials
-

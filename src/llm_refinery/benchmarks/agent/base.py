@@ -120,6 +120,10 @@ class AgentEvalResult:
     workflow_step_count: int | None = None
     workflow_step_abs_error: int | None = None
     code_syntax_ok: bool | None = None
+    code_model_function_present: bool | None = None
+    code_contract_ok: bool | None = None
+    code_reference_import_recall: float | None = None
+    code_reference_call_recall: float | None = None
     error: str | None = None
 
     def as_jsonable(self) -> dict[str, Any]:
@@ -134,6 +138,10 @@ class AgentEvalResult:
             "workflow_step_count": self.workflow_step_count,
             "workflow_step_abs_error": self.workflow_step_abs_error,
             "code_syntax_ok": self.code_syntax_ok,
+            "code_model_function_present": self.code_model_function_present,
+            "code_contract_ok": self.code_contract_ok,
+            "code_reference_import_recall": self.code_reference_import_recall,
+            "code_reference_call_recall": self.code_reference_call_recall,
             "error": self.error,
         }
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from llm_refinery.benchmarks.http_load.config import RECOMMENDED_MEASURED_REQUESTS
 from llm_refinery.benchmarks.http_load.models import RequestResult
 from llm_refinery.core.metrics import add_distribution_metrics
 
@@ -18,22 +19,65 @@ def summarize_request_results(
         "concurrency": float(concurrency),
         "max_tokens": float(max_tokens),
         "wall_duration_s": wall_duration_s,
+        "measured_request_count_recommended_min": float(RECOMMENDED_MEASURED_REQUESTS),
+        "measured_request_count_recommendation_met": float(
+            request_count >= RECOMMENDED_MEASURED_REQUESTS
+        ),
         "requests_per_second": float(len(successes) / wall_duration_s)
+        if wall_duration_s > 0
+        else 0.0,
+        "attempted_requests_per_second": float(request_count / wall_duration_s)
         if wall_duration_s > 0
         else 0.0,
     }
 
+    # Keep the legacy success-only ``latency`` distribution and add unambiguous variants.
     add_distribution_metrics(metrics, "latency", [result.latency_s for result in successes])
+    add_distribution_metrics(
+        metrics, "successful_latency", [result.latency_s for result in successes]
+    )
+    add_distribution_metrics(metrics, "observed_latency", [result.latency_s for result in results])
+    add_distribution_metrics(
+        metrics, "failed_latency", [result.latency_s for result in results if not result.ok]
+    )
     add_distribution_metrics(
         metrics,
         "ttft",
         [result.ttft_s for result in successes if result.ttft_s is not None],
     )
+    add_distribution_metrics(
+        metrics,
+        "visible_ttft",
+        [result.visible_ttft_s for result in successes if result.visible_ttft_s is not None],
+    )
+    add_distribution_metrics(
+        metrics,
+        "reasoning_ttft",
+        [result.reasoning_ttft_s for result in successes if result.reasoning_ttft_s is not None],
+    )
+    add_distribution_metrics(
+        metrics,
+        "tpot",
+        [result.tpot_s for result in successes if result.tpot_s is not None],
+    )
+    add_distribution_metrics(
+        metrics,
+        "itl",
+        [itl_s for result in successes for itl_s in result.itl_s],
+    )
+    itl_observation_count = sum(len(result.itl_s) for result in successes)
+    metrics["itl_observation_count"] = float(itl_observation_count)
+    metrics["itl_stream_event_approximation"] = float(itl_observation_count > 0)
 
     completion_chars_total = sum(result.completion_chars for result in successes)
     metrics["completion_chars_total"] = float(completion_chars_total)
     metrics["completion_chars_per_second"] = (
         float(completion_chars_total / wall_duration_s) if wall_duration_s > 0 else 0.0
+    )
+    observed_completion_chars_total = sum(result.completion_chars for result in results)
+    metrics["observed_completion_chars_total"] = float(observed_completion_chars_total)
+    metrics["observed_completion_chars_per_second"] = (
+        float(observed_completion_chars_total / wall_duration_s) if wall_duration_s > 0 else 0.0
     )
 
     known_completion_tokens = [
@@ -45,6 +89,17 @@ def summarize_request_results(
         metrics["completion_tokens_per_second"] = (
             float(completion_tokens_total / wall_duration_s) if wall_duration_s > 0 else 0.0
         )
+    observed_completion_tokens = [
+        result.completion_tokens for result in results if result.completion_tokens is not None
+    ]
+    if observed_completion_tokens:
+        observed_completion_tokens_total = sum(observed_completion_tokens)
+        metrics["observed_completion_tokens_total"] = float(observed_completion_tokens_total)
+        metrics["observed_completion_tokens_per_second"] = (
+            float(observed_completion_tokens_total / wall_duration_s)
+            if wall_duration_s > 0
+            else 0.0
+        )
 
     known_prompt_tokens = [
         result.prompt_tokens for result in successes if result.prompt_tokens is not None
@@ -52,7 +107,7 @@ def summarize_request_results(
     if known_prompt_tokens:
         metrics["prompt_tokens_total"] = float(sum(known_prompt_tokens))
 
-    checked_results = [result for result in successes if result.check_passed is not None]
+    checked_results = [result for result in results if result.check_passed is not None]
     if checked_results:
         check_pass_count = sum(1 for result in checked_results if result.check_passed)
         metrics["check_pass_count"] = float(check_pass_count)

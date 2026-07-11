@@ -1,0 +1,5 @@
+ifbench @ git+https://github.com/allenai/IFBench.git@1091c4c3de6c1f6ed12c012ed68f11ea450b0117
+emoji==2.15.0
+nltk==3.9.2
+setuptools==80.9.0
+syllapy==0.7.2

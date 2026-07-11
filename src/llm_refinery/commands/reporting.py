@@ -57,9 +57,7 @@ def report_command(database: Path, metric: str | None, limit: int, list_metrics:
         if not rows:
             click.echo("no runs yet")
             return
-        recent_table_rows = [
-            ("ended_at", "kind", "status", "duration_s", "trial", "run_id")
-        ]
+        recent_table_rows = [("ended_at", "kind", "status", "duration_s", "trial", "run_id")]
         recent_table_rows.extend(
             (
                 str(row["ended_at"]),
@@ -133,7 +131,10 @@ def compare_command(
     with ResultStore(database) as store:
         runs = store.comparison_runs(
             include_failed=include_failed,
-            latest_per_trial=not all_runs,
+            # Host-aware deduplication happens after system_json has been loaded.
+            # Selecting one row per trial here would discard otherwise identical
+            # benchmark runs collected on another machine.
+            latest_per_trial=False,
         )
 
     runs = _filter_compare_runs(

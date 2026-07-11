@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from llm_refinery.utils.system import host_identity
+
 DEFAULT_METRICS = ("pp_tps", "tg_tps")
 DEFAULT_SORT = "tg_tps"
 ALWAYS_PARAMS = ("prompt_tokens", "gen_tokens")
@@ -40,7 +42,16 @@ def build_compare_table_rows(rows: list[dict[str, Any]]) -> list[tuple[object, .
 
     metric_keys = list(rows[0]["_metric_keys"])
     param_keys = list(rows[0]["_param_keys"])
-    header = ["rank", *metric_keys, "model", *ALWAYS_PARAMS, *param_keys, "duration_s", "run_id"]
+    header = [
+        "rank",
+        *metric_keys,
+        "model",
+        "host",
+        *ALWAYS_PARAMS,
+        *param_keys,
+        "duration_s",
+        "run_id",
+    ]
 
     table_rows: list[tuple[object, ...]] = [tuple(header)]
     for rank, row in enumerate(rows, start=1):
@@ -50,6 +61,7 @@ def build_compare_table_rows(rows: list[dict[str, Any]]) -> list[tuple[object, .
                     rank,
                     *[_format_metric(row.get(key)) for key in metric_keys],
                     row.get("model", ""),
+                    row.get("host", ""),
                     *[row.get(key, "") for key in ALWAYS_PARAMS],
                     *[row.get(key, "") for key in param_keys],
                     f"{row['duration_s']:.1f}",
@@ -79,6 +91,7 @@ def _build_compare_row(
     config = run.get("config_json") or {}
     trial_params = config.get("params") or {}
     metrics = run.get("metrics") or {}
+    system_profile = run.get("system_json") or {}
     prompt_tokens = config.get("prompt_tokens")
     gen_tokens = config.get("gen_tokens")
 
@@ -89,8 +102,10 @@ def _build_compare_row(
         "status": run["status"],
         "duration_s": run["duration_s"],
         "model": _model_name(config.get("model")),
+        "host": _host_label(system_profile),
         "prompt_tokens": prompt_tokens if prompt_tokens is not None else "",
         "gen_tokens": gen_tokens if gen_tokens is not None else "",
+        "_host_identity": host_identity(system_profile),
         "_metric_keys": metric_keys,
         "_param_keys": param_keys,
     }
@@ -103,6 +118,21 @@ def _build_compare_row(
     for key in metric_keys:
         row[key] = metric_value(key, metrics, prompt_tokens=prompt_tokens, gen_tokens=gen_tokens)
     return row
+
+
+def _host_label(system_profile: dict[str, Any]) -> str:
+    hostname = system_profile.get("hostname")
+    if hostname:
+        return str(hostname)
+
+    hardware = system_profile.get("hardware") or {}
+    if isinstance(hardware, dict):
+        model = hardware.get("model") or hardware.get("chip")
+        if model:
+            return str(model)
+
+    identity = host_identity(system_profile)
+    return "" if identity == "unknown-host" else identity
 
 
 def _model_name(value: object) -> str:
@@ -129,9 +159,12 @@ def _dedupe_latest_configs(
     deduped: list[dict[str, Any]] = []
     for row in rows:
         signature = (
-            ("spec_hash", row["spec_hash"])
+            ("spec_hash", row["spec_hash"], row["_host_identity"])
             if row.get("spec_hash")
-            else tuple(row.get(key, "") for key in (*IDENTITY_COLUMNS, *param_keys))
+            else (
+                row["_host_identity"],
+                *tuple(row.get(key, "") for key in (*IDENTITY_COLUMNS, *param_keys)),
+            )
         )
         if signature in seen:
             continue
