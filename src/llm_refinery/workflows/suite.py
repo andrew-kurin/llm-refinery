@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ipaddress
 import json
+import os
+import socket
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -13,15 +16,16 @@ from rich.table import Table
 from llm_refinery.application.run_context import RunContext
 from llm_refinery.application.run_session import RunSession
 from llm_refinery.application.target_discovery import TargetResolver
-from llm_refinery.benchmarks.http_load.config import load_http_load_config
+from llm_refinery.benchmarks.http_load.config import HttpTransportConfig, load_http_load_config
 from llm_refinery.benchmarks.http_load.runner import run_http_load
 from llm_refinery.benchmarks.lm_eval.config import LmEvalConfig
 from llm_refinery.benchmarks.lm_eval.runner import run_lm_eval
 from llm_refinery.compare import build_compare_rows, build_compare_table_rows
 from llm_refinery.core.config import ConfigError
 from llm_refinery.core.endpoints import Endpoint
+from llm_refinery.core.http_safety import PinnedHttpRoute, pinned_route_trust_env
 from llm_refinery.core.runs import CompletedRun, RunSpec
-from llm_refinery.core.targets import ResolvedTarget
+from llm_refinery.core.targets import ResolvedTarget, TargetInspection, TargetSpec
 from llm_refinery.storage.duckdb import ResultStore
 from llm_refinery.utils.sanity import run_api_sanity_check
 from llm_refinery.utils.system import get_system_snapshot, is_port_listening
@@ -46,7 +50,7 @@ class BenchmarkSuiteWorkflow:
         lm_eval_runner: LmEvalRunner = run_lm_eval,
         http_load_runner: HttpLoadRunner = run_http_load,
         port_listener: Callable[[int], bool] = is_port_listening,
-        sanity_checker: Callable[..., dict[str, Any]] = run_api_sanity_check,
+        sanity_checker: Callable[..., dict[str, Any]] | None = None,
         system_snapshot: Callable[[], str] = get_system_snapshot,
         target_resolver: TargetResolver | None = None,
     ) -> None:
@@ -55,12 +59,23 @@ class BenchmarkSuiteWorkflow:
         self.lm_eval_runner = lm_eval_runner
         self.http_load_runner = http_load_runner
         self.port_listener = port_listener
-        self.sanity_checker = sanity_checker
+        if sanity_checker is not None:
+            self.sanity_checker = sanity_checker
+        else:
+            target_transport = config.target.transport if config.target is not None else None
+            self.sanity_checker = lambda endpoint: run_api_sanity_check(
+                endpoint,
+                trust_env=(target_transport.trust_env if target_transport is not None else True),
+                ca_bundle=(target_transport.ca_bundle if target_transport is not None else None),
+                route=self._target_route,
+            )
         self.system_snapshot = system_snapshot
         self.target_resolver = target_resolver or TargetResolver()
         self._endpoint: Endpoint | None = config.endpoint
         self._resolved_target: ResolvedTarget | None = None
+        self._target_route: PinnedHttpRoute | None = None
         self._run_context: RunContext | None = None
+        self._validation_warnings: list[str] = []
 
     def execute(self) -> SuiteResult:
         command = f"llm-refinery suite {self.config.name}"
@@ -97,17 +112,47 @@ class BenchmarkSuiteWorkflow:
                 before_snapshot = self.system_snapshot()
                 before_path.write_text(before_snapshot, encoding="utf-8")
                 if target_spec is not None:
-                    inspection = self.target_resolver.inspect(
-                        target_spec,
-                        allow_service_unavailable=True,
-                    )
                     assert discovery_path is not None and server_before_path is not None
+                    try:
+                        inspection = self.target_resolver.inspect(
+                            target_spec,
+                            allow_service_unavailable=True,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - persist discovery failure context
+                        detail = _target_error_summary(exc, target_spec)
+                        partial = getattr(exc, "target_inspection", None)
+                        inspection = (
+                            replace(
+                                partial,
+                                errors=tuple(dict.fromkeys([*partial.errors, detail])),
+                            )
+                            if isinstance(partial, TargetInspection)
+                            else TargetInspection(
+                                spec=target_spec,
+                                host=None,
+                                service=None,
+                                resolved=None,
+                                errors=(detail,),
+                            )
+                        )
+                        failure = inspection.safe_json()
+                        failure["failure_stage"] = "target_discovery"
+                        failure["requested_target"] = target_spec.safe_json()
+                        _write_json(discovery_path, failure)
+                        _write_json(
+                            server_before_path,
+                            inspection.host.profile
+                            if inspection.host is not None
+                            else {"capture_error": detail},
+                        )
+                        run.set_target_json(failure)
+                        raise
                     _write_json(discovery_path, inspection.safe_json())
                     _write_json(
                         server_before_path,
-                        inspection.host.profile if inspection.host is not None else {
-                            "capture_error": "target host inventory unavailable"
-                        },
+                        inspection.host.profile
+                        if inspection.host is not None
+                        else {"capture_error": "target host inventory unavailable"},
                     )
                     run.set_target_json(inspection.safe_json())
                     if inspection.resolved is None:
@@ -116,6 +161,7 @@ class BenchmarkSuiteWorkflow:
                             f"could not resolve target {target_spec.name!r}: {detail}"
                         )
                     self._resolved_target = inspection.resolved
+                    self._target_route = inspection.route
                     self._endpoint = inspection.resolved.endpoint
                     self._validate_resolved_target(inspection.resolved)
                     if target_spec.discovery.metrics:
@@ -144,9 +190,7 @@ class BenchmarkSuiteWorkflow:
             finally:
                 if target_spec is not None and server_after_path is not None:
                     try:
-                        after_profile = self.target_resolver.snapshot_host(
-                            target_spec
-                        ).profile
+                        after_profile = self.target_resolver.snapshot_host(target_spec).profile
                     except Exception as exc:  # noqa: BLE001 - retain best-effort telemetry
                         after_profile = {"capture_error": f"{type(exc).__name__}: {exc}"}
                     _write_json(server_after_path, after_profile)
@@ -184,19 +228,23 @@ class BenchmarkSuiteWorkflow:
     def preflight(self, snapshot: str | None = None) -> dict[str, Any]:
         config = self.config.preflight
         if not config.enabled:
-            return {"enabled": False}
+            return {"enabled": False, "warnings": list(self._validation_warnings)}
         self._log("Performing preflight checks...")
         endpoint = self._effective_endpoint()
         parsed = urlparse(endpoint.base_url)
         endpoint_port = _port_from_url(endpoint.base_url)
-        if parsed.hostname in {"127.0.0.1", "localhost", "::1"} and not self.port_listener(
-            endpoint_port
-        ):
+        endpoint_is_loopback = _is_loopback_hostname(parsed.hostname)
+        if endpoint_is_loopback and not self.port_listener(endpoint_port):
             raise RuntimeError(
                 f"no model server listening on :{endpoint_port}; start it first, then rerun"
             )
 
-        if config.require_clean and parsed.hostname in {"127.0.0.1", "localhost", "::1"}:
+        if config.require_clean:
+            if not endpoint_is_loopback:
+                raise ConfigError(
+                    "preflight.require_clean cannot verify ports on a remote endpoint; "
+                    "set require_clean: false explicitly"
+                )
             for port in config.forbidden_ports:
                 if port != endpoint_port and self.port_listener(port):
                     raise RuntimeError(
@@ -206,7 +254,11 @@ class BenchmarkSuiteWorkflow:
         self._log("Memory/process snapshot before")
         self.console.print(snapshot if snapshot is not None else self.system_snapshot())
         if not config.sanity_check:
-            return {"enabled": True, "sanity_check": False}
+            return {
+                "enabled": True,
+                "sanity_check": False,
+                "warnings": list(self._validation_warnings),
+            }
 
         self._log("Sanity check: content present")
         sanity = self.sanity_checker(endpoint)
@@ -235,13 +287,31 @@ class BenchmarkSuiteWorkflow:
             "content_preview",
         ):
             self.console.print(f"    {key}={sanity.get(key)}")
-        return {"enabled": True, "sanity_check": True, "sanity": sanity}
+        return {
+            "enabled": True,
+            "sanity_check": True,
+            "sanity": sanity,
+            "warnings": list(self._validation_warnings),
+        }
 
     def run_quality(self, store: ResultStore, *, parent_run_id: str) -> list[CompletedRun]:
         quality = self.config.quality
         if not quality.enabled:
             return []
         endpoint = self._effective_endpoint()
+        target_transport = self.config.target.transport if self.config.target is not None else None
+        trust_env = (
+            quality.trust_env
+            if quality.trust_env is not None
+            else target_transport.trust_env
+            if target_transport is not None
+            else False
+        )
+        ca_bundle = quality.ca_bundle or (
+            target_transport.ca_bundle if target_transport is not None else None
+        )
+        if self._target_route is not None:
+            pinned_route_trust_env(endpoint.base_url, trust_env=trust_env)
         self._log(f"Running lm-eval quality (tasks={quality.tasks}, limit={quality.limit})")
         lm_config = LmEvalConfig(
             target=endpoint.name,
@@ -258,6 +328,9 @@ class BenchmarkSuiteWorkflow:
             package_spec=quality.package_spec,
             extra_packages=quality.extra_packages,
             offline=quality.offline,
+            trust_env=trust_env,
+            ca_bundle=ca_bundle,
+            pinned_route=self._target_route,
             suite_name=self.config.name,
             database=self.config.database,
             log_samples=True,
@@ -297,7 +370,17 @@ class BenchmarkSuiteWorkflow:
         endpoint = self._effective_endpoint()
         target_name = step.targets[0] if step.targets else endpoint.name
         effective_target = replace(endpoint, name=target_name)
-        http_config = replace(http_config, targets=[effective_target])
+        assert self.config.target is not None
+        target_transport = self.config.target.transport
+        http_config = replace(
+            http_config,
+            targets=[effective_target],
+            transport=HttpTransportConfig(
+                trust_env=target_transport.trust_env,
+                ca_bundle=target_transport.ca_bundle,
+                pinned_route=self._target_route,
+            ),
+        )
         targets = (target_name,)
         self._log(f"Running HTTP load (targets={','.join(targets)})")
         outcomes = self.http_load_runner(
@@ -320,6 +403,11 @@ class BenchmarkSuiteWorkflow:
     def _validate_resolved_target(self, target: ResolvedTarget) -> None:
         max_model_len = target.model.max_model_len
         if max_model_len is None:
+            if self.config.quality.enabled or self.config.http_load.enabled:
+                self._warn_validation(
+                    "served model discovery did not report max_model_len; suite context "
+                    "budgets cannot be validated"
+                )
             return
         quality = self.config.quality
         if quality.enabled and quality.max_length > max_model_len:
@@ -339,19 +427,35 @@ class BenchmarkSuiteWorkflow:
         missing_scenarios = wanted_scenarios - {scenario.name for scenario in scenarios}
         if missing_scenarios:
             raise ConfigError(
-                "unknown HTTP load scenario(s): "
-                + ", ".join(sorted(missing_scenarios))
+                "unknown HTTP load scenario(s): " + ", ".join(sorted(missing_scenarios))
             )
         requested_max = max(
-            token_count
-            for scenario in scenarios
-            for token_count in scenario.max_tokens
+            token_count for scenario in scenarios for token_count in scenario.max_tokens
         )
-        if requested_max > max_model_len:
+        if requested_max >= max_model_len:
             raise ConfigError(
-                f"HTTP load max_tokens {requested_max} exceeds served model limit "
-                f"{max_model_len}"
+                f"HTTP load max_tokens {requested_max} leaves no context for the "
+                f"non-empty prompt within served model limit {max_model_len}"
             )
+        for scenario in scenarios:
+            prompt_chars = max(
+                len(scenario.rendered_prompt_for(index, request_nonce="context-check"))
+                for index in range(len(scenario.prompts))
+            )
+            input_chars = prompt_chars + len(scenario.system or "")
+            remaining_tokens = max_model_len - max(scenario.max_tokens)
+            warning = (
+                f"HTTP scenario {scenario.name!r} leaves {remaining_tokens} model tokens "
+                f"for a rendered prompt/system of up to {input_chars} characters; exact "
+                "context fit cannot be verified without the served tokenizer"
+            )
+            self._warn_validation(warning)
+
+    def _warn_validation(self, warning: str) -> None:
+        if warning in self._validation_warnings:
+            return
+        self._validation_warnings.append(warning)
+        self.console.print(f"[yellow]warning:[/yellow] {warning}")
 
     def _print_http_comparison(self, store: ResultStore, suite_name: str) -> None:
         runs = [run for run in store.comparison_runs() if run["suite"] == suite_name]
@@ -392,6 +496,21 @@ def _port_from_url(url: str) -> int:
     return 80
 
 
+def _is_loopback_hostname(hostname: str | None) -> bool:
+    if hostname is None:
+        return False
+    normalized = hostname.casefold().rstrip(".")
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        try:
+            return ipaddress.ip_address(socket.inet_aton(normalized)).is_loopback
+        except OSError:
+            return False
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -402,3 +521,14 @@ def _write_text_observation(path: Path, capture: Callable[[], str]) -> None:
     except Exception as exc:  # noqa: BLE001 - telemetry must not fail a benchmark
         value = f"# capture_error: {type(exc).__name__}: {exc}\n"
     path.write_text(value, encoding="utf-8")
+
+
+def _target_error_summary(exc: Exception, target: TargetSpec) -> str:
+    detail = f"{type(exc).__name__}: {exc}"
+    secrets = list(target.endpoint.headers.values())
+    if target.endpoint.api_key_env:
+        secrets.append(os.environ.get(target.endpoint.api_key_env, ""))
+    for secret in secrets:
+        if secret:
+            detail = detail.replace(secret, "<redacted>")
+    return detail

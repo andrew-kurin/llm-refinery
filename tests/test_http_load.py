@@ -1,5 +1,7 @@
 import json
+import socketserver
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
@@ -140,6 +142,10 @@ def test_http_client_applies_transport_proxy_and_ca_settings(tmp_path, monkeypat
         "create_default_context",
         lambda *, cafile: ssl_context if cafile == str(ca_bundle) else None,
     )
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        lambda host, port, **kwargs: [(2, 1, 6, "", ("192.168.1.41", port))],
+    )
 
     class FakeClient:
         def __init__(self, **kwargs):
@@ -165,7 +171,13 @@ def test_http_client_resolves_remote_origin_once_before_measured_requests(monkey
                 }
             ],
             "scenarios": [
-                {"name": "chat", "prompt": "hello", "stream": False, "requests": 2}
+                {
+                    "name": "chat",
+                    "prompt": "hello",
+                    "stream": False,
+                    "requests": 2,
+                    "concurrency": 2,
+                }
             ],
         }
     )
@@ -180,6 +192,9 @@ def test_http_client_resolves_remote_origin_once_before_measured_requests(monkey
     monkeypatch.setattr("llm_refinery.core.http_safety.socket.getaddrinfo", resolve)
 
     def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "192.168.1.41"
+        assert request.headers["host"] == "aitopatom-41de.local:8000"
+        assert request.extensions["sni_hostname"] == "aitopatom-41de.local"
         return httpx.Response(
             200,
             json={
@@ -190,7 +205,8 @@ def test_http_client_resolves_remote_origin_once_before_measured_requests(monkey
         )
 
     with pooled_http_client(trial) as client:
-        client._transport = httpx.MockTransport(handler)  # type: ignore[attr-defined]
+        for pooled_client in client._clients:  # type: ignore[attr-defined]
+            pooled_client._transport = httpx.MockTransport(handler)  # type: ignore[attr-defined]
         assert all(result.ok for result in run_requests(trial, count=2, client=client))
 
     assert resolutions == 1
@@ -480,8 +496,8 @@ def test_run_requests_shares_and_closes_one_connection_pool(monkeypatch):
     results = run_requests(trial, count=4)
 
     assert [result.index for result in results] == [0, 1, 2, 3]
-    assert all(client is clients[0] for client in clients)
-    assert clients[0].is_closed
+    assert 1 <= len({id(client) for client in clients}) <= trial.concurrency
+    assert all(client.is_closed for client in clients)
 
 
 def test_connection_pool_reuses_http11_connections_across_batches():
@@ -499,9 +515,7 @@ def test_connection_pool_reuses_http11_connections_across_batches():
             self.rfile.read(content_length)
             body = json.dumps(
                 {
-                    "choices": [
-                        {"message": {"content": "ok"}, "finish_reason": "stop"}
-                    ],
+                    "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
                     "usage": {
                         "prompt_tokens": 1,
                         "completion_tokens": 1,
@@ -557,6 +571,31 @@ def test_connection_pool_reuses_http11_connections_across_batches():
     assert 1 <= len(connections) <= trial.concurrency
 
 
+def test_http_client_pool_keeps_deadline_cancellation_request_local():
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8000/v1",
+                    "model": "local",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello", "requests": 2, "concurrency": 2}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+
+    with pooled_http_client(trial) as pool:
+        with pool.lease() as first, pool.lease() as second:
+            assert first is not second
+            first.close()
+            assert second.is_closed is False
+
+        assert len([client for client in pool._clients if not client.is_closed]) == 2
+
+
 def test_http_load_rejects_dns_name_resolving_to_client_loopback(monkeypatch):
     config = HttpLoadConfig.from_mapping(
         {
@@ -592,9 +631,7 @@ def test_http_load_rejects_cross_origin_redirect_before_following(monkeypatch):
                     "model": "served-model",
                 }
             ],
-            "scenarios": [
-                {"name": "chat", "prompt": "hello", "stream": False, "requests": 1}
-            ],
+            "scenarios": [{"name": "chat", "prompt": "hello", "stream": False, "requests": 1}],
         }
     )
     trial = expand_http_load_trials(config)[0]
@@ -621,6 +658,287 @@ def test_http_load_rejects_cross_origin_redirect_before_following(monkeypatch):
     assert len(requests) == 1
 
 
+def test_http_load_redacts_credentials_echoed_by_error_response(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "authenticated",
+                    "protocol": "openai_chat",
+                    "base_url": "http://remote.test:8000/v1",
+                    "model": "served-model",
+                    "headers": {"Authorization": "Bearer top-secret-token"},
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello", "stream": False, "requests": 1}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        lambda host, port, **kwargs: [(2, 1, 6, "", ("192.168.1.41", port))],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            text="gateway echoed Bearer top-secret-token",
+            request=request,
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = http_transport.execute_http_request(trial, 0, client=client)
+
+    assert result.ok is False
+    assert "top-secret-token" not in (result.error or "")
+    assert "[REDACTED]" in (result.error or "")
+
+
+def test_http_load_bounds_nonstream_response_bodies(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "remote",
+                    "protocol": "openai_chat",
+                    "base_url": "http://remote.test:8000/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello", "stream": False, "requests": 1}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    monkeypatch.setattr(http_transport, "_MAX_SUCCESS_RESPONSE_BYTES", 10)
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        lambda host, port, **kwargs: [(2, 1, 6, "", ("192.168.1.41", port))],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"x" * 11, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = run_requests(trial, count=1, client=client)[0]
+
+    assert result.ok is False
+    assert "response exceeded 10 bytes" in (result.error or "")
+
+
+def test_http_load_bounds_unterminated_stream_without_line_buffering(monkeypatch):
+    response = httpx.Response(
+        200,
+        content=b"x" * 11,
+        request=httpx.Request("POST", "http://remote.test/v1/chat/completions"),
+    )
+
+    with pytest.raises(ValueError, match="response exceeded 10 bytes"):
+        list(
+            http_transport._iter_bounded_lines(
+                response,
+                deadline=time.perf_counter() + 1,
+                max_bytes=10,
+            )
+        )
+
+
+def test_http_load_worker_fallback_redacts_server_echoed_token(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "authenticated",
+                    "protocol": "ollama_chat",
+                    "base_url": "http://remote.test:8000",
+                    "model": "served-model",
+                    "api_key_env": "HTTP_LOAD_SECRET",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello", "requests": 1}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    monkeypatch.setenv("HTTP_LOAD_SECRET", "top-secret-token")
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        lambda host, port, **kwargs: [(2, 1, 6, "", ("192.168.1.41", port))],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b'{"error":"top-secret-token"}\n',
+            request=request,
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = run_requests(trial, count=1, client=client)[0]
+
+    assert result.ok is False
+    assert "top-secret-token" not in (result.error or "")
+    assert "[REDACTED]" in (result.error or "")
+
+
+def test_http_load_missing_api_key_fails_before_workers_or_network(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "authenticated",
+                    "protocol": "openai_chat",
+                    "base_url": "http://remote.test:8000/v1",
+                    "model": "served-model",
+                    "api_key_env": "MISSING_HTTP_LOAD_KEY",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello", "requests": 4}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    monkeypatch.delenv("MISSING_HTTP_LOAD_KEY", raising=False)
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(200, json={}, request=request)
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as client,
+        pytest.raises(ConfigError, match="MISSING_HTTP_LOAD_KEY"),
+    ):
+        run_requests(trial, count=4, client=client)
+
+    assert request_count == 0
+
+
+def test_http_load_absolute_deadline_interrupts_blocking_stream(monkeypatch):
+    class BlockingStream(httpx.SyncByteStream):
+        def __init__(self) -> None:
+            self.closed = threading.Event()
+
+        def __iter__(self):
+            yield b'data: {"choices": []}\n\n'
+            self.closed.wait(timeout=2)
+
+        def close(self) -> None:
+            self.closed.set()
+
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "remote",
+                    "protocol": "openai_chat",
+                    "base_url": "http://remote.test:8000/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [
+                {
+                    "name": "chat",
+                    "prompt": "hello",
+                    "stream": True,
+                    "requests": 1,
+                    "timeout_s": 0.05,
+                }
+            ],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        lambda host, port, **kwargs: [(2, 1, 6, "", ("192.168.1.41", port))],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=BlockingStream(), request=request)
+
+    started = time.perf_counter()
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = http_transport.execute_http_request(trial, 0, client=client)
+
+    assert time.perf_counter() - started < 1
+    assert result.ok is False
+    assert "total timeout" in (result.error or "")
+
+
+def test_http_load_absolute_deadline_interrupts_trickled_response_headers():
+    class TrickleHandler(socketserver.BaseRequestHandler):
+        def handle(self):
+            self.request.recv(65536)
+            self.request.sendall(b"HTTP/1.1 200 OK\r\nX-Trickle: ")
+            for _ in range(100):
+                time.sleep(0.02)
+                try:
+                    self.request.sendall(b"x")
+                except OSError:
+                    return
+
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), TrickleHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": f"http://127.0.0.1:{server.server_address[1]}/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [
+                {
+                    "name": "chat",
+                    "prompt": "hello",
+                    "stream": False,
+                    "requests": 1,
+                    "timeout_s": 0.08,
+                }
+            ],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    started = time.perf_counter()
+    try:
+        with httpx.Client() as client:
+            result = http_transport.execute_http_request(trial, 0, client=client)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert time.perf_counter() - started < 1
+    assert result.ok is False
+    assert "total timeout" in (result.error or "")
+
+
+def test_http_load_stream_iteration_enforces_total_deadline(monkeypatch):
+    response = httpx.Response(
+        200,
+        content=b'data: {"choices": []}\n\ndata: [DONE]\n\n',
+        request=httpx.Request("POST", "http://remote.test/v1/chat/completions"),
+    )
+    observed_times = iter((1.0, 1.0, 3.0))
+    monkeypatch.setattr(
+        http_transport.time,
+        "perf_counter",
+        lambda: next(observed_times),
+    )
+
+    lines = http_transport._iter_bounded_lines(
+        response,
+        deadline=2.0,
+        max_bytes=1_000,
+    )
+
+    assert next(lines).startswith("data:")
+    with pytest.raises(TimeoutError, match="total timeout"):
+        next(lines)
+
+
 def test_http_load_follows_same_origin_method_preserving_redirect(monkeypatch):
     config = HttpLoadConfig.from_mapping(
         {
@@ -632,9 +950,7 @@ def test_http_load_follows_same_origin_method_preserving_redirect(monkeypatch):
                     "model": "served-model",
                 }
             ],
-            "scenarios": [
-                {"name": "chat", "prompt": "hello", "stream": False, "requests": 1}
-            ],
+            "scenarios": [{"name": "chat", "prompt": "hello", "stream": False, "requests": 1}],
         }
     )
     trial = expand_http_load_trials(config)[0]
@@ -673,6 +989,9 @@ def test_http_load_follows_same_origin_method_preserving_redirect(monkeypatch):
         "/v1/chat/completions",
         "/v1/redirected-chat",
     ]
+    assert all(request.url.host == "192.168.1.41" for request in requests)
+    assert all(request.headers["host"] == "aitopatom-41de.local:8000" for request in requests)
+    assert all(request.extensions["sni_hostname"] == "aitopatom-41de.local" for request in requests)
     assert resolutions == 1
 
 

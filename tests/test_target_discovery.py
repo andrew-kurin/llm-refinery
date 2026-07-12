@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import socket
+import socketserver
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,11 +26,14 @@ from llm_refinery.core.targets import (
     ServiceDiscovery,
     TargetInspection,
     TargetSpec,
+    TargetTransport,
     load_target_spec,
 )
 from llm_refinery.probes import linux_dgx_probe
 from llm_refinery.providers import openai_discovery as openai_discovery_module
 from llm_refinery.providers.openai_discovery import OpenAIDiscoveryClient
+
+_REAL_GETADDRINFO = socket.getaddrinfo
 
 
 @pytest.fixture(autouse=True)
@@ -123,14 +130,18 @@ class _FakeService:
     ) -> None:
         self.service = service
         self.error = error
-        self.calls: list[tuple[EndpointSpec, DiscoveryPolicy]] = []
+        self.calls: list[tuple[EndpointSpec, DiscoveryPolicy, TargetTransport]] = []
 
     def discover(
         self,
         endpoint: EndpointSpec,
         policy: DiscoveryPolicy,
+        transport: TargetTransport,
+        *,
+        route: Any = None,
     ) -> ServiceDiscovery:
-        self.calls.append((endpoint, policy))
+        del route
+        self.calls.append((endpoint, policy, transport))
         if self.error:
             raise RuntimeError(self.error)
         assert self.service is not None
@@ -177,6 +188,62 @@ target:
     assert spec.endpoint.model is None
     assert spec.model.model_id is None
     assert spec.safe_json()["endpoint"]["header_names"] == []
+    assert spec.transport == TargetTransport()
+
+
+def test_target_transport_resolves_ca_bundle_relative_to_target_file(tmp_path: Path):
+    cert_dir = tmp_path / "certs"
+    cert_dir.mkdir()
+    ca_bundle = cert_dir / "spark.pem"
+    ca_bundle.write_text("test CA fixture", encoding="utf-8")
+    config = tmp_path / "target.yaml"
+    config.write_text(
+        """
+schema_version: 1
+target:
+  name: dgx-spark
+  host:
+    access: ssh
+    destination: dgx
+  endpoint:
+    protocol: openai_chat
+    base_url: https://spark.local:8000/v1
+  model:
+    selection: single
+  transport:
+    trust_env: false
+    ca_bundle: certs/spark.pem
+""",
+        encoding="utf-8",
+    )
+
+    _, spec = load_target_spec(config)
+
+    assert spec.transport == TargetTransport(
+        trust_env=False,
+        ca_bundle=ca_bundle.resolve(),
+    )
+    assert spec.safe_json()["transport"] == {
+        "trust_env": False,
+        "ca_bundle": str(ca_bundle.resolve()),
+    }
+
+
+@pytest.mark.parametrize("value", [None, "", False, 123])
+def test_target_transport_rejects_invalid_ca_bundle(value: Any, tmp_path: Path):
+    raw = _target_mapping()
+    raw["transport"] = {"ca_bundle": value}
+
+    with pytest.raises(ConfigError, match="ca_bundle must be a non-empty path string"):
+        TargetSpec.from_mapping(raw, base_dir=tmp_path)
+
+
+def test_target_transport_rejects_missing_ca_bundle(tmp_path: Path):
+    raw = _target_mapping()
+    raw["transport"] = {"ca_bundle": "missing.pem"}
+
+    with pytest.raises(ConfigError, match="ca_bundle is not a file"):
+        TargetSpec.from_mapping(raw, base_dir=tmp_path)
 
 
 @pytest.mark.parametrize("destination", ["-oProxyCommand=bad", "dgx host", "dgx\nother"])
@@ -267,7 +334,7 @@ def test_target_spec_rejects_url_credentials_queries_and_fragments(base_url: str
         TargetSpec.from_mapping(raw)
 
 
-@pytest.mark.parametrize("section", ["host", "endpoint", "model", "discovery"])
+@pytest.mark.parametrize("section", ["host", "endpoint", "model", "discovery", "transport"])
 @pytest.mark.parametrize("value", [False, [], "not-a-mapping"])
 def test_target_spec_rejects_falsey_or_malformed_sections(section: str, value: Any):
     raw = _target_mapping()
@@ -283,10 +350,12 @@ def test_target_spec_rejects_falsey_or_malformed_sections(section: str, value: A
         ("host", "required"),
         ("discovery", "service_required"),
         ("discovery", "metrics"),
+        ("transport", "trust_env"),
     ],
 )
 def test_target_spec_rejects_quoted_booleans(section: str, key: str):
     raw = _target_mapping()
+    raw.setdefault(section, {})
     raw[section][key] = "false"
 
     with pytest.raises(ConfigError, match=rf"target\.{section}\.{key} must be a boolean"):
@@ -703,6 +772,80 @@ def test_openai_discovery_uses_api_auth_and_sanitizes_server_info(
     assert metrics == "vllm:num_requests_running 0\n"
 
 
+def test_openai_discovery_applies_target_transport_to_owned_clients(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    ca_bundle = tmp_path / "private-ca.pem"
+    ca_bundle.write_text("fixture", encoding="utf-8")
+    ssl_context = object()
+    captured: dict[str, Any] = {}
+
+    def create_context(*, cafile: str) -> object:
+        captured["cafile"] = cafile
+        return ssl_context
+
+    monkeypatch.setattr(
+        openai_discovery_module.ssl,
+        "create_default_context",
+        create_context,
+    )
+
+    class FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["client_kwargs"] = kwargs
+
+    monkeypatch.setattr(openai_discovery_module.httpx, "Client", FakeClient)
+
+    client = OpenAIDiscoveryClient()._new_client(
+        TargetTransport(trust_env=False, ca_bundle=ca_bundle)
+    )
+
+    assert isinstance(client, FakeClient)
+    assert captured["cafile"] == str(ca_bundle)
+    assert captured["client_kwargs"] == {
+        "timeout": 5.0,
+        "follow_redirects": False,
+        "trust_env": False,
+        "verify": ssl_context,
+    }
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        {"id": True},
+        {"id": 123},
+        {"id": 1.5},
+        {"id": ""},
+        {"id": "served", "max_model_len": True},
+        {"id": "served", "max_model_len": 32768.5},
+        {"id": "served", "max_model_len": 0},
+        {"id": "served", "max_model_len": -1},
+        {"id": "served", "root": 123},
+        {"id": "served", "root": ""},
+        {"id": "served", "owned_by": False},
+        {"id": "served", "owned_by": ""},
+    ],
+)
+def test_openai_discovery_rejects_malformed_model_metadata(model: dict[str, Any]):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, request=request)
+        if request.url.path == "/version":
+            return httpx.Response(200, json={"version": "v"}, request=request)
+        return httpx.Response(200, json={"data": [model]}, request=request)
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as client,
+        pytest.raises(ConfigError, match="model discovery returned an invalid response"),
+    ):
+        OpenAIDiscoveryClient(client=client).discover(
+            _spec().endpoint,
+            DiscoveryPolicy(server_info="off"),
+        )
+
+
 def test_openai_discovery_bounds_streams_before_buffering(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(openai_discovery_module, "MAX_RESPONSE_BYTES", 32)
     model_chunks_read = 0
@@ -806,6 +949,44 @@ def test_openai_discovery_applies_total_stream_deadline(monkeypatch: pytest.Monk
         pytest.raises(RuntimeError, match="exceeded the total timeout"),
     ):
         OpenAIDiscoveryClient(client=client, timeout_s=5.0).metrics(_spec().endpoint)
+
+
+def test_openai_discovery_interrupts_trickled_response_headers(monkeypatch):
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        _REAL_GETADDRINFO,
+    )
+
+    class TrickleHandler(socketserver.BaseRequestHandler):
+        def handle(self):
+            self.request.recv(65536)
+            self.request.sendall(b"HTTP/1.1 200 OK\r\nX-Trickle: ")
+            for _ in range(100):
+                time.sleep(0.02)
+                try:
+                    self.request.sendall(b"x")
+                except OSError:
+                    return
+
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), TrickleHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    endpoint = EndpointSpec(
+        name="local",
+        protocol="openai_chat",
+        base_url=f"http://127.0.0.1:{server.server_address[1]}/v1",
+    )
+    started = time.perf_counter()
+    try:
+        with pytest.raises(RuntimeError, match="exceeded the total timeout"):
+            OpenAIDiscoveryClient(timeout_s=0.08).metrics(endpoint)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert time.perf_counter() - started < 1
 
 
 def test_openai_discovery_requires_configured_api_key(monkeypatch: pytest.MonkeyPatch):
@@ -943,9 +1124,7 @@ def test_discovery_rejects_cross_origin_redirect_before_following_it(
 ):
     monkeypatch.setattr(
         "llm_refinery.core.http_safety.socket.getaddrinfo",
-        lambda host, port, **kwargs: [
-            (2, 1, 6, "", ("192.168.1.41", port))
-        ],
+        lambda host, port, **kwargs: [(2, 1, 6, "", ("192.168.1.41", port))],
     )
     requests: list[httpx.Request] = []
 
@@ -986,6 +1165,39 @@ def test_discovery_rejects_dns_name_that_resolves_to_client_loopback(
             resolver.inspect(_spec(), allow_service_unavailable=True)
 
 
+def test_discovery_requires_ssh_endpoint_hostname_to_resolve(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fail_resolution(host: str, port: int, **kwargs: Any) -> Any:
+        raise OSError("temporary DNS failure")
+
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        fail_resolution,
+    )
+    resolver = TargetResolver(
+        ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+        service_client=_FakeService(error="connection refused"),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ConfigError, match="could not be resolved for safety validation"):
+        resolver.inspect(_spec(), allow_service_unavailable=True)
+
+
+def test_discovery_rejects_endpoint_address_assigned_to_benchmark_client(monkeypatch):
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety._is_client_interface_address",
+        lambda address, route_address, port: True,
+    )
+    resolver = TargetResolver(
+        ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+        service_client=_FakeService(_service("served-model")),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ConfigError, match="assigned to the benchmark client"):
+        resolver.inspect(_spec())
+
+
 def test_discovery_allows_dgx_local_name_that_resolves_to_lan_address(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -995,6 +1207,9 @@ def test_discovery_allows_dgx_local_name_that_resolves_to_lan_address(
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "192.168.1.41"
+        assert request.headers["host"] == "spark.local:8000"
+        assert request.extensions["sni_hostname"] == "spark.local"
         if request.url.path == "/health":
             return httpx.Response(200, request=request)
         if request.url.path == "/version":
@@ -1017,6 +1232,7 @@ def test_discovery_allows_dgx_local_name_that_resolves_to_lan_address(
     assert inspection.service is not None
     assert inspection.service.health == "ok"
     assert [model.id for model in inspection.service.models] == ["served-model"]
+    assert inspection.safe_json()["route"]["selected_address"] == "192.168.1.41"
 
 
 def test_openai_discovery_preserves_explicit_auth_and_short_circuits_offline_host(
@@ -1048,6 +1264,47 @@ def test_openai_discovery_preserves_explicit_auth_and_short_circuits_offline_hos
     assert discovery.health == "unavailable"
     assert discovery.models == ()
     assert discovery.errors == ("health: connection refused",)
+
+
+def test_offline_tolerance_accepts_connection_reset_read_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadError("connection reset", request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        resolver = TargetResolver(
+            ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+            service_client=OpenAIDiscoveryClient(client=client),
+        )
+        inspection = resolver.inspect(_spec(), allow_service_unavailable=True)
+
+    assert inspection.available is False
+    assert inspection.errors == ("health: connection reset",)
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        (httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"), "TLS"),
+        (httpx.ProxyError("proxy unavailable"), "proxy connection"),
+        (httpx.RemoteProtocolError("invalid response framing"), "HTTP protocol"),
+        (httpx.UnsupportedProtocol("unsupported scheme"), "unsupported HTTP protocol"),
+    ],
+)
+def test_offline_tolerance_does_not_suppress_fatal_transport_errors(
+    error: httpx.TransportError,
+    message: str,
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        error.request = request
+        raise error
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        resolver = TargetResolver(
+            ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+            service_client=OpenAIDiscoveryClient(client=client),
+        )
+        with pytest.raises(ConfigError, match=message):
+            resolver.inspect(_spec(), allow_service_unavailable=True)
 
 
 def test_resolver_can_return_inventory_when_service_is_unavailable():

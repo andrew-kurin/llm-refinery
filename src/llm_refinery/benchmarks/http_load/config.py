@@ -11,6 +11,7 @@ from llm_refinery.core.config import (
     reject_unknown_keys,
 )
 from llm_refinery.core.endpoints import CHAT_PROTOCOLS, Endpoint
+from llm_refinery.core.http_safety import PinnedHttpRoute
 from llm_refinery.core.runs import stable_hash
 
 CACHE_MODES = {"shared", "unique"}
@@ -163,6 +164,7 @@ class HttpTransportConfig:
 
     trust_env: bool = True
     ca_bundle: Path | None = None
+    pinned_route: PinnedHttpRoute | None = None
 
     @classmethod
     def from_mapping(
@@ -184,16 +186,17 @@ class HttpTransportConfig:
         if ca_bundle is not None and not ca_bundle.is_absolute():
             ca_bundle = base_dir / ca_bundle
         if ca_bundle is not None and not ca_bundle.is_file():
-            raise ConfigError(
-                f"HTTP-load transport.ca_bundle is not a file: {ca_bundle}"
-            )
+            raise ConfigError(f"HTTP-load transport.ca_bundle is not a file: {ca_bundle}")
         return cls(trust_env=trust_env, ca_bundle=ca_bundle)
 
     def safe_json(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "trust_env": self.trust_env,
             "ca_bundle": str(self.ca_bundle) if self.ca_bundle else None,
         }
+        if self.pinned_route is not None:
+            result["pinned_route"] = self.pinned_route.safe_json()
+        return result
 
 
 @dataclass(frozen=True)

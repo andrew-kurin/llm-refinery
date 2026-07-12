@@ -3,7 +3,13 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from llm_refinery.adapters.ssh import OpenSSHClient
-from llm_refinery.core.http_safety import validate_request_url
+from llm_refinery.core.config import ConfigError
+from llm_refinery.core.http_safety import (
+    HttpOrigin,
+    PinnedHttpRoute,
+    http_origin,
+    resolve_request_route,
+)
 from llm_refinery.core.targets import (
     HOST_ACCESS_LOCAL,
     HOST_ACCESS_SSH,
@@ -32,6 +38,7 @@ class TargetResolver:
         self._ssh_client = ssh_client or OpenSSHClient()
         self._service_client = service_client or OpenAIDiscoveryClient()
         self._local_system_profile = local_system_profile
+        self._service_routes: dict[HttpOrigin, PinnedHttpRoute | None] = {}
 
     def inspect(
         self,
@@ -51,11 +58,28 @@ class TargetResolver:
                 fatal_errors.append(error)
 
         service = None
+        route: PinnedHttpRoute | None = None
         try:
-            if spec.host.access == HOST_ACCESS_SSH:
-                validate_request_url(spec.endpoint.base_url)
-            service = self._service_client.discover(spec.endpoint, spec.discovery)
+            route = self._service_route(spec)
+            service = self._service_client.discover(
+                spec.endpoint,
+                spec.discovery,
+                spec.transport,
+                route=route,
+            )
             errors.extend(service.errors)
+        except ConfigError as exc:
+            error = f"service: {exc}"
+            partial = TargetInspection(
+                spec=spec,
+                host=host,
+                service=None,
+                resolved=None,
+                route=route,
+                errors=tuple(dict.fromkeys([*errors, error])),
+            )
+            exc.target_inspection = partial  # type: ignore[attr-defined]
+            raise
         except RuntimeError as exc:
             errors.append(f"service: {exc}")
 
@@ -108,6 +132,7 @@ class TargetResolver:
                 service=service,
                 model=selected,
                 selection=selection,
+                route=route,
                 expected_host_fingerprint=spec.host.expected_fingerprint,
             )
 
@@ -116,6 +141,7 @@ class TargetResolver:
             host=host,
             service=service,
             resolved=resolved,
+            route=route,
             errors=tuple(dict.fromkeys(errors)),
         )
         service_unavailability_allowed = (
@@ -129,7 +155,9 @@ class TargetResolver:
         )
         if resolved is None and not unresolved_is_tolerated:
             detail = "; ".join(inspection.errors) or "target is unavailable"
-            raise RuntimeError(f"could not resolve target {spec.name!r}: {detail}")
+            resolution_error = RuntimeError(f"could not resolve target {spec.name!r}: {detail}")
+            resolution_error.target_inspection = inspection  # type: ignore[attr-defined]
+            raise resolution_error
         return inspection
 
     def snapshot_host(self, spec: TargetSpec) -> HostDiscovery:
@@ -155,7 +183,23 @@ class TargetResolver:
         return host
 
     def metrics(self, spec: TargetSpec) -> str:
-        return self._service_client.metrics(spec.endpoint)
+        return self._service_client.metrics(
+            spec.endpoint,
+            spec.transport,
+            route=self._service_route(spec),
+        )
+
+    def _service_route(self, spec: TargetSpec) -> PinnedHttpRoute | None:
+        if spec.host.access != HOST_ACCESS_SSH:
+            return None
+        origin = http_origin(spec.endpoint.base_url)
+        if origin not in self._service_routes:
+            self._service_routes[origin] = resolve_request_route(
+                spec.endpoint.base_url,
+                require_resolution=True,
+                reject_client_local=True,
+            )
+        return self._service_routes[origin]
 
     def resolve(self, spec: TargetSpec) -> ResolvedTarget:
         inspection = self.inspect(spec)

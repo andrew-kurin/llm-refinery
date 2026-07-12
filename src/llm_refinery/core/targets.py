@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 from llm_refinery.core.config import ConfigError, load_yaml_mapping, reject_unknown_keys
 from llm_refinery.core.endpoints import CHAT_PROTOCOLS, OPENAI_CHAT, Endpoint
+from llm_refinery.core.http_safety import PinnedHttpRoute
 from llm_refinery.core.runs import stable_hash
 
 HOST_ACCESS_LOCAL = "local"
@@ -417,6 +418,46 @@ class DiscoveryPolicy:
 
 
 @dataclass(frozen=True)
+class TargetTransport:
+    """HTTP environment and TLS settings for target discovery requests."""
+
+    trust_env: bool = True
+    ca_bundle: Path | None = None
+
+    @classmethod
+    def from_mapping(
+        cls,
+        raw: dict[str, Any],
+        *,
+        base_dir: Path,
+        context: str = "target.transport",
+    ) -> TargetTransport:
+        reject_unknown_keys(raw, {"trust_env", "ca_bundle"}, context=context)
+        trust_env = _strict_bool(
+            raw.get("trust_env", True),
+            context=f"{context}.trust_env",
+        )
+        ca_bundle: Path | None = None
+        if "ca_bundle" in raw:
+            value = raw["ca_bundle"]
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError(f"{context}.ca_bundle must be a non-empty path string")
+            ca_bundle = Path(value).expanduser()
+            if not ca_bundle.is_absolute():
+                ca_bundle = base_dir / ca_bundle
+            ca_bundle = ca_bundle.resolve()
+            if not ca_bundle.is_file():
+                raise ConfigError(f"{context}.ca_bundle is not a file: {ca_bundle}")
+        return cls(trust_env=trust_env, ca_bundle=ca_bundle)
+
+    def safe_json(self) -> dict[str, Any]:
+        return {
+            "trust_env": self.trust_env,
+            "ca_bundle": str(self.ca_bundle) if self.ca_bundle else None,
+        }
+
+
+@dataclass(frozen=True)
 class ModelDescriptor:
     id: str
     root: str | None = None
@@ -424,8 +465,26 @@ class ModelDescriptor:
     owned_by: str | None = None
 
     def __post_init__(self) -> None:
-        if not self.id.strip():
-            raise ConfigError("discovered model id cannot be empty")
+        if not isinstance(self.id, str) or not self.id.strip():
+            raise ConfigError("discovered model id must be a non-empty string")
+        model_id = self.id.strip()
+        root = _optional_metadata_string(self.root, field_name="root", model_id=model_id)
+        owned_by = _optional_metadata_string(
+            self.owned_by,
+            field_name="owned_by",
+            model_id=model_id,
+        )
+        if self.max_model_len is not None and (
+            isinstance(self.max_model_len, bool)
+            or not isinstance(self.max_model_len, int)
+            or self.max_model_len <= 0
+        ):
+            raise ConfigError(
+                f"discovered model {model_id!r} max_model_len must be a positive integer"
+            )
+        object.__setattr__(self, "id", model_id)
+        object.__setattr__(self, "root", root)
+        object.__setattr__(self, "owned_by", owned_by)
 
     def safe_json(self) -> dict[str, Any]:
         return {
@@ -482,6 +541,7 @@ class TargetSpec:
     endpoint: EndpointSpec
     model: ModelSelection
     discovery: DiscoveryPolicy = field(default_factory=DiscoveryPolicy)
+    transport: TargetTransport = field(default_factory=TargetTransport)
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -496,10 +556,16 @@ class TargetSpec:
             )
 
     @classmethod
-    def from_mapping(cls, raw: dict[str, Any], *, context: str = "target") -> TargetSpec:
+    def from_mapping(
+        cls,
+        raw: dict[str, Any],
+        *,
+        context: str = "target",
+        base_dir: Path | None = None,
+    ) -> TargetSpec:
         reject_unknown_keys(
             raw,
-            {"name", "host", "endpoint", "model", "discovery"},
+            {"name", "host", "endpoint", "model", "discovery", "transport"},
             context=context,
         )
         name_value = raw.get("name")
@@ -510,6 +576,7 @@ class TargetSpec:
         endpoint_raw = _mapping_section(raw, "endpoint", context=context)
         model_raw = _mapping_section(raw, "model", context=context)
         discovery_raw = _mapping_section(raw, "discovery", context=context)
+        transport_raw = _mapping_section(raw, "transport", context=context)
         endpoint = EndpointSpec.from_mapping(
             endpoint_raw,
             default_name=name,
@@ -529,6 +596,11 @@ class TargetSpec:
                 discovery_raw,
                 context=f"{context}.discovery",
             ),
+            transport=TargetTransport.from_mapping(
+                transport_raw,
+                base_dir=base_dir or Path.cwd(),
+                context=f"{context}.transport",
+            ),
         )
 
     def safe_json(self) -> dict[str, Any]:
@@ -538,6 +610,7 @@ class TargetSpec:
             "endpoint": self.endpoint.safe_json(),
             "model": self.model.safe_json(),
             "discovery": self.discovery.safe_json(),
+            "transport": self.transport.safe_json(),
         }
 
 
@@ -549,6 +622,7 @@ class ResolvedTarget:
     service: ServiceDiscovery
     model: ModelDescriptor
     selection: str
+    route: PinnedHttpRoute | None = None
     expected_host_fingerprint: str | None = None
 
     @property
@@ -575,6 +649,7 @@ class ResolvedTarget:
             "service": self.service.safe_json(include_models=False),
             "model": model_json,
             "topology": self.topology,
+            "route": self.route.safe_json() if self.route is not None else None,
         }
         binding = _host_identity_binding(
             self.expected_host_fingerprint,
@@ -591,6 +666,7 @@ class TargetInspection:
     host: HostDiscovery | None
     service: ServiceDiscovery | None
     resolved: ResolvedTarget | None
+    route: PinnedHttpRoute | None = None
     errors: tuple[str, ...] = ()
 
     @property
@@ -604,6 +680,7 @@ class TargetInspection:
                 result["service"] = self.service.safe_json(include_models=True)
             result["status"] = "available"
             result["errors"] = list(self.errors)
+            result["route"] = self.route.safe_json() if self.route is not None else None
             return result
         result = {
             "schema_version": 1,
@@ -619,6 +696,7 @@ class TargetInspection:
                 )
             },
             "errors": list(self.errors),
+            "route": self.route.safe_json() if self.route is not None else None,
         }
         binding = _host_identity_binding(
             self.spec.host.expected_fingerprint,
@@ -686,6 +764,19 @@ def _measurement_scope(host_access: str, base_url: str) -> str:
     return "local_client_to_network_endpoint"
 
 
+def _optional_metadata_string(
+    value: Any,
+    *,
+    field_name: str,
+    model_id: str,
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"discovered model {model_id!r} {field_name} must be a non-empty string")
+    return value.strip()
+
+
 def load_target_spec(path: str | Path) -> tuple[Path, TargetSpec]:
     config_path, raw = load_yaml_mapping(path)
     if "target" in raw:
@@ -698,7 +789,10 @@ def load_target_spec(path: str | Path) -> tuple[Path, TargetSpec]:
             raise ConfigError(f"{config_path} target must be a mapping")
     else:
         target_raw = raw
-    return config_path, TargetSpec.from_mapping(target_raw)
+    return config_path, TargetSpec.from_mapping(
+        target_raw,
+        base_dir=config_path.parent,
+    )
 
 
 __all__ = [
@@ -712,5 +806,6 @@ __all__ = [
     "ServiceDiscovery",
     "TargetInspection",
     "TargetSpec",
+    "TargetTransport",
     "load_target_spec",
 ]

@@ -241,11 +241,84 @@ def test_resume_fails_closed_when_executor_capture_fails(
         def fail_capture():
             raise OSError("inventory unavailable")
 
-        monkeypatch.setattr(
-            "llm_refinery.application.run_session.get_system_profile", fail_capture
-        )
+        monkeypatch.setattr("llm_refinery.application.run_session.get_system_profile", fail_capture)
         with pytest.raises(RuntimeError, match="cannot verify resume executor host"):
             RunSession(store, spec, resume_run_id=run.run_id)
+
+
+def test_legacy_resume_requires_explicit_recovery_and_rebinds_executor(tmp_path: Path):
+    database = tmp_path / "runs.duckdb"
+    spec = RunSpec.create(
+        benchmark_kind="dabstep",
+        suite="suite",
+        label="suite/local",
+        command="dabstep",
+        config_json={},
+        database=database,
+    )
+    recovered_profile = {
+        "hostname": "mac",
+        "host_fingerprint": "mac-one",
+        "captured_at": "recovery",
+    }
+
+    with ResultStore(database) as store:
+        with RunSession(
+            store,
+            spec,
+            system_profile={"capture_error": "legacy inventory failure"},
+        ) as run:
+            run.complete(status="failed", error="retry")
+
+        with pytest.raises(RuntimeError, match="stored run has no host identity"):
+            RunSession(store, spec, resume_run_id=run.run_id, system_profile=recovered_profile)
+
+        with RunSession(
+            store,
+            spec,
+            resume_run_id=run.run_id,
+            system_profile=recovered_profile,
+            allow_unverified_executor=True,
+        ) as resumed:
+            assert resumed.system_profile == recovered_profile
+            resumed.complete(status="failed", error="retry again")
+
+        with pytest.raises(RuntimeError, match="resume executor host"):
+            RunSession(
+                store,
+                spec,
+                resume_run_id=run.run_id,
+                system_profile={
+                    "hostname": "other-mac",
+                    "host_fingerprint": "mac-two",
+                },
+                allow_unverified_executor=True,
+            )
+
+
+def test_unverified_resume_cannot_bind_an_unknown_current_executor(tmp_path: Path):
+    database = tmp_path / "runs.duckdb"
+    spec = RunSpec.create(
+        benchmark_kind="dabstep",
+        suite="suite",
+        label="suite/local",
+        command="dabstep",
+        config_json={},
+        database=database,
+    )
+
+    with ResultStore(database) as store:
+        with RunSession(store, spec, system_profile={}) as run:
+            run.complete(status="failed", error="retry")
+
+        with pytest.raises(RuntimeError, match="current system profile also has no"):
+            RunSession(
+                store,
+                spec,
+                resume_run_id=run.run_id,
+                system_profile={},
+                allow_unverified_executor=True,
+            )
 
 
 def test_run_session_rejects_ambiguous_target_inputs(tmp_path: Path):
@@ -297,9 +370,10 @@ def test_run_context_target_identity_excludes_volatile_observations():
         "errors": ["temporary"],
     }
 
-    assert RunContext(target_json=base).target_identity_json() == RunContext(
-        target_json=changed_observation
-    ).target_identity_json()
+    assert (
+        RunContext(target_json=base).target_identity_json()
+        == RunContext(target_json=changed_observation).target_identity_json()
+    )
 
 
 def test_resume_rejects_changed_executor_or_target_provenance(tmp_path: Path):

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from llm_refinery.core.config import ConfigError, reject_unknown_keys
 from llm_refinery.core.runs import stable_hash
@@ -24,13 +25,10 @@ class Endpoint:
     def __post_init__(self) -> None:
         name = self.name.strip()
         protocol = self.protocol.strip().lower()
-        base_url = self.base_url.strip().rstrip("/")
+        base_url = _normalize_base_url(self.base_url, context="endpoint base_url")
         model = self.model.strip()
         if not name or not protocol or not model:
             raise ConfigError("endpoint name, protocol, and model cannot be empty")
-        parsed_url = urlparse(base_url)
-        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
-            raise ConfigError("endpoint base_url must be an HTTP(S) URL")
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "protocol", protocol)
         object.__setattr__(self, "base_url", base_url)
@@ -63,12 +61,13 @@ class Endpoint:
                 f"{sorted(allowed_protocols)}, got {protocol!r}"
             )
 
-        base_url = str(raw.get("base_url") or "").strip().rstrip("/")
+        base_url = str(raw.get("base_url") or "").strip()
         if not base_url:
             raise ConfigError(f"{context} {name!r} requires 'base_url'")
-        parsed_url = urlparse(base_url)
-        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
-            raise ConfigError(f"{context} {name!r} base_url must be an HTTP(S) URL")
+        base_url = _normalize_base_url(
+            base_url,
+            context=f"{context} {name!r} base_url",
+        )
         model = str(raw.get("model") or "").strip()
         if not model:
             raise ConfigError(f"{context} {name!r} requires 'model'")
@@ -87,17 +86,20 @@ class Endpoint:
 
     @property
     def chat_completions_url(self) -> str:
-        if self.base_url.endswith("/chat/completions"):
-            return self.base_url
-        return f"{self.base_url}/chat/completions"
+        return _replace_or_append_path(
+            self.base_url,
+            existing_suffix="/chat/completions",
+            replacement_suffix="/chat/completions",
+        )
 
     @property
     def completions_url(self) -> str:
-        if self.base_url.endswith("/chat/completions"):
-            return self.base_url[: -len("/chat/completions")] + "/completions"
-        if self.base_url.endswith("/completions"):
-            return self.base_url
-        return f"{self.base_url}/completions"
+        return _replace_or_append_path(
+            self.base_url,
+            existing_suffix="/chat/completions",
+            replacement_suffix="/completions",
+            alternate_existing_suffix="/completions",
+        )
 
     def safe_json(self) -> dict[str, Any]:
         return {
@@ -109,3 +111,56 @@ class Endpoint:
             "header_names": sorted(self.headers),
             "headers_hash": stable_hash(self.headers) if self.headers else None,
         }
+
+
+def _normalize_base_url(value: str, *, context: str) -> str:
+    """Validate and normalize a credential-free HTTP endpoint base URL."""
+    base_url = value.strip().rstrip("/")
+    if not base_url or any(character.isspace() or ord(character) < 32 for character in base_url):
+        raise ConfigError(f"{context} must be an HTTP(S) URL without whitespace")
+    if "\\" in base_url:
+        raise ConfigError(f"{context} cannot include backslashes")
+
+    parsed = urlsplit(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ConfigError(f"{context} must be an HTTP(S) URL")
+    try:
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ConfigError(f"{context} must include a valid hostname and port") from exc
+    if hostname is None:
+        raise ConfigError(f"{context} must include a hostname")
+    try:
+        explicit_address = ipaddress.ip_address(hostname)
+    except ValueError:
+        explicit_address = None
+    if explicit_address is not None and explicit_address.is_unspecified:
+        raise ConfigError(f"{context} cannot use a wildcard address")
+    if port == 0 or parsed.netloc.endswith(":"):
+        raise ConfigError(f"{context} must include a valid hostname and port")
+    if parsed.username is not None or parsed.password is not None:
+        raise ConfigError(f"{context} cannot include user information")
+    # Check the delimiters as well as the parsed fields so an empty query or
+    # fragment (for example, ``...?``) cannot silently survive normalization.
+    if parsed.query or parsed.fragment or "?" in base_url or "#" in base_url:
+        raise ConfigError(f"{context} cannot include a query or fragment")
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+
+
+def _replace_or_append_path(
+    base_url: str,
+    *,
+    existing_suffix: str,
+    replacement_suffix: str,
+    alternate_existing_suffix: str | None = None,
+) -> str:
+    """Build an API URL by operating on its path, never its authority."""
+    parsed = urlsplit(base_url)
+    path = parsed.path
+    if path.endswith(existing_suffix):
+        path = path[: -len(existing_suffix)] + replacement_suffix
+    elif alternate_existing_suffix is None or not path.endswith(alternate_existing_suffix):
+        path = f"{path.rstrip('/')}{replacement_suffix}"
+    result = SplitResult(parsed.scheme, parsed.netloc, path, "", "")
+    return urlunsplit(result)

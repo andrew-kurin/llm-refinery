@@ -31,6 +31,7 @@ class RunSession:
         run_context: RunContext | None = None,
         target_json: Mapping[str, Any] | None = None,
         resume_run_id: str | None = None,
+        allow_unverified_executor: bool = False,
     ) -> None:
         if run_context is not None and target_json is not None:
             raise ValueError("pass either run_context or target_json, not both")
@@ -86,12 +87,15 @@ class RunSession:
                         "cannot verify resume executor host because system profile "
                         f"capture failed: {type(exc).__name__}: {exc}"
                     ) from exc
-            self._validate_resume_provenance(
+            recovered_executor = self._validate_resume_provenance(
                 resume_state,
                 system_profile=provided_system_profile,
                 target_json=context_target_json,
+                allow_unverified_executor=allow_unverified_executor,
             )
-            self.system_profile = dict(resume_state["system_json"])
+            self.system_profile = dict(
+                provided_system_profile if recovered_executor else resume_state["system_json"]
+            )
             self.target_json = dict(resume_state["target_json"])
         else:
             if provided_system_profile is not None:
@@ -241,16 +245,33 @@ class RunSession:
         *,
         system_profile: dict[str, Any] | None,
         target_json: dict[str, Any] | None,
-    ) -> None:
-        if system_profile is not None and host_identity(system_profile) != host_identity(
-            state["system_json"]
-        ):
-            raise RuntimeError("resume executor host does not match the stored run")
+        allow_unverified_executor: bool,
+    ) -> bool:
+        recovered_executor = False
+        if system_profile is not None:
+            current_identity = host_identity(system_profile)
+            stored_identity = host_identity(state["system_json"])
+            if stored_identity == "unknown-host":
+                if not allow_unverified_executor:
+                    raise RuntimeError(
+                        "cannot verify resume executor because the stored run has no host "
+                        "identity; rerun with explicit unverified-executor recovery only "
+                        "if you have independently confirmed this is the original host"
+                    )
+                if current_identity == "unknown-host":
+                    raise RuntimeError(
+                        "cannot recover resume executor identity because the current system "
+                        "profile also has no host identity"
+                    )
+                recovered_executor = True
+            elif current_identity != stored_identity:
+                raise RuntimeError("resume executor host does not match the stored run")
         if target_json is not None:
             incoming = RunContext(target_json=target_json).target_identity_json()
             stored = RunContext(target_json=state["target_json"]).target_identity_json()
             if incoming != stored:
                 raise RuntimeError("resume target identity does not match the stored run")
+        return recovered_executor
 
     def _record(
         self,

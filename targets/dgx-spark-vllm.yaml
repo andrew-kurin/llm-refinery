@@ -27,6 +27,14 @@ target:
     # Select automatically only when /v1/models returns exactly one model.
     selection: single
 
+  # Discovery and metrics use the same HTTP environment/TLS policy. Disable
+  # proxy environment variables for a direct LAN connection. IP-pinned remote
+  # target routes reject active environment proxying.
+  transport:
+    trust_env: false
+    # Relative paths are resolved from this target file's directory.
+    # ca_bundle: certs/dgx-spark-ca.pem
+
   discovery:
     service_required: true
     server_info: optional

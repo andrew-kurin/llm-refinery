@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import os
 import shlex
+import ssl
 import subprocess
+import threading
 import time
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
+from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+
+import httpx
 
 from llm_refinery.application.run_context import RunContext
 from llm_refinery.application.run_session import RunSession
@@ -20,6 +27,9 @@ from llm_refinery.benchmarks.lm_eval.parser import (
     summarize_lm_eval_samples,
 )
 from llm_refinery.benchmarks.lm_eval.presets import default_targets
+from llm_refinery.core.config import ConfigError
+from llm_refinery.core.endpoints import Endpoint
+from llm_refinery.core.http_safety import pinned_route_trust_env
 from llm_refinery.core.runs import CompletedRun, RunSpec, stable_hash
 from llm_refinery.storage.duckdb import ResultStore
 from llm_refinery.storage.models import SampleRecord
@@ -27,6 +37,9 @@ from llm_refinery.storage.models import SampleRecord
 
 class LmEvalFailed(RuntimeError):
     pass
+
+
+_MAX_RELAY_BODY_BYTES = 64_000_000
 
 
 def run_lm_eval(
@@ -52,10 +65,13 @@ def run_lm_eval(
 
     outcomes: list[CompletedRun] = []
     store_context = nullcontext(store) if store is not None else ResultStore(config.database)
-    with store_context as active_store:
+    with store_context as active_store, ExitStack() as relay_stack:
         assert active_store is not None
         for target_name in selected:
-            target = targets[target_name]
+            logical_target = targets[target_name]
+            target = relay_stack.enter_context(
+                _lm_eval_target(logical_target, config, dry_run=dry_run)
+            )
             limit_text = str(config.limit) if config.limit is not None else "all"
             output_path = config.output_root / target.name
             cmd = build_lm_eval_command(config, target)
@@ -69,14 +85,18 @@ def run_lm_eval(
                 print(command_text)
                 continue
 
+            recorded_command_text = command_text.replace(
+                target.base_url,
+                logical_target.base_url,
+            )
             spec = _run_spec(
                 config,
                 target_name=target.name,
                 target_model=target.model,
-                target_base_url=target.base_url,
-                target_api_key_env=target.api_key_env,
-                target_headers=target.headers,
-                command_text=command_text,
+                target_base_url=logical_target.base_url,
+                target_api_key_env=logical_target.api_key_env,
+                target_headers=logical_target.headers,
+                command_text=recorded_command_text,
                 database=active_store.database,
                 parent_run_id=parent_run_id,
                 run_context=run_context,
@@ -100,8 +120,14 @@ def run_lm_eval(
                     capture_output=True,
                     text=True,
                 )
-                stdout_path.write_text(completed.stdout or "", encoding="utf-8")
-                stderr_path.write_text(completed.stderr or "", encoding="utf-8")
+                stdout_path.write_text(
+                    _redact_subprocess_output(completed.stdout or "", api_key),
+                    encoding="utf-8",
+                )
+                stderr_path.write_text(
+                    _redact_subprocess_output(completed.stderr or "", api_key),
+                    encoding="utf-8",
+                )
                 source_result = latest_lm_eval_result(
                     output_path,
                     newer_than=result_started_mtime,
@@ -206,6 +232,13 @@ def _run_spec(
         "num_fewshot": config.num_fewshot,
         "gen_kwargs": config.gen_kwargs,
         "offline": config.offline,
+        "transport": {
+            "trust_env": config.trust_env,
+            "ca_bundle": str(config.ca_bundle) if config.ca_bundle else None,
+            "pinned_route": (
+                config.pinned_route.safe_json() if config.pinned_route is not None else None
+            ),
+        },
         "include_path": str(config.include_path) if config.include_path else None,
         "output_root": str(config.output_root),
         "params": {"target": target_name, "model": target_model},
@@ -221,3 +254,125 @@ def _run_spec(
         database=database,
         parent_run_id=parent_run_id,
     )
+
+
+def _redact_subprocess_output(value: str, api_key: str | None) -> str:
+    if not api_key:
+        return value
+    return value.replace(f"Bearer {api_key}", "Bearer [REDACTED]").replace(
+        api_key,
+        "[REDACTED]",
+    )
+
+
+@contextmanager
+def _lm_eval_target(
+    target: Endpoint,
+    config: LmEvalConfig,
+    *,
+    dry_run: bool,
+):
+    route = config.pinned_route
+    if route is None or dry_run:
+        yield target
+        return
+    pinned_route = route
+    pinned_route.request_url(target.base_url)
+
+    client_trust_env = pinned_route_trust_env(
+        target.base_url,
+        trust_env=config.trust_env,
+    )
+    try:
+        verify = httpx.create_ssl_context(
+            verify=str(config.ca_bundle) if config.ca_bundle is not None else True,
+            trust_env=config.trust_env,
+        )
+    except (OSError, ssl.SSLError) as exc:
+        raise ConfigError(f"could not load lm-eval CA bundle: {config.ca_bundle}") from exc
+    client = httpx.Client(
+        follow_redirects=False,
+        trust_env=client_trust_env,
+        verify=verify,
+    )
+    logical = urlsplit(target.base_url)
+    allowed_paths = {
+        urlsplit(target.chat_completions_url).path,
+        urlsplit(target.completions_url).path,
+    }
+
+    class RelayHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            request_path = urlsplit(self.path).path
+            if request_path not in allowed_paths:
+                self.send_error(404)
+                return
+            try:
+                content_length = int(self.headers.get("Content-Length", ""))
+            except ValueError:
+                content_length = -1
+            if content_length < 0 or content_length > _MAX_RELAY_BODY_BYTES:
+                self.send_error(413)
+                return
+            body = self.rfile.read(content_length)
+            forward_url = urlunsplit(
+                (logical.scheme, logical.netloc, request_path, urlsplit(self.path).query, "")
+            )
+            headers = {
+                key: value
+                for key, value in self.headers.items()
+                if key.casefold()
+                not in {
+                    "connection",
+                    "content-length",
+                    "host",
+                    "proxy-authorization",
+                    "transfer-encoding",
+                }
+            }
+            try:
+                with client.stream(
+                    "POST",
+                    pinned_route.request_url(forward_url),
+                    content=body,
+                    headers=pinned_route.request_headers(headers),
+                    extensions={"sni_hostname": pinned_route.sni_hostname},
+                    timeout=300.0,
+                ) as response:
+                    if 300 <= response.status_code < 400:
+                        raise RuntimeError("upstream redirect refused")
+                    response_body = bytearray()
+                    for chunk in response.iter_bytes():
+                        if len(response_body) + len(chunk) > _MAX_RELAY_BODY_BYTES:
+                            raise RuntimeError("upstream response is too large")
+                        response_body.extend(chunk)
+                    self.send_response(response.status_code)
+                    content_type = response.headers.get("content-type")
+                    if content_type:
+                        self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(response_body)))
+                    self.end_headers()
+                    self.wfile.write(response_body)
+            except Exception:  # noqa: BLE001 - return a fixed, credential-free relay error
+                self.send_error(502, "upstream request failed")
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), RelayHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name="llm-refinery-lm-eval-relay",
+        daemon=True,
+    )
+    thread.start()
+    relay_netloc = f"127.0.0.1:{server.server_port}"
+    relay_base_url = urlunsplit(("http", relay_netloc, logical.path, "", ""))
+    try:
+        yield replace(target, base_url=relay_base_url)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        client.close()

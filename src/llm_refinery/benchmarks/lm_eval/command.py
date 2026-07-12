@@ -9,6 +9,22 @@ from llm_refinery.core.endpoints import Endpoint
 from llm_refinery.providers.openai_chat import validate_http_headers
 
 _BEARER_AUTHORIZATION = re.compile(r"Bearer[ \t]+([^\s]+)", re.IGNORECASE)
+_PROXY_ENVIRONMENT_VARIABLES = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+)
+_CA_ENVIRONMENT_VARIABLES = (
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+)
 
 
 def build_lm_eval_command(config: LmEvalConfig, target: Endpoint) -> list[str]:
@@ -43,7 +59,26 @@ def build_lm_eval_command(config: LmEvalConfig, target: Endpoint) -> list[str]:
     ]
     for package in config.extra_packages:
         cmd.extend(["--with", package])
-    cmd.extend(
+    child_command: list[str] = []
+    strip_child_proxy = not config.trust_env or config.pinned_route is not None
+    if strip_child_proxy or config.ca_bundle is not None:
+        child_command.append("env")
+        if strip_child_proxy:
+            for name in _PROXY_ENVIRONMENT_VARIABLES:
+                child_command.extend(["-u", name])
+        if not config.trust_env or config.ca_bundle is not None:
+            for name in _CA_ENVIRONMENT_VARIABLES:
+                child_command.extend(["-u", name])
+        if config.ca_bundle is not None:
+            ca_bundle = str(config.ca_bundle)
+            child_command.extend(
+                [
+                    f"SSL_CERT_FILE={ca_bundle}",
+                    f"REQUESTS_CA_BUNDLE={ca_bundle}",
+                    f"CURL_CA_BUNDLE={ca_bundle}",
+                ]
+            )
+    child_command.extend(
         [
             "lm_eval",
             "--model",
@@ -56,6 +91,7 @@ def build_lm_eval_command(config: LmEvalConfig, target: Endpoint) -> list[str]:
             "1",
         ]
     )
+    cmd.extend(child_command)
 
     if config.limit is not None:
         cmd.extend(["--limit", str(config.limit)])
@@ -85,9 +121,7 @@ def validate_lm_eval_headers(target: Endpoint) -> None:
     authorization = [
         value for key, value in target.headers.items() if key.casefold() == "authorization"
     ]
-    unsupported = sorted(
-        key for key in target.headers if key.casefold() != "authorization"
-    )
+    unsupported = sorted(key for key in target.headers if key.casefold() != "authorization")
     if unsupported:
         raise ConfigError(
             "lm-eval does not safely support custom endpoint headers; unsupported header "
@@ -120,8 +154,7 @@ def lm_eval_api_key(
         token = environ.get(target.api_key_env)
         if not token:
             raise ConfigError(
-                "lm-eval endpoint API key environment variable is not set: "
-                f"{target.api_key_env}"
+                f"lm-eval endpoint API key environment variable is not set: {target.api_key_env}"
             )
         validate_http_headers({"Authorization": f"Bearer {token}"})
         return token

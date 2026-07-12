@@ -71,6 +71,7 @@ def run_dabstep(
     *,
     dry_run: bool = False,
     resume_run_id: str | None = None,
+    allow_unverified_executor: bool = False,
     store: ResultStore | None = None,
     parent_run_id: str | None = None,
     run_context: RunContext | None = None,
@@ -112,6 +113,7 @@ def run_dabstep(
             spec,
             resume_run_id=resume_run_id,
             run_context=run_context,
+            allow_unverified_executor=allow_unverified_executor,
         ) as run:
             answers_path = run.artifact("answers", "answers.jsonl", "application/x-ndjson")
             tasks_path = run.artifact("tasks", "tasks.jsonl", "application/x-ndjson")

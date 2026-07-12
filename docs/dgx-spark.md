@@ -17,6 +17,9 @@ Copy `targets/dgx-spark-vllm.yaml` and set:
   alias should be pinned to one physical machine.
 - `endpoint.base_url` to the client-visible URL, including `/v1`.
 - `model.id` with `selection: explicit` when the server exposes multiple IDs.
+- `transport.trust_env` to `false` for a direct LAN connection. Certificate
+  environment variables remain available when a logical host is covered by
+  `NO_PROXY`, but active HTTP proxying is rejected for IP-pinned DGX routes.
 
 The SSH destination and HTTP hostname intentionally do not have to match. For
 example, SSH can use `dgx` while requests use
@@ -77,6 +80,16 @@ sampled.
 Keep the vLLM port on a trusted network. Some observability endpoints, including
 server configuration and metrics, may not be protected by the OpenAI API key.
 
+Target discovery and metrics share the target's `transport` policy. It defaults
+to `trust_env: true`, matching HTTP-load behavior. Remote DGX hostnames are
+resolved and IP-pinned before requests; an active environment proxy is rejected
+because it cannot preserve both that address binding and logical TLS SNI. For a
+deterministic direct LAN path, set `transport.trust_env: false`. For an HTTPS
+endpoint using a private CA, set `transport.ca_bundle` to a PEM bundle; a relative path is resolved from
+the target YAML file and must name an existing file. TLS, proxy, and HTTP
+protocol failures are configuration/transport errors and are not hidden by
+`--allow-service-unavailable`.
+
 For an authenticated endpoint, set `endpoint.api_key_env` to the name of an
 environment variable containing the Bearer token. Discovery, preflight, load,
 and lm-eval then use the same credential. The lm-eval child receives the token
@@ -84,6 +97,15 @@ only in its environment, never in command arguments. Because the pinned
 lm-eval API adapter cannot safely receive arbitrary headers, quality runs reject
 custom headers and non-Bearer `Authorization` values instead of silently
 dropping them.
+
+For a schema-v2 target suite, quality evaluation inherits the target's
+`transport.trust_env` and `transport.ca_bundle` policy. `quality.trust_env` and
+`quality.ca_bundle` can override that policy; legacy endpoint suites default to
+a direct path. The harness gives lm-eval a temporary loopback URL and relays
+requests to the already-resolved address. The relay preserves logical Host and
+HTTPS SNI, applies the configured CA, and refuses upstream redirects. Package
+and dataset resolution by `uvx` retains the executor's network environment;
+proxy and CA variables are removed or replaced only for the lm-eval child.
 
 The pinned `local-chat-completions` backend does not perform client-side
 tokenization or token-aware truncation. The harness therefore rejects a quality
@@ -103,13 +125,26 @@ uv run llm-refinery suite sweeps/dgx-spark-quality-smoke-suite.yaml
 The suite resolves the target once, validates quality context length and each
 selected HTTP scenario's output-token budget against the discovered model limit,
 then gives the same concrete model and endpoint to quality and HTTP-load child
-runs. HTTP-load scenarios are overlaid with the suite target, so a stale target
-inside the scenario library cannot redirect load measurements.
+runs. Exact prompt, system-message, chat-template, and output context fit cannot
+be proven without the served tokenizer; the suite records a preflight warning
+with the rendered character size and remaining input-token budget. HTTP-load
+scenarios are overlaid with the suite target, so a stale target inside the
+scenario library cannot redirect load measurements. Schema-v2 suites also apply
+the target transport policy to preflight sanity, quality evaluation, and HTTP
+load, keeping direct routing and private-CA trust consistent across every request
+to the serving endpoint.
+
+`preflight.require_clean` checks listening ports only for a loopback endpoint on
+the executor. It cannot prove that a remote DGX has no competing model server,
+so remote suites must set `require_clean: false` explicitly instead of silently
+claiming a clean host.
 
 ## Recorded identity
 
 - `runs.system_json` is the executor/client, such as the Mac running lm-eval.
 - `runs.target_json` is the DGX host, vLLM service, selected model, and topology.
+- `runs.target_json.route` records the logical origin and selected IP address
+  reused by discovery, preflight, quality relay, metrics, and HTTP load.
 - `target-discovery.json` retains the complete sanitized discovery report.
 - `server-before.json` and `server-after.json` retain best-effort host snapshots.
 - `vllm-metrics-before.prom` and `vllm-metrics-after.prom` retain read-only

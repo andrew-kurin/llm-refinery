@@ -7,6 +7,7 @@ from pathlib import Path
 from llm_refinery.benchmarks.lm_eval.presets import TARGET_ORDER
 from llm_refinery.core.config import ConfigError
 from llm_refinery.core.endpoints import Endpoint
+from llm_refinery.core.http_safety import PinnedHttpRoute
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,9 @@ class LmEvalConfig:
     extra_packages: tuple[str, ...] = ()
     apply_chat_template: bool = True
     include_path: Path | None = None
+    trust_env: bool = False
+    ca_bundle: Path | None = None
+    pinned_route: PinnedHttpRoute | None = None
     suite_name: str = "lm-eval"
     database: Path = Path("results/llm_refinery.duckdb")
     targets: dict[str, Endpoint] = field(default_factory=dict)
@@ -45,6 +49,15 @@ class LmEvalConfig:
             raise ConfigError("lm-eval max_retries cannot be negative")
         if self.max_length <= 0:
             raise ConfigError("lm-eval max_length must be positive")
+        if not isinstance(self.trust_env, bool):
+            raise ConfigError("lm-eval trust_env must be a boolean")
+        if self.trust_env and self.num_concurrent > 1 and self.pinned_route is None:
+            raise ConfigError(
+                "lm-eval trust_env is supported only with num_concurrent=1 because the "
+                "pinned asynchronous API client does not honor proxy environment variables"
+            )
+        if self.ca_bundle is not None and not self.ca_bundle.is_file():
+            raise ConfigError(f"lm-eval ca_bundle is not a file: {self.ca_bundle}")
         if not self.package_spec.strip():
             raise ConfigError("lm-eval package_spec cannot be empty")
         if any(not package.strip() for package in self.extra_packages):

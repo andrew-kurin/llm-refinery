@@ -1,8 +1,11 @@
 import json
 import os
 import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import httpx
 import pytest
 
 from llm_refinery.benchmarks.lm_eval import runner as lm_eval_runner
@@ -17,6 +20,7 @@ from llm_refinery.benchmarks.lm_eval.parser import (
 )
 from llm_refinery.core.config import ConfigError
 from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
+from llm_refinery.core.http_safety import PinnedHttpRoute
 from llm_refinery.storage.duckdb import ResultStore
 
 
@@ -64,6 +68,83 @@ def test_lm_eval_command_supports_long_context_metadata(tmp_path):
 def test_lm_eval_chat_backend_rejects_ignored_tokenizer():
     with pytest.raises(ConfigError, match="ignores client-side tokenization"):
         LmEvalConfig(tokenizer="org/model-tokenizer")
+
+
+def test_lm_eval_rejects_proxy_environment_with_async_api_client():
+    with pytest.raises(ConfigError, match="num_concurrent=1"):
+        LmEvalConfig(num_concurrent=2, trust_env=True)
+
+
+def test_lm_eval_relay_preserves_host_and_refuses_upstream_redirects(tmp_path, monkeypatch):
+    requests: list[tuple[str, str]] = []
+    redirect = False
+
+    class Upstream(BaseHTTPRequestHandler):
+        def do_POST(self):
+            requests.append((self.path, self.headers["Host"]))
+            self.rfile.read(int(self.headers["Content-Length"]))
+            if redirect:
+                self.send_response(307)
+                self.send_header("Location", "http://127.0.0.1:9/stolen")
+                self.end_headers()
+                return
+            body = b'{"choices":[]}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+    thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    thread.start()
+    logical_base = f"http://spark.local:{upstream.server_port}/v1"
+    route = PinnedHttpRoute(
+        origin=("http", "spark.local", upstream.server_port),
+        connect_host="127.0.0.1",
+        authority=f"spark.local:{upstream.server_port}",
+        sni_hostname="spark.local",
+    )
+    target = Endpoint(
+        name="spark",
+        protocol=OPENAI_CHAT,
+        model="served-model",
+        base_url=logical_base,
+    )
+    config = LmEvalConfig(
+        target="spark",
+        output_root=tmp_path,
+        targets={"spark": target},
+        pinned_route=route,
+        trust_env=True,
+    )
+    monkeypatch.setattr("llm_refinery.core.http_safety.getproxies", lambda: {})
+    command = build_lm_eval_command(config, target)
+    env_index = command.index("env")
+    lm_eval_index = command.index("lm_eval")
+    wrapper = command[env_index:lm_eval_index]
+    assert ["-u", "HTTP_PROXY"] in [wrapper[index : index + 2] for index in range(len(wrapper))]
+    try:
+        with lm_eval_runner._lm_eval_target(target, config, dry_run=False) as relay_target:
+            response = httpx.post(relay_target.chat_completions_url, json={"model": "x"})
+            assert response.status_code == 200
+            assert response.json() == {"choices": []}
+
+            redirect = True
+            response = httpx.post(relay_target.chat_completions_url, json={"model": "x"})
+            assert response.status_code == 502
+    finally:
+        upstream.shutdown()
+        upstream.server_close()
+        thread.join(timeout=2)
+
+    assert requests == [
+        ("/v1/chat/completions", f"spark.local:{upstream.server_port}"),
+        ("/v1/chat/completions", f"spark.local:{upstream.server_port}"),
+    ]
 
 
 def test_lm_eval_completions_backend_uses_completions_url_and_tokenizer():
@@ -129,10 +210,13 @@ def test_lm_eval_api_key_env_must_exist_and_overrides_ambient_openai_key():
         api_key_env="VLLM_API_KEY",
     )
 
-    assert lm_eval_api_key(
-        target,
-        environ={"VLLM_API_KEY": "target-key", "OPENAI_API_KEY": "unrelated-key"},
-    ) == "target-key"
+    assert (
+        lm_eval_api_key(
+            target,
+            environ={"VLLM_API_KEY": "target-key", "OPENAI_API_KEY": "unrelated-key"},
+        )
+        == "target-key"
+    )
     with pytest.raises(ConfigError, match="VLLM_API_KEY"):
         lm_eval_api_key(target, environ={"OPENAI_API_KEY": "unrelated-key"})
 
@@ -300,11 +384,15 @@ def test_lm_eval_runner_persists_logged_samples(monkeypatch, tmp_path):
     output_root = tmp_path / "lm-eval-output"
     database = tmp_path / "runs.duckdb"
     real_run = subprocess.run
+    child_env: dict[str, str] = {}
+    executed_command: list[str] = []
 
     def fake_run(*args, **kwargs):
         command = args[0] if args else kwargs.get("args")
         if not isinstance(command, list) or not command or command[0] != "uvx":
             return real_run(*args, **kwargs)
+        executed_command.extend(command)
+        child_env.update(kwargs["env"])
         output_dir = output_root / "local" / "model"
         output_dir.mkdir(parents=True, exist_ok=True)
         stamp = "2026-07-10T12-00-00"
@@ -324,15 +412,26 @@ def test_lm_eval_runner_persists_logged_samples(monkeypatch, tmp_path):
             + "\n",
             encoding="utf-8",
         )
-        return subprocess.CompletedProcess(args=[], returncode=0, stdout="ok", stderr="")
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="ok top-secret-token Bearer top-secret-token",
+            stderr="request failed with top-secret-token",
+        )
 
     monkeypatch.setattr(lm_eval_runner.subprocess, "run", fake_run)
+    monkeypatch.setenv("TEST_LM_EVAL_API_KEY", "top-secret-token")
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setenv("SSL_CERT_DIR", "/ambient/certificates")
+    ca_bundle = tmp_path / "private-ca.pem"
+    ca_bundle.write_text("test CA", encoding="utf-8")
     config = LmEvalConfig(
         target="local",
         tasks="ifeval",
         limit=1,
         log_samples=True,
         output_root=output_root,
+        ca_bundle=ca_bundle,
         database=database,
         targets={
             "local": Endpoint(
@@ -340,6 +439,7 @@ def test_lm_eval_runner_persists_logged_samples(monkeypatch, tmp_path):
                 protocol=OPENAI_CHAT,
                 model="local-model",
                 base_url="http://127.0.0.1:8080/v1",
+                api_key_env="TEST_LM_EVAL_API_KEY",
             )
         },
     )
@@ -350,6 +450,21 @@ def test_lm_eval_runner_persists_logged_samples(monkeypatch, tmp_path):
     assert outcome.metrics["samples.recorded_count"] == 1
     with ResultStore(database) as store:
         samples = store.samples_for_run(outcome.run_id)
+        run = store.comparison_runs()[0]
     assert samples[0]["sample_id"] == "ifeval:none:42"
     assert samples[0]["metrics"]["correct"] == 1.0
     assert samples[0]["artifact_path"].endswith("samples_ifeval_2026-07-10T12-00-00.jsonl")
+    stdout = Path(run["artifacts"]["stdout"]["path"]).read_text(encoding="utf-8")
+    stderr = Path(run["artifacts"]["stderr"]["path"]).read_text(encoding="utf-8")
+    assert "top-secret-token" not in stdout + stderr
+    assert "[REDACTED]" in stdout + stderr
+    assert child_env["HTTP_PROXY"] == "http://proxy.invalid:3128"
+    assert child_env["SSL_CERT_DIR"] == "/ambient/certificates"
+    env_index = executed_command.index("env")
+    lm_eval_index = executed_command.index("lm_eval")
+    wrapper = executed_command[env_index:lm_eval_index]
+    assert ["-u", "HTTP_PROXY"] in [wrapper[index : index + 2] for index in range(len(wrapper))]
+    assert ["-u", "SSL_CERT_DIR"] in [wrapper[index : index + 2] for index in range(len(wrapper))]
+    assert f"SSL_CERT_FILE={ca_bundle}" in wrapper
+    assert f"REQUESTS_CA_BUNDLE={ca_bundle}" in wrapper
+    assert f"CURL_CA_BUNDLE={ca_bundle}" in wrapper

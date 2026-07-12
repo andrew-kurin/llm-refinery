@@ -83,6 +83,17 @@ from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
 @click.option("--base-url", help="Override chat-completions URL for a single target.")
 @click.option("--api-key-env", help="Environment variable containing the endpoint API key.")
 @click.option(
+    "--trust-env/--no-trust-env",
+    default=False,
+    show_default=True,
+    help="Honor proxy environment variables (supported only with --num-concurrent 1).",
+)
+@click.option(
+    "--ca-bundle",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="PEM CA bundle used consistently by lm-eval HTTP clients.",
+)
+@click.option(
     "--output-root",
     type=click.Path(file_okay=False, path_type=Path),
     default=Path("results/lm_eval"),
@@ -118,6 +129,8 @@ def lm_eval_command(
     model: str | None,
     base_url: str | None,
     api_key_env: str | None,
+    trust_env: bool,
+    ca_bundle: Path | None,
     output_root: Path,
     offline: bool,
     dry_run: bool,
@@ -173,6 +186,8 @@ def lm_eval_command(
             extra_packages=extra_packages,
             apply_chat_template=apply_chat_template,
             include_path=include_path,
+            trust_env=trust_env,
+            ca_bundle=ca_bundle,
             suite_name=suite_name,
             database=db,
             targets=targets,

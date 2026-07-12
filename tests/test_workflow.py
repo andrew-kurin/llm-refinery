@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from llm_refinery.core.config import ConfigError
+from llm_refinery.core.http_safety import PinnedHttpRoute
 from llm_refinery.core.targets import (
     HostDiscovery,
     ModelDescriptor,
@@ -205,6 +206,59 @@ def test_schema_v1_suite_keeps_legacy_default_endpoint():
     assert config.endpoint.base_url == "http://127.0.0.1:8080/v1"
 
 
+@pytest.mark.parametrize(
+    ("section", "field"),
+    [
+        ("quality", "enabled"),
+        ("quality", "offline"),
+        ("quality", "trust_env"),
+        ("http_load", "enabled"),
+        ("preflight", "enabled"),
+        ("preflight", "require_clean"),
+        ("preflight", "sanity_check"),
+    ],
+)
+def test_suite_config_rejects_non_boolean_flags(section: str, field: str):
+    raw = {
+        "endpoint": {
+            "name": "local",
+            "protocol": "openai_chat",
+            "base_url": "http://127.0.0.1:8080/v1",
+            "model": "model",
+        },
+        section: {field: "false"},
+    }
+
+    with pytest.raises(ConfigError, match="must be a boolean"):
+        SuiteConfig.from_mapping(raw)
+
+
+@pytest.mark.parametrize("value", [True, "2", 2.0, 2.9, None])
+def test_suite_config_requires_an_integer_schema_version(value):
+    with pytest.raises(ConfigError, match="integer 1 or 2"):
+        SuiteConfig.from_mapping({"schema_version": value})
+
+
+def test_suite_quality_resolves_ca_bundle_relative_to_manifest(tmp_path: Path):
+    ca_bundle = tmp_path / "private-ca.pem"
+    ca_bundle.write_text("test CA", encoding="utf-8")
+    config = SuiteConfig.from_mapping(
+        {
+            "endpoint": {
+                "name": "local",
+                "protocol": "openai_chat",
+                "base_url": "https://model.local/v1",
+                "model": "model",
+            },
+            "quality": {"trust_env": True, "ca_bundle": ca_bundle.name},
+        },
+        source_path=tmp_path / "suite.yaml",
+    )
+
+    assert config.quality.trust_env is True
+    assert config.quality.ca_bundle == ca_bundle
+
+
 def test_suite_can_require_the_response_model_identity(tmp_path: Path):
     config = SuiteConfig.from_mapping(
         {
@@ -244,6 +298,7 @@ def _resolved_dgx_target(*, max_model_len: int = 32768) -> tuple[TargetSpec, Tar
                 "base_url": "http://aitopatom-41de.local:8000/v1",
             },
             "model": {"selection": "single"},
+            "transport": {"trust_env": False},
         }
     )
     host = HostDiscovery(
@@ -268,6 +323,12 @@ def _resolved_dgx_target(*, max_model_len: int = 32768) -> tuple[TargetSpec, Tar
         version="0.10.2",
         models=(model,),
     )
+    route = PinnedHttpRoute(
+        origin=("http", "aitopatom-41de.local", 8000),
+        connect_host="192.168.1.41",
+        authority="aitopatom-41de.local:8000",
+        sni_hostname="aitopatom-41de.local",
+    )
     resolved = ResolvedTarget(
         spec_name=spec.name,
         endpoint=spec.endpoint.resolve(model.id),
@@ -275,12 +336,14 @@ def _resolved_dgx_target(*, max_model_len: int = 32768) -> tuple[TargetSpec, Tar
         service=service,
         model=model,
         selection="single_discovered",
+        route=route,
     )
     return spec, TargetInspection(
         spec=spec,
         host=host,
         service=service,
         resolved=resolved,
+        route=route,
     )
 
 
@@ -298,6 +361,9 @@ def _target_config_mapping(spec: TargetSpec) -> dict[str, object]:
         },
         "model": {
             "selection": spec.model.selection,
+        },
+        "transport": {
+            "trust_env": spec.transport.trust_env,
         },
     }
 
@@ -352,7 +418,7 @@ target:
         f"""
 schema_version: 2
 name: spark-suite
-database: {tmp_path / 'runs.duckdb'}
+database: {tmp_path / "runs.duckdb"}
 target: targets/spark.yaml
 quality:
   enabled: false
@@ -370,6 +436,32 @@ preflight:
     assert config.target is not None
     assert config.target.host.destination == "dgx"
     assert config.target.model.selection == "single"
+
+
+def test_suite_config_resolves_inline_target_ca_relative_to_manifest(tmp_path: Path):
+    ca_bundle = tmp_path / "private-ca.pem"
+    ca_bundle.write_text("test CA", encoding="utf-8")
+    config = SuiteConfig.from_mapping(
+        {
+            "schema_version": 2,
+            "target": {
+                "name": "spark",
+                "host": {"access": "ssh", "destination": "dgx"},
+                "endpoint": {
+                    "protocol": "openai_chat",
+                    "base_url": "https://spark.local:8000/v1",
+                },
+                "transport": {"ca_bundle": ca_bundle.name},
+            },
+            "quality": {"enabled": False},
+            "http_load": {"enabled": False},
+            "preflight": {"enabled": False},
+        },
+        source_path=tmp_path / "suite.yaml",
+    )
+
+    assert config.target is not None
+    assert config.target.transport.ca_bundle == ca_bundle.resolve()
 
 
 def test_remote_suite_resolves_once_for_children_and_overlays_http_target(tmp_path: Path):
@@ -408,10 +500,23 @@ def test_remote_suite_resolves_once_for_children_and_overlays_http_target(tmp_pa
     assert [call[0] for call in calls] == ["quality", "load"]
     assert calls[0][1].targets["spark"].model == "served-model"
     assert calls[0][1].tokenizer is None
+    assert calls[0][1].trust_env is False
+    assert calls[0][1].pinned_route == inspection.route
     assert calls[1][1].targets[0].base_url == "http://aitopatom-41de.local:8000/v1"
     assert calls[1][1].targets[0].model == "served-model"
+    assert calls[1][1].transport.trust_env is False
+    assert calls[1][1].transport.pinned_route == inspection.route
     assert calls[0][2]["run_context"].to_target_json()["host"]["destination"] == "dgx"
     assert calls[1][2]["run_context"].to_target_json()["model"]["id"] == "served-model"
+    assert calls[1][2]["run_context"].to_target_json()["route"] == {
+        "logical_origin": {
+            "scheme": "http",
+            "hostname": "aitopatom-41de.local",
+            "port": 8000,
+        },
+        "selected_address": "192.168.1.41",
+        "authority": "aitopatom-41de.local:8000",
+    }
     assert resolver.calls == 1
     assert resolver.snapshot_calls == 1
     assert resolver.metrics_calls == 2
@@ -427,6 +532,10 @@ def test_remote_suite_resolves_once_for_children_and_overlays_http_target(tmp_pa
         "vllm_metrics_before",
         "vllm_metrics_after",
     }
+    assert (
+        "exact context fit cannot be verified"
+        in Path(run["artifacts"]["preflight"]["path"]).read_text()
+    )
 
 
 def test_remote_suite_preflight_defaults_to_discovered_model_identity(tmp_path: Path):
@@ -454,6 +563,66 @@ def test_remote_suite_preflight_defaults_to_discovered_model_identity(tmp_path: 
 
     with pytest.raises(RuntimeError, match="served-model"):
         workflow.execute()
+
+
+def test_remote_suite_preflight_inherits_target_transport(monkeypatch, tmp_path: Path):
+    spec, inspection = _resolved_dgx_target()
+    captured: dict[str, object] = {}
+
+    def fake_sanity(endpoint, **kwargs):
+        captured.update(kwargs)
+        return {"success": True, "response_model": endpoint.model}
+
+    monkeypatch.setattr("llm_refinery.workflows.suite.run_api_sanity_check", fake_sanity)
+    config = SuiteConfig.from_mapping(
+        {
+            "schema_version": 2,
+            "name": "spark-transport",
+            "database": str(tmp_path / "runs.duckdb"),
+            "target": _target_config_mapping(spec),
+            "quality": {"enabled": False},
+            "http_load": {"enabled": False},
+            "preflight": {"enabled": True, "require_clean": False},
+        }
+    )
+
+    BenchmarkSuiteWorkflow(
+        config,
+        target_resolver=_FakeTargetResolver(inspection),
+        system_snapshot=lambda: "snapshot",
+    ).execute()
+
+    assert captured == {
+        "trust_env": False,
+        "ca_bundle": None,
+        "route": inspection.route,
+    }
+
+
+def test_remote_suite_require_clean_fails_instead_of_silently_skipping(tmp_path: Path):
+    spec, inspection = _resolved_dgx_target()
+    config = SuiteConfig.from_mapping(
+        {
+            "schema_version": 2,
+            "name": "spark-clean-check",
+            "database": str(tmp_path / "runs.duckdb"),
+            "target": _target_config_mapping(spec),
+            "quality": {"enabled": False},
+            "http_load": {"enabled": False},
+            "preflight": {
+                "enabled": True,
+                "require_clean": True,
+                "sanity_check": False,
+            },
+        }
+    )
+
+    with pytest.raises(ConfigError, match="cannot verify ports on a remote endpoint"):
+        BenchmarkSuiteWorkflow(
+            config,
+            target_resolver=_FakeTargetResolver(inspection),
+            system_snapshot=lambda: "snapshot",
+        ).execute()
 
 
 def test_remote_suite_persists_unavailable_discovery_and_starts_no_children(tmp_path: Path):
@@ -510,6 +679,47 @@ def test_remote_suite_persists_unavailable_discovery_and_starts_no_children(tmp_
     assert "local telemetry failed" not in run["error"]
 
 
+def test_remote_suite_persists_discovery_exception_before_failing(tmp_path: Path):
+    spec, inspection = _resolved_dgx_target()
+
+    class FailingResolver(_FakeTargetResolver):
+        def inspect(self, spec, *, allow_service_unavailable=False):
+            error = ConfigError("inventory response was malformed")
+            error.target_inspection = inspection
+            raise error
+
+    config = SuiteConfig.from_mapping(
+        {
+            "schema_version": 2,
+            "name": "malformed-spark",
+            "database": str(tmp_path / "runs.duckdb"),
+            "target": _target_config_mapping(spec),
+            "quality": {"enabled": False},
+            "http_load": {"enabled": False},
+            "preflight": {"enabled": False},
+        }
+    )
+
+    with pytest.raises(ConfigError, match="inventory response was malformed"):
+        BenchmarkSuiteWorkflow(
+            config,
+            target_resolver=FailingResolver(inspection),
+            system_snapshot=lambda: "snapshot",
+        ).execute()
+
+    with ResultStore(config.database) as store:
+        run = store.comparison_runs(include_failed=True)[0]
+    discovery_path = Path(run["artifacts"]["target_discovery"]["path"])
+    server_before_path = Path(run["artifacts"]["server_before"]["path"])
+    assert run["target_json"]["failure_stage"] == "target_discovery"
+    assert run["target_json"]["requested_target"]["endpoint"]["header_names"] == []
+    assert run["target_json"]["host"]["profile"]["hostname"] == "spark"
+    assert run["target_json"]["service"]["version"] == "0.10.2"
+    assert "inventory response was malformed" in run["target_json"]["errors"][0]
+    assert "inventory response was malformed" in discovery_path.read_text()
+    assert '"hostname": "spark"' in server_before_path.read_text()
+
+
 def test_target_limit_validation_only_checks_selected_http_scenarios(tmp_path: Path):
     http_config = tmp_path / "scenarios.yaml"
     http_config.write_text(
@@ -523,6 +733,8 @@ targets:
 scenarios:
   - name: selected-short
     prompt: hello
+    system: system
+    prompt_repeat: 3
     max_tokens: [8]
     requests: 1
     concurrency: [1]
@@ -555,3 +767,27 @@ scenarios:
     workflow = BenchmarkSuiteWorkflow(config, target_resolver=_FakeTargetResolver(inspection))
 
     workflow._validate_resolved_target(inspection.resolved)
+    assert any(
+        "rendered prompt/system of up to 25 characters" in warning
+        for warning in workflow._validation_warnings
+    )
+
+
+def test_target_limit_reserves_context_for_the_http_prompt(tmp_path: Path):
+    http_config = _write_http_load_config(tmp_path)
+    spec, inspection = _resolved_dgx_target(max_model_len=8)
+    assert inspection.resolved is not None
+    config = SuiteConfig.from_mapping(
+        {
+            "schema_version": 2,
+            "name": "prompt-budget",
+            "database": str(tmp_path / "runs.duckdb"),
+            "target": _target_config_mapping(spec),
+            "quality": {"enabled": False},
+            "http_load": {"enabled": True, "config": str(http_config)},
+            "preflight": {"enabled": False},
+        }
+    )
+
+    with pytest.raises(ConfigError, match="leaves no context for the non-empty prompt"):
+        BenchmarkSuiteWorkflow(config)._validate_resolved_target(inspection.resolved)

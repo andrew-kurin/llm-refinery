@@ -15,6 +15,18 @@ from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
 from llm_refinery.core.targets import TargetSpec, load_target_spec
 
 
+def _strict_bool(value: Any, *, context: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"{context} must be a boolean")
+    return value
+
+
+def _schema_version(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value not in {1, 2}:
+        raise ConfigError(f"suite schema_version must be the integer 1 or 2, got {value!r}")
+    return value
+
+
 @dataclass(frozen=True)
 class QualityStep:
     enabled: bool = True
@@ -31,6 +43,10 @@ class QualityStep:
     package_spec: str = "lm-eval[api]==0.4.12"
     extra_packages: tuple[str, ...] = ()
     offline: bool = True
+    # ``None`` inherits the schema-v2 target transport; legacy endpoint suites
+    # use a deterministic direct quality path.
+    trust_env: bool | None = None
+    ca_bundle: Path | None = None
 
     def __post_init__(self) -> None:
         if self.limit is not None and self.limit <= 0:
@@ -71,6 +87,8 @@ class QualityStep:
                 "package_spec",
                 "extra_packages",
                 "offline",
+                "trust_env",
+                "ca_bundle",
             },
             context="suite quality step",
         )
@@ -84,6 +102,16 @@ class QualityStep:
         include_path = Path(str(raw["include_path"])) if raw.get("include_path") else None
         if include_path is not None and source_path is not None and not include_path.is_absolute():
             include_path = source_path.parent / include_path
+        ca_bundle_raw = raw.get("ca_bundle")
+        if ca_bundle_raw is not None and (
+            not isinstance(ca_bundle_raw, str) or not ca_bundle_raw.strip()
+        ):
+            raise ConfigError("suite quality.ca_bundle must be a non-empty path string")
+        ca_bundle = Path(ca_bundle_raw) if ca_bundle_raw is not None else None
+        if ca_bundle is not None and source_path is not None and not ca_bundle.is_absolute():
+            ca_bundle = source_path.parent / ca_bundle
+        if ca_bundle is not None and not ca_bundle.is_file():
+            raise ConfigError(f"suite quality.ca_bundle is not a file: {ca_bundle}")
         metadata_raw = raw.get("metadata")
         metadata = (
             json.dumps(metadata_raw, sort_keys=True, separators=(",", ":"))
@@ -93,7 +121,7 @@ class QualityStep:
             else None
         )
         return cls(
-            enabled=bool(raw.get("enabled", True)),
+            enabled=_strict_bool(raw.get("enabled", True), context="suite quality.enabled"),
             tasks=str(raw.get("tasks") or "ifeval,gsm8k"),
             limit=limit,
             num_fewshot=int(raw["num_fewshot"]) if raw.get("num_fewshot") is not None else None,
@@ -108,7 +136,13 @@ class QualityStep:
             extra_packages=tuple(
                 str(package) for package in coerce_list(raw.get("extra_packages"))
             ),
-            offline=bool(raw.get("offline", True)),
+            offline=_strict_bool(raw.get("offline", True), context="suite quality.offline"),
+            trust_env=(
+                _strict_bool(raw["trust_env"], context="suite quality.trust_env")
+                if "trust_env" in raw
+                else None
+            ),
+            ca_bundle=ca_bundle,
         )
 
     def safe_json(self) -> dict[str, Any]:
@@ -127,6 +161,8 @@ class QualityStep:
             "package_spec": self.package_spec,
             "extra_packages": list(self.extra_packages),
             "offline": self.offline,
+            "trust_env": self.trust_env,
+            "ca_bundle": str(self.ca_bundle) if self.ca_bundle else None,
         }
 
 
@@ -148,7 +184,10 @@ class HttpLoadStep:
         config_path = Path(str(raw["config"])) if raw.get("config") else None
         if config_path is not None and source_path is not None and not config_path.is_absolute():
             config_path = source_path.parent / config_path
-        enabled = bool(raw.get("enabled", config_path is not None))
+        enabled = _strict_bool(
+            raw.get("enabled", config_path is not None),
+            context="suite http_load.enabled",
+        )
         if enabled and config_path is None:
             raise ConfigError("suite http_load.config is required when HTTP load is enabled")
         return cls(
@@ -195,10 +234,16 @@ class PreflightStep:
         if any(port <= 0 or port > 65535 for port in forbidden_ports):
             raise ConfigError("suite preflight.forbidden_ports must be valid TCP ports")
         return cls(
-            enabled=bool(raw.get("enabled", True)),
-            require_clean=bool(raw.get("require_clean", True)),
+            enabled=_strict_bool(raw.get("enabled", True), context="suite preflight.enabled"),
+            require_clean=_strict_bool(
+                raw.get("require_clean", True),
+                context="suite preflight.require_clean",
+            ),
             forbidden_ports=forbidden_ports,
-            sanity_check=bool(raw.get("sanity_check", True)),
+            sanity_check=_strict_bool(
+                raw.get("sanity_check", True),
+                context="suite preflight.sanity_check",
+            ),
             expected_response_model=(
                 str(raw["expected_response_model"]) if raw.get("expected_response_model") else None
             ),
@@ -252,14 +297,17 @@ class SuiteConfig:
             },
             context="suite configuration",
         )
-        schema_version = int(raw.get("schema_version", 1))
+        schema_version = _schema_version(raw.get("schema_version", 1))
         target_value = raw.get("target")
         endpoint_value = raw.get("endpoint")
         if target_value is not None and endpoint_value is not None:
             raise ConfigError("suite cannot define both 'endpoint' and 'target'")
         if target_value is not None:
             if isinstance(target_value, dict):
-                target = TargetSpec.from_mapping(target_value)
+                target = TargetSpec.from_mapping(
+                    target_value,
+                    base_dir=source_path.parent if source_path else Path.cwd(),
+                )
             elif isinstance(target_value, str):
                 target_path = Path(target_value)
                 if source_path is not None and not target_path.is_absolute():
