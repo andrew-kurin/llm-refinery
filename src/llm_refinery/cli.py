@@ -15,6 +15,7 @@ from llm_refinery.commands.reporting import compare_command, reparse_command, re
 from llm_refinery.commands.suite import suite_command
 from llm_refinery.commands.sweep import bench_command, init_command, plan_command, server_command
 from llm_refinery.commands.system import backfill_system_metadata_command
+from llm_refinery.commands.targets import target_command
 from llm_refinery.core.config import ConfigError
 
 
@@ -53,6 +54,7 @@ main.add_command(reparse_command)
 main.add_command(report_command)
 main.add_command(server_command)
 main.add_command(suite_command)
+main.add_command(target_command)
 
 
 if __name__ == "__main__":

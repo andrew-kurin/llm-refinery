@@ -7,6 +7,7 @@ import time
 from contextlib import nullcontext
 from pathlib import Path
 
+from llm_refinery.application.run_context import RunContext
 from llm_refinery.application.run_session import RunSession
 from llm_refinery.benchmarks.lm_eval.command import build_lm_eval_command
 from llm_refinery.benchmarks.lm_eval.config import LmEvalConfig, resolve_target_names
@@ -34,6 +35,7 @@ def run_lm_eval(
     dry_run: bool = False,
     parent_run_id: str | None = None,
     store: ResultStore | None = None,
+    run_context: RunContext | None = None,
 ) -> list[CompletedRun]:
     targets = {**default_targets(), **config.targets}
     selected = resolve_target_names(config.target, set(targets))
@@ -76,8 +78,9 @@ def run_lm_eval(
                 command_text=command_text,
                 database=active_store.database,
                 parent_run_id=parent_run_id,
+                run_context=run_context,
             )
-            with RunSession(active_store, spec) as run:
+            with RunSession(active_store, spec, run_context=run_context) as run:
                 stdout_path = run.artifact("stdout", "stdout.txt", "text/plain")
                 stderr_path = run.artifact("stderr", "stderr.txt", "text/plain")
                 result_path = run.artifact("result", "result.json", "application/json")
@@ -171,6 +174,7 @@ def _run_spec(
     command_text: str,
     database: str | Path,
     parent_run_id: str | None,
+    run_context: RunContext | None,
 ) -> RunSpec:
     config_json = {
         "benchmark": "lm_eval",
@@ -198,6 +202,8 @@ def _run_spec(
         "output_root": str(config.output_root),
         "params": {"target": target_name, "model": target_model},
     }
+    if run_context is not None and run_context.target_json:
+        config_json["execution_target"] = run_context.target_identity_json()
     return RunSpec.create(
         benchmark_kind="lm_eval",
         suite=config.suite_name,

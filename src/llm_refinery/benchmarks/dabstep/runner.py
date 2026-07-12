@@ -9,6 +9,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
+from llm_refinery.application.run_context import RunContext
 from llm_refinery.application.run_session import RunSession
 from llm_refinery.benchmarks.dabstep.command import (
     build_dabstep_command,
@@ -72,6 +73,7 @@ def run_dabstep(
     resume_run_id: str | None = None,
     store: ResultStore | None = None,
     parent_run_id: str | None = None,
+    run_context: RunContext | None = None,
 ) -> CompletedRun | None:
     tasks = load_dabstep_tasks(config.dabstep)
     task_source_contract = validate_dabstep_task_source(config.dabstep, tasks)
@@ -103,8 +105,14 @@ def run_dabstep(
             task_source_contract=task_source_contract,
             database=active_store.database,
             parent_run_id=parent_run_id,
+            run_context=run_context,
         )
-        with RunSession(active_store, spec, resume_run_id=resume_run_id) as run:
+        with RunSession(
+            active_store,
+            spec,
+            resume_run_id=resume_run_id,
+            run_context=run_context,
+        ) as run:
             answers_path = run.artifact("answers", "answers.jsonl", "application/x-ndjson")
             tasks_path = run.artifact("tasks", "tasks.jsonl", "application/x-ndjson")
             stdout_path = run.artifact("stdout", "stdout.txt", "text/plain")
@@ -293,6 +301,7 @@ def _run_spec(
     task_source_contract: DabstepTaskSourceContract,
     database: Path,
     parent_run_id: str | None,
+    run_context: RunContext | None,
 ) -> RunSpec:
     selected_ids = [task.task_id for task in tasks]
     config_json = {
@@ -314,6 +323,8 @@ def _run_spec(
             "max_steps": config.dabstep.max_steps,
         },
     }
+    if run_context is not None and run_context.target_json:
+        config_json["execution_target"] = run_context.target_identity_json()
     return RunSpec.create(
         benchmark_kind="dabstep",
         suite=config.name,

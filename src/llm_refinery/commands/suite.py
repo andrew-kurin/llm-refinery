@@ -6,6 +6,7 @@ from pathlib import Path
 import click
 
 from llm_refinery.commands.common import parse_lm_eval_limit
+from llm_refinery.core.targets import MODEL_SELECTION_EXPLICIT
 from llm_refinery.workflows.suite import BenchmarkSuiteWorkflow
 from llm_refinery.workflows.suite_config import load_suite_config
 
@@ -50,6 +51,10 @@ from llm_refinery.workflows.suite_config import load_suite_config
 @click.option("--base-url", help="Override the suite endpoint URL.")
 @click.option("--api-model", help="Override the model sent to the suite endpoint.")
 @click.option(
+    "--ssh-destination",
+    help="Override the OpenSSH destination/alias for a discovery target.",
+)
+@click.option(
     "--http-load-config",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="Override the HTTP-load configuration path.",
@@ -73,15 +78,53 @@ def suite_command(
     require_clean: bool | None,
     base_url: str | None,
     api_model: str | None,
+    ssh_destination: str | None,
     http_load_config: Path | None,
     target: str | None,
 ) -> None:
     suite = load_suite_config(config)
-    endpoint = replace(
-        suite.endpoint,
-        base_url=(base_url or suite.endpoint.base_url).rstrip("/"),
-        model=api_model or suite.endpoint.model,
-    )
+    endpoint = suite.endpoint
+    target_spec = suite.target
+    if endpoint is not None:
+        endpoint = replace(
+            endpoint,
+            base_url=(base_url or endpoint.base_url).rstrip("/"),
+            model=api_model or endpoint.model,
+        )
+    else:
+        assert target_spec is not None
+        if ssh_destination is not None:
+            if target_spec.host.access != "ssh":
+                raise click.BadParameter(
+                    "--ssh-destination requires target.host.access: ssh",
+                    param_hint="--ssh-destination",
+                )
+            target_spec = replace(
+                target_spec,
+                host=replace(target_spec.host, destination=ssh_destination),
+            )
+        endpoint_spec = replace(
+            target_spec.endpoint,
+            base_url=(base_url or target_spec.endpoint.base_url).rstrip("/"),
+        )
+        model_selection = target_spec.model
+        if api_model is not None:
+            endpoint_spec = replace(endpoint_spec, model=api_model)
+            model_selection = replace(
+                model_selection,
+                selection=MODEL_SELECTION_EXPLICIT,
+                model_id=api_model,
+            )
+        target_spec = replace(
+            target_spec,
+            endpoint=endpoint_spec,
+            model=model_selection,
+        )
+    if endpoint is not None and ssh_destination is not None:
+        raise click.BadParameter(
+            "--ssh-destination requires a schema_version 2 discovery target",
+            param_hint="--ssh-destination",
+        )
     quality = replace(
         suite.quality,
         enabled=suite.quality.enabled if run_lm_eval is None else run_lm_eval,
@@ -115,6 +158,7 @@ def suite_command(
     effective = replace(
         suite,
         endpoint=endpoint,
+        target=target_spec,
         quality=quality,
         http_load=http_load,
         preflight=preflight,

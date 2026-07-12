@@ -14,6 +14,7 @@ application ──────────┤
                       ▲
 benchmarks ───────────┤
 providers ────────────┤
+adapters ─────────────┤
 storage ──────────────┘
 ```
 
@@ -25,6 +26,8 @@ Enforced rules:
 - benchmarks, providers, and application code never import commands or workflows.
 - workflows call benchmark services directly; they do not invoke the project's CLI
   as a subprocess.
+- target discovery is orchestrated by `application`; SSH remains an `adapters`
+  concern and never leaks into benchmark transports.
 
 `tests/test_architecture.py` verifies these boundaries.
 
@@ -45,7 +48,8 @@ interruptions are recorded as failed runs rather than disappearing.
 
 DuckDB infrastructure lives under `llm_refinery.storage`:
 
-- `runs`: execution identity, status, configuration, and system profile
+- `runs`: execution identity, status, configuration, executor profile, and
+  optional remote target profile
 - `metrics`: normalized scalar metrics
 - `artifacts`: typed artifact roles, portable database-relative paths, and media types
 - `samples`: task/request-level outcomes for checkpointing and future resume support
@@ -85,6 +89,25 @@ A vendor that exposes an OpenAI-compatible endpoint uses `openai_chat`; adding a
 vendor does not require a new execution branch. Secret header values are excluded
 from stored configuration, while a hash keeps experiment identity sensitive to
 header changes.
+
+## Remote execution targets
+
+`core.targets.TargetSpec` represents unresolved intent: an API endpoint, a local or
+SSH-accessible serving host, and a deterministic model-selection policy.
+`application.target_discovery.TargetResolver` combines read-only host inventory with
+OpenAI-compatible service discovery and produces a concrete `Endpoint` before any
+benchmark child starts.
+
+SSH and HTTP are deliberately separate control and data planes. An SSH alias such as
+`dgx` is resolved by the user's OpenSSH configuration; it is never assumed to be the
+same name used by the benchmark endpoint. The SSH adapter sends a packaged,
+standard-library-only inventory probe over stdin and never starts, stops, or modifies
+the serving process.
+
+For remote runs, `runs.system_json` continues to describe the executor running the
+harness, while `runs.target_json` describes the serving host, service, selected model,
+and measurement topology. Child runs inherit one `RunContext`, so a suite performs
+static discovery once rather than once per benchmark cell.
 
 ## Adding a benchmark
 

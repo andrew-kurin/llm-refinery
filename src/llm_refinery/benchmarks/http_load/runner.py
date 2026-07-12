@@ -5,6 +5,7 @@ import time
 from contextlib import nullcontext
 from pathlib import Path
 
+from llm_refinery.application.run_context import RunContext
 from llm_refinery.application.run_session import RunSession
 from llm_refinery.benchmarks.http_load.config import (
     RECOMMENDED_MEASURED_REQUESTS,
@@ -15,7 +16,7 @@ from llm_refinery.benchmarks.http_load.config import (
 )
 from llm_refinery.benchmarks.http_load.metrics import summarize_request_results
 from llm_refinery.benchmarks.http_load.models import RequestResult
-from llm_refinery.benchmarks.http_load.transport import run_requests
+from llm_refinery.benchmarks.http_load.transport import pooled_http_client, run_requests
 from llm_refinery.core.runs import CompletedRun, RunSpec
 from llm_refinery.storage.duckdb import ResultStore
 from llm_refinery.storage.models import SampleRecord
@@ -36,6 +37,7 @@ def run_http_load(
     database_override: str | Path | None = None,
     parent_run_id: str | None = None,
     store: ResultStore | None = None,
+    run_context: RunContext | None = None,
 ) -> list[CompletedRun]:
     trials = expand_http_load_trials(
         config,
@@ -76,6 +78,7 @@ def run_http_load(
                         index=index,
                         total=len(trials),
                         parent_run_id=parent_run_id,
+                        run_context=run_context,
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - RunSession has persisted the failure
@@ -97,8 +100,11 @@ def _run_one_http_load(
     index: int,
     total: int,
     parent_run_id: str | None,
+    run_context: RunContext | None,
 ) -> CompletedRun:
     config_json = {**trial.as_jsonable(), "benchmark": "http_load"}
+    if run_context is not None and run_context.target_json:
+        config_json["execution_target"] = run_context.target_identity_json()
     label = (
         f"{trial.suite}/{trial.target.name}/{trial.scenario.name}/"
         f"c{trial.concurrency}-n{trial.max_tokens}"
@@ -122,17 +128,18 @@ def _run_one_http_load(
             f"the recommended minimum of {RECOMMENDED_MEASURED_REQUESTS}"
         )
 
-    with RunSession(store, spec) as run:
+    with RunSession(store, spec, run_context=run_context) as run:
         responses_path = run.artifact("responses", "responses.jsonl", "application/x-ndjson")
         errors_path = run.artifact("errors", "errors.txt", "text/plain")
         measurement_path = run.artifact("measurement", "measurement.json", "application/json")
 
         warmup_count = trial.effective_warmup_requests
-        warmup_results = run_requests(trial, count=warmup_count)
+        with pooled_http_client(trial) as client:
+            warmup_results = run_requests(trial, count=warmup_count, client=client)
 
-        measurement_started = time.perf_counter()
-        results = run_requests(trial, count=trial.scenario.requests)
-        duration_s = time.perf_counter() - measurement_started
+            measurement_started = time.perf_counter()
+            results = run_requests(trial, count=trial.scenario.requests, client=client)
+            duration_s = time.perf_counter() - measurement_started
         measurement_path.write_text(
             json.dumps(
                 {

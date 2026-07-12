@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from types import TracebackType
 from typing import Any
 
+from llm_refinery.application.run_context import RunContext
 from llm_refinery.core.runs import (
     Artifact,
     CompletedRun,
@@ -14,7 +16,7 @@ from llm_refinery.core.runs import (
 )
 from llm_refinery.storage.duckdb import ResultStore, utc_now
 from llm_refinery.storage.models import RunRecord
-from llm_refinery.utils.system import get_system_profile
+from llm_refinery.utils.system import get_system_profile, host_identity
 
 
 class RunSession:
@@ -26,8 +28,12 @@ class RunSession:
         spec: RunSpec,
         *,
         system_profile: dict[str, Any] | None = None,
+        run_context: RunContext | None = None,
+        target_json: Mapping[str, Any] | None = None,
         resume_run_id: str | None = None,
     ) -> None:
+        if run_context is not None and target_json is not None:
+            raise ValueError("pass either run_context or target_json, not both")
         if store.database != spec.database.resolve():
             raise ValueError(
                 f"run database {spec.database.resolve()} does not match store {store.database}"
@@ -59,15 +65,35 @@ class RunSession:
             self._prior_duration_s = 0.0
             self._artifacts = {}
         self.artifact_dir = prepare_artifact_dir(store.database, self.run_id)
-        if system_profile is not None:
-            self.system_profile = system_profile
-        elif resume_state is not None:
-            self.system_profile = dict(resume_state["system_json"])
+        context_system_profile = (
+            run_context.to_executor_system_json() if run_context is not None else None
+        )
+        if run_context is not None:
+            context_target_json = run_context.to_target_json()
+        elif target_json is not None:
+            context_target_json = RunContext(target_json=target_json).to_target_json()
         else:
-            try:
-                self.system_profile = get_system_profile()
-            except Exception as exc:  # noqa: BLE001 - metadata must not prevent a benchmark
-                self.system_profile = {"capture_error": f"{type(exc).__name__}: {exc}"}
+            context_target_json = None
+        provided_system_profile = (
+            system_profile if system_profile is not None else context_system_profile
+        )
+        if resume_state is not None:
+            self._validate_resume_provenance(
+                resume_state,
+                system_profile=provided_system_profile,
+                target_json=context_target_json,
+            )
+            self.system_profile = dict(resume_state["system_json"])
+            self.target_json = dict(resume_state["target_json"])
+        else:
+            if provided_system_profile is not None:
+                self.system_profile = dict(provided_system_profile)
+            else:
+                try:
+                    self.system_profile = get_system_profile()
+                except Exception as exc:  # noqa: BLE001 - metadata must not prevent a benchmark
+                    self.system_profile = {"capture_error": f"{type(exc).__name__}: {exc}"}
+            self.target_json = context_target_json or {}
         self._started_monotonic = time.perf_counter()
         self._claimed_artifact_roles: set[str] = set()
         self._completed: CompletedRun | None = None
@@ -81,6 +107,14 @@ class RunSession:
     def completed(self) -> CompletedRun | None:
         return self._completed
 
+    @property
+    def run_context(self) -> RunContext:
+        """Return an isolated context suitable for propagating to child runs."""
+        return RunContext(
+            target_json=self.target_json,
+            executor_system_json=self.system_profile,
+        )
+
     def __enter__(self) -> RunSession:
         if self._entered:
             raise RuntimeError(f"run {self.run_id} session has already been entered")
@@ -92,6 +126,19 @@ class RunSession:
             duration_s=self._prior_duration_s,
         )
         return self
+
+    def set_target_json(self, target_json: Mapping[str, Any]) -> None:
+        """Attach resolved target metadata, persisting it when the run is active."""
+        if self._completed is not None:
+            raise RuntimeError(f"run {self.run_id} has already completed")
+        self.target_json = RunContext(target_json=target_json).to_target_json()
+        if self._entered:
+            self._record(
+                status="running",
+                metrics={},
+                error=None,
+                duration_s=self.elapsed_s,
+            )
 
     def artifact(self, role: str, filename: str, media_type: str) -> Path:
         if not self._entered:
@@ -180,6 +227,23 @@ class RunSession:
                 f"run {state['run_id']} has unsupported resume status {state['status']!r}"
             )
 
+    def _validate_resume_provenance(
+        self,
+        state: dict[str, Any],
+        *,
+        system_profile: dict[str, Any] | None,
+        target_json: dict[str, Any] | None,
+    ) -> None:
+        if system_profile is not None and host_identity(system_profile) != host_identity(
+            state["system_json"]
+        ):
+            raise RuntimeError("resume executor host does not match the stored run")
+        if target_json is not None:
+            incoming = RunContext(target_json=target_json).target_identity_json()
+            stored = RunContext(target_json=state["target_json"]).target_identity_json()
+            if incoming != stored:
+                raise RuntimeError("resume target identity does not match the stored run")
+
     def _record(
         self,
         *,
@@ -211,6 +275,7 @@ class RunSession:
                 config_json=self.spec.config_json,
                 metrics=metrics,
                 system_json=self.system_profile,
+                target_json=self.target_json,
                 artifacts=artifacts,
                 llama_version=llama_version,
                 error=error,

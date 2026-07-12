@@ -2,6 +2,10 @@
 
 Small, local-first experiment harness for refining local LLM serving choices across llama.cpp, Ollama, MLX, and other OpenAI-compatible endpoints.
 
+Remote OpenAI-compatible targets, including DGX Spark running vLLM, support
+read-only SSH system inventory, deterministic served-model discovery, and
+separate client/server attribution. See [`docs/dgx-spark.md`](docs/dgx-spark.md).
+
 It gives you a `llm-refinery` command that can:
 
 - expand YAML sweep files into concrete `llama bench` / `llama server` commands
@@ -232,7 +236,7 @@ Important notes:
 - `bench.omit_params` / `server.omit_params` remove shared flags for one command type.
 - Snake-case keys become llama.cpp kebab-case flags. Example: `ctx_size` -> `--ctx-size`.
 - Boolean `true` values become flags. Boolean `false` values are omitted.
-- Bench, lm-eval, HTTP-load, agent-eval, DABStep, and suite runs record structured host metadata in `runs.system_json` for cross-machine history: macOS version, hardware model, chip/CPU fields when available, memory size, Python path/version, project version, and git head/dirty state. `llm-refinery compare --param system.hardware.model --param system.hardware.memory_gb` can display it.
+- Bench, lm-eval, HTTP-load, agent-eval, DABStep, and suite runs record structured executor metadata in `runs.system_json`: OS, hardware model, chip/CPU fields, memory, Python, project version, and git state. Remote suites record the serving host, service, model, and topology separately in `runs.target_json`. `llm-refinery compare --param executor.hardware.model --param target.host.profile.hardware.model` can display both.
 - Linux/DGX profiles also capture OS/DMI, NVIDIA GPU/driver, CUDA runtime/toolkit, and
   DGX release metadata best-effort. A hashed machine fingerprint keeps identical configs
   from a Mac and DGX Spark as distinct comparison rows while collapsing reruns only on

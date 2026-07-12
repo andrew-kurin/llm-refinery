@@ -17,6 +17,26 @@ def test_json_headers_adds_bearer_token(monkeypatch):
     }
 
 
+def test_json_headers_honors_case_insensitive_explicit_headers(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "environment-secret")
+
+    headers = json_headers(
+        {
+            "authorization": "Static credential",
+            "content-type": "application/custom+json",
+            "accept": "application/problem+json",
+        },
+        api_key_env="OPENAI_API_KEY",
+    )
+
+    assert headers == {
+        "authorization": "Static credential",
+        "content-type": "application/custom+json",
+        "accept": "application/problem+json",
+        "User-Agent": DEFAULT_USER_AGENT,
+    }
+
+
 def test_openai_choice_text_collects_content_and_reasoning_fields():
     assert (
         openai_choice_text(

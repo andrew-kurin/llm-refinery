@@ -1,0 +1,33 @@
+schema_version: 1
+
+target:
+  name: dgx-spark
+
+  # OpenSSH resolves this using ~/.ssh/config. Override it with
+  # --ssh-destination when another user calls the machine something else.
+  host:
+    access: ssh
+    destination: dgx
+    connect_timeout_s: 5
+    command_timeout_s: 20
+    required: true
+
+  # This is the data-plane address used by the benchmark client. It need not
+  # match the SSH alias above.
+  endpoint:
+    name: dgx-spark-vllm
+    protocol: openai_chat
+    base_url: http://aitopatom-41de.local:8000/v1
+    # api_key_env: VLLM_API_KEY
+
+  model:
+    # Select automatically only when /v1/models returns exactly one model.
+    selection: single
+    # For RULER or aliases/local model paths, set a tokenizer accessible from
+    # the machine running lm-eval:
+    # tokenizer: organization/model-tokenizer
+
+  discovery:
+    service_required: true
+    server_info: optional
+    metrics: true

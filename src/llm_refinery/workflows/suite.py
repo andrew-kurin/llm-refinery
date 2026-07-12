@@ -2,20 +2,26 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.table import Table
 
+from llm_refinery.application.run_context import RunContext
 from llm_refinery.application.run_session import RunSession
+from llm_refinery.application.target_discovery import TargetResolver
 from llm_refinery.benchmarks.http_load.config import load_http_load_config
 from llm_refinery.benchmarks.http_load.runner import run_http_load
 from llm_refinery.benchmarks.lm_eval.config import LmEvalConfig
 from llm_refinery.benchmarks.lm_eval.runner import run_lm_eval
 from llm_refinery.compare import build_compare_rows, build_compare_table_rows
+from llm_refinery.core.config import ConfigError
+from llm_refinery.core.endpoints import Endpoint
 from llm_refinery.core.runs import CompletedRun, RunSpec
+from llm_refinery.core.targets import ResolvedTarget
 from llm_refinery.storage.duckdb import ResultStore
 from llm_refinery.utils.sanity import run_api_sanity_check
 from llm_refinery.utils.system import get_system_snapshot, is_port_listening
@@ -42,6 +48,7 @@ class BenchmarkSuiteWorkflow:
         port_listener: Callable[[int], bool] = is_port_listening,
         sanity_checker: Callable[..., dict[str, Any]] = run_api_sanity_check,
         system_snapshot: Callable[[], str] = get_system_snapshot,
+        target_resolver: TargetResolver | None = None,
     ) -> None:
         self.config = config
         self.console = console or Console()
@@ -50,6 +57,10 @@ class BenchmarkSuiteWorkflow:
         self.port_listener = port_listener
         self.sanity_checker = sanity_checker
         self.system_snapshot = system_snapshot
+        self.target_resolver = target_resolver or TargetResolver()
+        self._endpoint: Endpoint | None = config.endpoint
+        self._resolved_target: ResolvedTarget | None = None
+        self._run_context: RunContext | None = None
 
     def execute(self) -> SuiteResult:
         command = f"llm-refinery suite {self.config.name}"
@@ -66,9 +77,63 @@ class BenchmarkSuiteWorkflow:
             before_path = run.artifact("system_before", "system-before.txt", "text/plain")
             after_path = run.artifact("system_after", "system-after.txt", "text/plain")
             preflight_path = run.artifact("preflight", "preflight.json", "application/json")
+            discovery_path = None
+            server_before_path = None
+            server_after_path = None
+            metrics_before_path = None
+            metrics_after_path = None
+            target_spec = self.config.target
+            if target_spec is not None:
+                discovery_path = run.artifact(
+                    "target_discovery", "target-discovery.json", "application/json"
+                )
+                server_before_path = run.artifact(
+                    "server_before", "server-before.json", "application/json"
+                )
+                server_after_path = run.artifact(
+                    "server_after", "server-after.json", "application/json"
+                )
             try:
                 before_snapshot = self.system_snapshot()
                 before_path.write_text(before_snapshot, encoding="utf-8")
+                if target_spec is not None:
+                    inspection = self.target_resolver.inspect(
+                        target_spec,
+                        allow_service_unavailable=True,
+                    )
+                    assert discovery_path is not None and server_before_path is not None
+                    _write_json(discovery_path, inspection.safe_json())
+                    _write_json(
+                        server_before_path,
+                        inspection.host.profile if inspection.host is not None else {
+                            "capture_error": "target host inventory unavailable"
+                        },
+                    )
+                    run.set_target_json(inspection.safe_json())
+                    if inspection.resolved is None:
+                        detail = "; ".join(inspection.errors) or "target is unavailable"
+                        raise RuntimeError(
+                            f"could not resolve target {target_spec.name!r}: {detail}"
+                        )
+                    self._resolved_target = inspection.resolved
+                    self._endpoint = inspection.resolved.endpoint
+                    self._validate_resolved_target(inspection.resolved)
+                    if target_spec.discovery.metrics:
+                        metrics_before_path = run.artifact(
+                            "vllm_metrics_before",
+                            "vllm-metrics-before.prom",
+                            "text/plain",
+                        )
+                        metrics_after_path = run.artifact(
+                            "vllm_metrics_after",
+                            "vllm-metrics-after.prom",
+                            "text/plain",
+                        )
+                        _write_text_observation(
+                            metrics_before_path,
+                            lambda: self.target_resolver.metrics(target_spec),
+                        )
+                self._run_context = run.run_context
                 preflight_result = self.preflight(before_snapshot)
                 preflight_path.write_text(
                     json.dumps(preflight_result, indent=2, sort_keys=True) + "\n",
@@ -77,7 +142,27 @@ class BenchmarkSuiteWorkflow:
                 children.extend(self.run_quality(store, parent_run_id=run.run_id))
                 children.extend(self.run_load(store, parent_run_id=run.run_id))
             finally:
-                after_snapshot = self.system_snapshot()
+                if target_spec is not None and server_after_path is not None:
+                    try:
+                        after_profile = self.target_resolver.snapshot_host(
+                            target_spec
+                        ).profile
+                    except Exception as exc:  # noqa: BLE001 - retain best-effort telemetry
+                        after_profile = {"capture_error": f"{type(exc).__name__}: {exc}"}
+                    _write_json(server_after_path, after_profile)
+                if (
+                    target_spec is not None
+                    and metrics_after_path is not None
+                    and self._resolved_target is not None
+                ):
+                    _write_text_observation(
+                        metrics_after_path,
+                        lambda: self.target_resolver.metrics(target_spec),
+                    )
+                try:
+                    after_snapshot = self.system_snapshot()
+                except Exception as exc:  # noqa: BLE001 - retain the primary suite outcome
+                    after_snapshot = f"capture_error: {type(exc).__name__}: {exc}"
                 after_path.write_text(after_snapshot, encoding="utf-8")
                 self._log("Memory/process snapshot after")
                 self.console.print(after_snapshot)
@@ -101,7 +186,7 @@ class BenchmarkSuiteWorkflow:
         if not config.enabled:
             return {"enabled": False}
         self._log("Performing preflight checks...")
-        endpoint = self.config.endpoint
+        endpoint = self._effective_endpoint()
         parsed = urlparse(endpoint.base_url)
         endpoint_port = _port_from_url(endpoint.base_url)
         if parsed.hostname in {"127.0.0.1", "localhost", "::1"} and not self.port_listener(
@@ -111,7 +196,7 @@ class BenchmarkSuiteWorkflow:
                 f"no model server listening on :{endpoint_port}; start it first, then rerun"
             )
 
-        if config.require_clean:
+        if config.require_clean and parsed.hostname in {"127.0.0.1", "localhost", "::1"}:
             for port in config.forbidden_ports:
                 if port != endpoint_port and self.port_listener(port):
                     raise RuntimeError(
@@ -153,7 +238,10 @@ class BenchmarkSuiteWorkflow:
         quality = self.config.quality
         if not quality.enabled:
             return []
-        endpoint = self.config.endpoint
+        endpoint = self._effective_endpoint()
+        tokenizer = quality.tokenizer
+        if tokenizer is None and self._resolved_target is not None:
+            tokenizer = self._resolved_target.tokenizer
         self._log(f"Running lm-eval quality (tasks={quality.tasks}, limit={quality.limit})")
         lm_config = LmEvalConfig(
             target=endpoint.name,
@@ -161,7 +249,7 @@ class BenchmarkSuiteWorkflow:
             tasks=quality.tasks,
             max_length=quality.max_length,
             eos_string=quality.eos_string,
-            tokenizer=quality.tokenizer,
+            tokenizer=tokenizer,
             metadata=quality.metadata,
             num_fewshot=quality.num_fewshot,
             gen_kwargs=quality.gen_kwargs,
@@ -179,6 +267,7 @@ class BenchmarkSuiteWorkflow:
             lm_config,
             parent_run_id=parent_run_id,
             store=store,
+            run_context=self._run_context,
         )
 
     def run_load(self, store: ResultStore, *, parent_run_id: str) -> list[CompletedRun]:
@@ -187,7 +276,13 @@ class BenchmarkSuiteWorkflow:
             return []
         assert step.config is not None
         http_config = load_http_load_config(step.config)
-        targets = step.targets or (self.config.endpoint.name,)
+        if len(step.targets) > 1:
+            raise ConfigError("suite HTTP load supports one resolved target")
+        endpoint = self._effective_endpoint()
+        target_name = step.targets[0] if step.targets else endpoint.name
+        effective_target = replace(endpoint, name=target_name)
+        http_config = replace(http_config, targets=[effective_target])
+        targets = (target_name,)
         self._log(f"Running HTTP load (targets={','.join(targets)})")
         outcomes = self.http_load_runner(
             http_config,
@@ -196,9 +291,51 @@ class BenchmarkSuiteWorkflow:
             database_override=self.config.database,
             parent_run_id=parent_run_id,
             store=store,
+            run_context=self._run_context,
         )
         self._print_http_comparison(store, http_config.name)
         return outcomes
+
+    def _effective_endpoint(self) -> Endpoint:
+        if self._endpoint is None:
+            raise RuntimeError("suite target has not been resolved")
+        return self._endpoint
+
+    def _validate_resolved_target(self, target: ResolvedTarget) -> None:
+        max_model_len = target.model.max_model_len
+        if max_model_len is None:
+            return
+        quality = self.config.quality
+        if quality.enabled and quality.max_length > max_model_len:
+            raise ConfigError(
+                f"quality.max_length {quality.max_length} exceeds served model limit "
+                f"{max_model_len}"
+            )
+        if not self.config.http_load.enabled or self.config.http_load.config is None:
+            return
+        http_config = load_http_load_config(self.config.http_load.config)
+        wanted_scenarios = set(self.config.http_load.scenarios)
+        scenarios = [
+            scenario
+            for scenario in http_config.scenarios
+            if not wanted_scenarios or scenario.name in wanted_scenarios
+        ]
+        missing_scenarios = wanted_scenarios - {scenario.name for scenario in scenarios}
+        if missing_scenarios:
+            raise ConfigError(
+                "unknown HTTP load scenario(s): "
+                + ", ".join(sorted(missing_scenarios))
+            )
+        requested_max = max(
+            token_count
+            for scenario in scenarios
+            for token_count in scenario.max_tokens
+        )
+        if requested_max > max_model_len:
+            raise ConfigError(
+                f"HTTP load max_tokens {requested_max} exceeds served model limit "
+                f"{max_model_len}"
+            )
 
     def _print_http_comparison(self, store: ResultStore, suite_name: str) -> None:
         runs = [run for run in store.comparison_runs() if run["suite"] == suite_name]
@@ -237,3 +374,15 @@ def _port_from_url(url: str) -> int:
     if parsed.scheme == "https":
         return 443
     return 80
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _write_text_observation(path: Path, capture: Callable[[], str]) -> None:
+    try:
+        value = capture()
+    except Exception as exc:  # noqa: BLE001 - telemetry must not fail a benchmark
+        value = f"# capture_error: {type(exc).__name__}: {exc}\n"
+    path.write_text(value, encoding="utf-8")

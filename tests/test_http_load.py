@@ -1,5 +1,11 @@
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import httpx
 import pytest
 
+from llm_refinery.application.run_context import RunContext
 from llm_refinery.benchmarks.http_load.config import (
     HttpLoadConfig,
     HttpScenario,
@@ -10,8 +16,10 @@ from llm_refinery.benchmarks.http_load.models import RequestResult
 from llm_refinery.benchmarks.http_load.runner import HttpLoadFailed, run_http_load
 from llm_refinery.benchmarks.http_load.transport import (
     messages_for_scenario,
+    pooled_http_client,
     read_ollama_stream,
     read_openai_stream,
+    run_requests,
     with_check_result,
 )
 from llm_refinery.core.config import ConfigError
@@ -155,8 +163,11 @@ def test_http_load_runner_records_samples_and_typed_artifacts(tmp_path, monkeypa
     )
     calls = []
 
-    def fake_run_requests(_trial, *, count, index_offset=0):
+    clients: list[httpx.Client] = []
+
+    def fake_run_requests(_trial, *, count, index_offset=0, client=None):
         calls.append((count, index_offset))
+        clients.append(client)
         return [
             RequestResult(
                 **{
@@ -172,7 +183,15 @@ def test_http_load_runner_records_samples_and_typed_artifacts(tmp_path, monkeypa
         fake_run_requests,
     )
 
-    outcomes = run_http_load(config)
+    context = RunContext(
+        target_json={
+            "host": {"profile": {"host_fingerprint": "spark"}},
+            "service": {"implementation": "vllm", "version": "0.10.0"},
+            "model": {"id": "local"},
+            "topology": {"measurement_scope": "remote_client_to_server"},
+        }
+    )
+    outcomes = run_http_load(config, run_context=context)
 
     assert len(outcomes) == 1
     with ResultStore(config.database) as store:
@@ -180,8 +199,11 @@ def test_http_load_runner_records_samples_and_typed_artifacts(tmp_path, monkeypa
         samples = store.samples_for_run(run["run_id"])
     assert set(run["artifacts"]) == {"errors", "measurement", "responses"}
     assert calls == [(1, 0), (1, 0)]
+    assert clients[0] is clients[1]
+    assert clients[0].is_closed
     assert run["metrics"]["effective_warmup_requests"] == 1
     assert run["metrics"]["measured_request_count_recommendation_met"] == 0
+    assert run["config_json"]["execution_target"]["model"]["id"] == "local"
     assert len(samples) == 1
     assert samples[0]["metrics"] == {"latency_s": 1.0}
 
@@ -256,6 +278,7 @@ def test_summarize_request_results_calculates_latency_and_throughput_metrics():
 def test_read_openai_stream_extracts_content_text_and_reasoning_content():
     response = iter(
         [
+            b'data: {"choices":[{"delta":{"reasoning":"current "}}]}\n',
             b'data: {"choices":[{"delta":{"reasoning_content":"think "}}]}\n',
             b'data: {"choices":[{"delta":{"thinking":"more "}}]}\n',
             b'data: {"choices":[{"text":"hello "}]}\n',
@@ -267,11 +290,11 @@ def test_read_openai_stream_extracts_content_text_and_reasoning_content():
 
     result = read_openai_stream(0, response, 0.0, 200)
 
-    assert result.response_text == "think more hello world"
-    assert result.reasoning_response_text == "think more "
+    assert result.response_text == "current think more hello world"
+    assert result.reasoning_response_text == "current think more "
     assert result.visible_response_text == "hello world"
-    assert result.completion_chars == len("think more hello world")
-    assert result.reasoning_completion_chars == len("think more ")
+    assert result.completion_chars == len("current think more hello world")
+    assert result.reasoning_completion_chars == len("current think more ")
     assert result.visible_completion_chars == len("hello world")
     assert result.prompt_tokens == 3
     assert result.completion_tokens == 4
@@ -280,7 +303,127 @@ def test_read_openai_stream_extracts_content_text_and_reasoning_content():
     assert result.visible_ttft_s is not None
     assert result.reasoning_ttft_s <= result.visible_ttft_s
     assert result.tpot_s is not None
-    assert len(result.itl_s) == 3
+    assert len(result.itl_s) == 4
+
+
+def test_run_requests_shares_and_closes_one_connection_pool(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "model": "local",
+                }
+            ],
+            "scenarios": [
+                {
+                    "name": "pooled",
+                    "prompt": "hello",
+                    "requests": 4,
+                    "concurrency": 2,
+                }
+            ],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    clients: list[httpx.Client] = []
+
+    def fake_execute(_trial, index, *, request_nonce=None, client=None):
+        clients.append(client)
+        return RequestResult(
+            index=index,
+            ok=True,
+            status_code=200,
+            latency_s=0.1,
+            response_text="ok",
+            visible_response_text="ok",
+        )
+
+    monkeypatch.setattr(
+        "llm_refinery.benchmarks.http_load.transport.execute_http_request",
+        fake_execute,
+    )
+
+    results = run_requests(trial, count=4)
+
+    assert [result.index for result in results] == [0, 1, 2, 3]
+    assert all(client is clients[0] for client in clients)
+    assert clients[0].is_closed
+
+
+def test_connection_pool_reuses_http11_connections_across_batches():
+    connections: set[tuple[str, int]] = set()
+    request_count = 0
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            nonlocal request_count
+            request_count += 1
+            connections.add(self.client_address)
+            content_length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(content_length)
+            body = json.dumps(
+                {
+                    "choices": [
+                        {"message": {"content": "ok"}, "finish_reason": "stop"}
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *args):
+            del args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        config = HttpLoadConfig.from_mapping(
+            {
+                "targets": [
+                    {
+                        "name": "local",
+                        "protocol": "openai_chat",
+                        "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+                        "model": "local",
+                    }
+                ],
+                "scenarios": [
+                    {
+                        "name": "pooled",
+                        "prompt": "hello",
+                        "requests": 4,
+                        "concurrency": 2,
+                        "stream": False,
+                    }
+                ],
+            }
+        )
+        trial = expand_http_load_trials(config)[0]
+
+        with pooled_http_client(trial) as client:
+            assert all(result.ok for result in run_requests(trial, count=2, client=client))
+            assert all(result.ok for result in run_requests(trial, count=4, client=client))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert request_count == 6
+    assert 1 <= len(connections) <= trial.concurrency
 
 
 def test_read_ollama_stream_extracts_thinking_content():
@@ -390,7 +533,7 @@ def test_failed_correctness_result_fails_the_http_trial(tmp_path, monkeypatch):
 
     calls = 0
 
-    def fake_run_requests(_trial, *, count, index_offset=0):
+    def fake_run_requests(_trial, *, count, index_offset=0, client=None):
         nonlocal calls
         calls += 1
         return [good] if calls == 1 else [failed]

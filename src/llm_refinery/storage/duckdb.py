@@ -36,8 +36,8 @@ class ResultStore:
                     run_id, benchmark_kind, spec_hash, parent_run_id, schema_version,
                     suite, trial_name, status, started_at, ended_at, duration_s,
                     command, cwd, llama_version, config_json, metrics_json,
-                    system_json, error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    system_json, target_json, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     record.run_id,
@@ -57,6 +57,7 @@ class ResultStore:
                     _json_dump(record.config_json),
                     _json_dump(record.metrics),
                     _json_dump(record.system_json),
+                    _json_dump(record.target_json),
                     record.error,
                 ],
             )
@@ -131,7 +132,7 @@ class ResultStore:
         row = self.connection.execute(
             """
             SELECT benchmark_kind, spec_hash, parent_run_id, schema_version, trial_name,
-                   status, started_at, duration_s, system_json
+                   status, started_at, duration_s, system_json, target_json
             FROM runs
             WHERE run_id = ?
             """,
@@ -150,6 +151,7 @@ class ResultStore:
             "started_at": row[6],
             "duration_s": float(row[7]),
             "system_json": json.loads(row[8] or "{}"),
+            "target_json": json.loads(row[9] or "{}"),
             "artifacts": self.artifacts_for_runs([run_id]).get(run_id, {}),
         }
 
@@ -226,7 +228,7 @@ class ResultStore:
             SELECT
                 run_id, benchmark_kind, spec_hash, parent_run_id, schema_version,
                 suite, trial_name, status, started_at, ended_at, duration_s,
-                command, cwd, llama_version, config_json, system_json, error
+                command, cwd, llama_version, config_json, system_json, target_json, error
             FROM runs
             {status_filter}
             ORDER BY ended_at DESC
@@ -255,7 +257,8 @@ class ResultStore:
                 "llama_version": row[13],
                 "config_json": json.loads(row[14] or "{}"),
                 "system_json": json.loads(row[15] or "{}"),
-                "error": row[16],
+                "target_json": json.loads(row[16] or "{}"),
+                "error": row[17],
                 "metrics": metrics_by_run_id.get(row[0], {}),
                 "artifacts": artifacts_by_run_id.get(row[0], {}),
             }

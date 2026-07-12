@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import time
-import urllib.error
-import urllib.request
 import uuid
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
 from typing import Any
+
+import httpx
 
 from llm_refinery.benchmarks.http_load.config import HttpLoadTrial, HttpScenario
 from llm_refinery.benchmarks.http_load.models import RequestResult
@@ -21,6 +23,7 @@ def run_requests(
     count: int,
     index_offset: int = 0,
     request_nonce: str | None = None,
+    client: httpx.Client | None = None,
 ) -> list[RequestResult]:
     """Run one request batch.
 
@@ -29,7 +32,12 @@ def run_requests(
     """
     results: list[RequestResult] = []
     nonce = request_nonce or uuid.uuid4().hex
-    with ThreadPoolExecutor(max_workers=trial.concurrency) as executor:
+    client_context: AbstractContextManager[httpx.Client]
+    client_context = nullcontext(client) if client is not None else pooled_http_client(trial)
+    with (
+        client_context as active_client,
+        ThreadPoolExecutor(max_workers=trial.concurrency) as executor,
+    ):
         futures: dict[Any, tuple[int, float]] = {}
         for request_index in range(index_offset, index_offset + count):
             submitted_at = time.perf_counter()
@@ -38,6 +46,7 @@ def run_requests(
                 trial,
                 request_index,
                 request_nonce=nonce,
+                client=active_client,
             )
             futures[future] = (request_index, submitted_at)
         for future in as_completed(futures):
@@ -57,8 +66,34 @@ def run_requests(
     return sorted(results, key=lambda result: result.index)
 
 
+@contextmanager
+def pooled_http_client(trial: HttpLoadTrial) -> Iterator[httpx.Client]:
+    """Own one thread-safe connection pool for a complete HTTP load trial."""
+    client = _new_http_client(trial)
+    try:
+        yield client
+    finally:
+        client.close()
+
+
+def _new_http_client(trial: HttpLoadTrial) -> httpx.Client:
+    return httpx.Client(
+        limits=httpx.Limits(
+            max_connections=trial.concurrency,
+            max_keepalive_connections=trial.concurrency,
+            keepalive_expiry=None,
+        ),
+        follow_redirects=True,
+        trust_env=False,
+    )
+
+
 def execute_http_request(
-    trial: HttpLoadTrial, index: int, *, request_nonce: str | None = None
+    trial: HttpLoadTrial,
+    index: int,
+    *,
+    request_nonce: str | None = None,
+    client: httpx.Client | None = None,
 ) -> RequestResult:
     executors = {
         OPENAI_CHAT: execute_openai_request,
@@ -67,11 +102,15 @@ def execute_http_request(
     executor = executors.get(trial.target.protocol)
     if executor is None:
         raise ValueError(f"unsupported chat protocol: {trial.target.protocol}")
-    return executor(trial, index, request_nonce=request_nonce)
+    return executor(trial, index, request_nonce=request_nonce, client=client)
 
 
 def execute_openai_request(
-    trial: HttpLoadTrial, index: int, *, request_nonce: str | None = None
+    trial: HttpLoadTrial,
+    index: int,
+    *,
+    request_nonce: str | None = None,
+    client: httpx.Client | None = None,
 ) -> RequestResult:
     scenario = trial.scenario
     payload: dict[str, Any] = {
@@ -93,11 +132,16 @@ def execute_openai_request(
         payload=payload,
         stream_reader=read_openai_stream if scenario.stream else None,
         body_reader=read_openai_body,
+        client=client,
     )
 
 
 def execute_ollama_request(
-    trial: HttpLoadTrial, index: int, *, request_nonce: str | None = None
+    trial: HttpLoadTrial,
+    index: int,
+    *,
+    request_nonce: str | None = None,
+    client: httpx.Client | None = None,
 ) -> RequestResult:
     scenario = trial.scenario
     options: dict[str, Any] = {
@@ -120,6 +164,7 @@ def execute_ollama_request(
         payload=payload,
         stream_reader=read_ollama_stream if scenario.stream else None,
         body_reader=read_ollama_body,
+        client=client,
     )
 
 
@@ -131,36 +176,39 @@ def post_json(
     payload: dict[str, Any],
     stream_reader: Any,
     body_reader: Any,
+    client: httpx.Client | None = None,
 ) -> RequestResult:
     start = time.perf_counter()
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers=headers_for_target(trial.target),
-        method="POST",
-    )
+    client_context: AbstractContextManager[httpx.Client]
+    client_context = nullcontext(client) if client is not None else pooled_http_client(trial)
     try:
-        with urllib.request.urlopen(  # noqa: S310 - user-configured local/server URL
-            request,
-            timeout=trial.scenario.timeout_s,
-        ) as response:
-            status_code = response.status
+        with (
+            client_context as active_client,
+            active_client.stream(
+                "POST",
+                url,
+                content=json.dumps(payload).encode("utf-8"),
+                headers=headers_for_target(trial.target),
+                timeout=trial.scenario.timeout_s,
+            ) as response,
+        ):
+            status_code = response.status_code
+            if status_code >= 400:
+                body = response.read().decode("utf-8", errors="replace")[-1000:]
+                return RequestResult(
+                    index=index,
+                    ok=False,
+                    status_code=status_code,
+                    latency_s=time.perf_counter() - start,
+                    error=f"HTTP {status_code}: {body}",
+                )
             if stream_reader is not None:
-                result = stream_reader(index, response, start, status_code)
+                result = stream_reader(index, response.iter_lines(), start, status_code)
             else:
                 body = response.read().decode("utf-8", errors="replace")
                 result = body_reader(index, body, start, status_code)
             return with_check_result(result, trial.scenario)
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")[-1000:]
-        return RequestResult(
-            index=index,
-            ok=False,
-            status_code=exc.code,
-            latency_s=time.perf_counter() - start,
-            error=f"HTTP {exc.code}: {body}",
-        )
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (httpx.HTTPError, TimeoutError, OSError) as exc:
         return RequestResult(
             index=index,
             ok=False,
@@ -185,7 +233,7 @@ def read_openai_stream(
     reasoning_ttft_s: float | None = None
     usage: dict[str, Any] | None = None
     for raw_line in response:
-        line = raw_line.decode("utf-8", errors="replace").strip()
+        line = _line_text(raw_line)
         if not line or not line.startswith("data:"):
             continue
         data = line.removeprefix("data:").strip()
@@ -288,7 +336,7 @@ def read_ollama_stream(
     reasoning_ttft_s: float | None = None
     final: dict[str, Any] = {}
     for raw_line in response:
-        line = raw_line.decode("utf-8", errors="replace").strip()
+        line = _line_text(raw_line)
         if not line:
             continue
         chunk = json.loads(line)
@@ -428,13 +476,19 @@ def _openai_choice_parts(choice: dict[str, Any]) -> tuple[str, str]:
     for mapping in (choice.get("delta"), choice.get("message"), choice):
         if not isinstance(mapping, dict):
             continue
-        for key in ("reasoning_content", "thinking"):
+        for key in ("reasoning", "reasoning_content", "thinking"):
             if mapping.get(key):
                 reasoning_parts.append(str(mapping[key]))
         for key in ("content", "text"):
             if mapping.get(key):
                 visible_parts.append(str(mapping[key]))
     return "".join(visible_parts), "".join(reasoning_parts)
+
+
+def _line_text(raw_line: object) -> str:
+    if isinstance(raw_line, bytes):
+        return raw_line.decode("utf-8", errors="replace").strip()
+    return str(raw_line).strip()
 
 
 def _interarrival_times(event_times_s: list[float]) -> tuple[float, ...]:

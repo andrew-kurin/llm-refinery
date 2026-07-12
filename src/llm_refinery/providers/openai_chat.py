@@ -90,18 +90,29 @@ def json_headers(
     api_key_env: str | None = None,
     accept: bool = True,
 ) -> dict[str, str]:
-    resolved = {
+    resolved: dict[str, str] = {
         "Content-Type": "application/json",
         "User-Agent": DEFAULT_USER_AGENT,
-        **(headers or {}),
     }
-    if accept:
-        resolved.setdefault("Accept", "application/json")
-    if api_key_env and "Authorization" not in resolved:
+    for key, value in (headers or {}).items():
+        existing = next(
+            (candidate for candidate in resolved if candidate.casefold() == key.casefold()),
+            None,
+        )
+        if existing is not None:
+            del resolved[existing]
+        resolved[key] = value
+    if accept and not has_header(resolved, "Accept"):
+        resolved["Accept"] = "application/json"
+    if api_key_env and not has_header(resolved, "Authorization"):
         token = os.environ.get(api_key_env)
         if token:
             resolved["Authorization"] = f"Bearer {token}"
     return resolved
+
+
+def has_header(headers: dict[str, str], name: str) -> bool:
+    return any(key.casefold() == name.casefold() for key in headers)
 
 
 def post_json_body(

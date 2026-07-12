@@ -12,6 +12,7 @@ from llm_refinery.core.config import (
     reject_unknown_keys,
 )
 from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
+from llm_refinery.core.targets import TargetSpec, load_target_spec
 
 
 @dataclass(frozen=True)
@@ -217,40 +218,81 @@ class PreflightStep:
 class SuiteConfig:
     name: str
     database: Path
-    endpoint: Endpoint
+    endpoint: Endpoint | None
+    target: TargetSpec | None = None
+    schema_version: int = 1
     quality: QualityStep = QualityStep()
     http_load: HttpLoadStep = HttpLoadStep()
     preflight: PreflightStep = PreflightStep()
     source_path: Path | None = None
 
+    def __post_init__(self) -> None:
+        if self.schema_version not in {1, 2}:
+            raise ConfigError(
+                f"unsupported suite schema_version {self.schema_version}; expected 1 or 2"
+            )
+        if (self.endpoint is None) == (self.target is None):
+            raise ConfigError("suite requires exactly one of 'endpoint' or 'target'")
+        if self.target is not None and self.schema_version < 2:
+            raise ConfigError("suite target discovery requires schema_version: 2")
+
     @classmethod
     def from_mapping(cls, raw: dict[str, Any], source_path: Path | None = None) -> SuiteConfig:
         reject_unknown_keys(
             raw,
-            {"name", "database", "endpoint", "quality", "http_load", "preflight"},
+            {
+                "schema_version",
+                "name",
+                "database",
+                "endpoint",
+                "target",
+                "quality",
+                "http_load",
+                "preflight",
+            },
             context="suite configuration",
         )
-        endpoint_value = raw.get("endpoint") or {
-            "name": "local",
-            "protocol": OPENAI_CHAT,
-            "base_url": "http://127.0.0.1:8080/v1",
-            "model": "local-model",
-        }
-        if not isinstance(endpoint_value, dict):
-            raise ConfigError("suite endpoint must be a mapping")
+        schema_version = int(raw.get("schema_version", 1))
+        target_value = raw.get("target")
+        endpoint_value = raw.get("endpoint")
+        if target_value is not None and endpoint_value is not None:
+            raise ConfigError("suite cannot define both 'endpoint' and 'target'")
+        if target_value is not None:
+            if isinstance(target_value, dict):
+                target = TargetSpec.from_mapping(target_value)
+            elif isinstance(target_value, str):
+                target_path = Path(target_value)
+                if source_path is not None and not target_path.is_absolute():
+                    target_path = source_path.parent / target_path
+                _resolved_path, target = load_target_spec(target_path)
+            else:
+                raise ConfigError("suite target must be a mapping or target YAML path")
+            endpoint = None
+        else:
+            endpoint_value = endpoint_value or {
+                "name": "local",
+                "protocol": OPENAI_CHAT,
+                "base_url": "http://127.0.0.1:8080/v1",
+                "model": "local-model",
+            }
+            if not isinstance(endpoint_value, dict):
+                raise ConfigError("suite endpoint must be a mapping")
+            endpoint = Endpoint.from_mapping(
+                endpoint_value,
+                context="suite endpoint",
+                allowed_protocols=frozenset({OPENAI_CHAT}),
+            )
+            target = None
         for section in ("quality", "http_load", "preflight"):
             value = raw.get(section)
             if value is not None and not isinstance(value, dict):
                 raise ConfigError(f"suite {section} must be a mapping")
-        endpoint = Endpoint.from_mapping(
-            endpoint_value,
-            context="suite endpoint",
-            allowed_protocols=frozenset({OPENAI_CHAT}),
-        )
         return cls(
             name=str(raw.get("name") or (source_path.stem if source_path else "suite")),
             database=Path(str(raw.get("database") or "results/llm_refinery.duckdb")),
             endpoint=endpoint,
+            target=target,
+            schema_version=schema_version,
             quality=QualityStep.from_mapping(raw.get("quality"), source_path=source_path),
             http_load=HttpLoadStep.from_mapping(raw.get("http_load"), source_path=source_path),
             preflight=PreflightStep.from_mapping(raw.get("preflight")),
@@ -258,14 +300,19 @@ class SuiteConfig:
         )
 
     def safe_json(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
+            "schema_version": self.schema_version,
             "name": self.name,
             "database": str(self.database),
-            "endpoint": self.endpoint.safe_json(),
             "quality": self.quality.safe_json(),
             "http_load": self.http_load.safe_json(),
             "preflight": self.preflight.safe_json(),
         }
+        if self.endpoint is not None:
+            payload["endpoint"] = self.endpoint.safe_json()
+        if self.target is not None:
+            payload["target"] = self.target.safe_json()
+        return payload
 
 
 def load_suite_config(path: str | Path) -> SuiteConfig:
