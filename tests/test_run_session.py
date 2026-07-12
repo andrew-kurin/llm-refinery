@@ -132,7 +132,12 @@ def test_run_session_can_bind_target_after_enter_and_propagate_it_on_resume(tmp_
             assert running_target is not None and "unavailable" in running_target[0]
             run.complete(status="failed", error="service unavailable")
 
-        with RunSession(store, spec, resume_run_id=run.run_id) as resumed:
+        with RunSession(
+            store,
+            spec,
+            resume_run_id=run.run_id,
+            system_profile={"hostname": "mac"},
+        ) as resumed:
             assert resumed.target_json == target_json
             assert resumed.run_context.to_executor_system_json() == {"hostname": "mac"}
             resumed.complete()
@@ -142,6 +147,105 @@ def test_run_session_can_bind_target_after_enter_and_propagate_it_on_resume(tmp_
         stored = store.comparison_runs()[0]
 
     assert stored["target_json"] == target_json
+
+
+def test_resume_captures_and_validates_current_executor_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    database = tmp_path / "runs.duckdb"
+    spec = RunSpec.create(
+        benchmark_kind="dabstep",
+        suite="suite",
+        label="suite/local",
+        command="dabstep",
+        config_json={},
+        database=database,
+    )
+
+    with ResultStore(database) as store:
+        with RunSession(
+            store,
+            spec,
+            system_profile={"hostname": "mac-one", "host_fingerprint": "mac-one"},
+        ) as run:
+            run.complete(status="failed", error="retry")
+
+        monkeypatch.setattr(
+            "llm_refinery.application.run_session.get_system_profile",
+            lambda: {"hostname": "mac-two", "host_fingerprint": "mac-two"},
+        )
+        with pytest.raises(RuntimeError, match="resume executor host"):
+            RunSession(store, spec, resume_run_id=run.run_id)
+
+
+def test_resume_preserves_stored_executor_observation_after_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    database = tmp_path / "runs.duckdb"
+    spec = RunSpec.create(
+        benchmark_kind="dabstep",
+        suite="suite",
+        label="suite/local",
+        command="dabstep",
+        config_json={},
+        database=database,
+    )
+    stored_profile = {
+        "hostname": "mac",
+        "host_fingerprint": "mac-one",
+        "captured_at": "initial",
+    }
+
+    with ResultStore(database) as store:
+        with RunSession(store, spec, system_profile=stored_profile) as run:
+            run.complete(status="failed", error="retry")
+
+        monkeypatch.setattr(
+            "llm_refinery.application.run_session.get_system_profile",
+            lambda: {
+                "hostname": "renamed-mac",
+                "host_fingerprint": "mac-one",
+                "captured_at": "resume",
+            },
+        )
+        with RunSession(store, spec, resume_run_id=run.run_id) as resumed:
+            assert resumed.system_profile == stored_profile
+            resumed.complete()
+
+        stored = store.comparison_runs()[0]
+
+    assert stored["system_json"] == stored_profile
+
+
+def test_resume_fails_closed_when_executor_capture_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    database = tmp_path / "runs.duckdb"
+    spec = RunSpec.create(
+        benchmark_kind="dabstep",
+        suite="suite",
+        label="suite/local",
+        command="dabstep",
+        config_json={},
+        database=database,
+    )
+
+    with ResultStore(database) as store:
+        with RunSession(
+            store,
+            spec,
+            system_profile={"hostname": "mac", "host_fingerprint": "mac-one"},
+        ) as run:
+            run.complete(status="failed", error="retry")
+
+        def fail_capture():
+            raise OSError("inventory unavailable")
+
+        monkeypatch.setattr(
+            "llm_refinery.application.run_session.get_system_profile", fail_capture
+        )
+        with pytest.raises(RuntimeError, match="cannot verify resume executor host"):
+            RunSession(store, spec, resume_run_id=run.run_id)
 
 
 def test_run_session_rejects_ambiguous_target_inputs(tmp_path: Path):

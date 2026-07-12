@@ -49,6 +49,11 @@ class LmEvalConfig:
             raise ConfigError("lm-eval package_spec cannot be empty")
         if any(not package.strip() for package in self.extra_packages):
             raise ConfigError("lm-eval extra package specs cannot be empty")
+        if self.tokenizer and self.model_backend == "local-chat-completions":
+            raise ConfigError(
+                "lm-eval tokenizer is not supported by the local-chat-completions "
+                "backend: it ignores client-side tokenization and token-aware truncation"
+            )
         if self.metadata is not None:
             try:
                 metadata = json.loads(self.metadata)

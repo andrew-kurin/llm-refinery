@@ -3,8 +3,10 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from llm_refinery.benchmarks.lm_eval import runner as lm_eval_runner
-from llm_refinery.benchmarks.lm_eval.command import build_lm_eval_command
+from llm_refinery.benchmarks.lm_eval.command import build_lm_eval_command, lm_eval_api_key
 from llm_refinery.benchmarks.lm_eval.config import LmEvalConfig
 from llm_refinery.benchmarks.lm_eval.parser import (
     latest_lm_eval_result,
@@ -13,6 +15,7 @@ from llm_refinery.benchmarks.lm_eval.parser import (
     parse_lm_eval_samples,
     summarize_lm_eval_samples,
 )
+from llm_refinery.core.config import ConfigError
 from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
 from llm_refinery.storage.duckdb import ResultStore
 
@@ -33,10 +36,9 @@ def test_lm_eval_command_supports_include_path_for_fixed_tasks(tmp_path):
     assert str(tmp_path) in cmd
 
 
-def test_lm_eval_command_supports_tokenizer_and_long_context_metadata(tmp_path):
+def test_lm_eval_command_supports_long_context_metadata(tmp_path):
     config = LmEvalConfig(
         tasks="ruler",
-        tokenizer="org/model-tokenizer",
         metadata='{"max_seq_lengths":[4096,8192]}',
         extra_packages=("scorer==1.2.3",),
         output_root=tmp_path,
@@ -52,11 +54,106 @@ def test_lm_eval_command_supports_tokenizer_and_long_context_metadata(tmp_path):
     )
 
     model_args = cmd[cmd.index("--model_args") + 1]
-    assert "tokenizer=org/model-tokenizer" in model_args
+    assert "tokenizer=" not in model_args
     assert "eos_string=" not in model_args
     assert cmd[cmd.index("--metadata") + 1] == '{"max_seq_lengths":[4096,8192]}'
     scorer_index = cmd.index("scorer==1.2.3")
     assert cmd[scorer_index - 1] == "--with"
+
+
+def test_lm_eval_chat_backend_rejects_ignored_tokenizer():
+    with pytest.raises(ConfigError, match="ignores client-side tokenization"):
+        LmEvalConfig(tokenizer="org/model-tokenizer")
+
+
+def test_lm_eval_completions_backend_uses_completions_url_and_tokenizer():
+    config = LmEvalConfig(
+        model_backend="local-completions",
+        tokenizer="org/model-tokenizer",
+    )
+    target = Endpoint(
+        name="remote",
+        protocol=OPENAI_CHAT,
+        model="served-model",
+        base_url="http://remote.test/v1/chat/completions",
+    )
+
+    command = build_lm_eval_command(config, target)
+    model_args = command[command.index("--model_args") + 1]
+
+    assert "base_url=http://remote.test/v1/completions" in model_args
+    assert "tokenizer=org/model-tokenizer" in model_args
+
+
+@pytest.mark.parametrize(
+    "headers, message",
+    [
+        ({"X-Tenant": "tenant-a"}, "unsupported header name.*X-Tenant"),
+        ({"Authorization": "Basic secret"}, "only a Bearer Authorization"),
+    ],
+)
+def test_lm_eval_rejects_headers_it_cannot_pass_safely(headers, message):
+    target = Endpoint(
+        name="remote",
+        protocol=OPENAI_CHAT,
+        model="served-model",
+        base_url="http://remote.test/v1",
+        headers=headers,
+    )
+
+    with pytest.raises(ConfigError, match=message):
+        build_lm_eval_command(LmEvalConfig(), target)
+
+
+def test_lm_eval_bearer_header_is_resolved_only_into_environment():
+    target = Endpoint(
+        name="remote",
+        protocol=OPENAI_CHAT,
+        model="served-model",
+        base_url="http://remote.test/v1",
+        headers={"authorization": "Bearer top-secret-token"},
+    )
+
+    command = build_lm_eval_command(LmEvalConfig(), target)
+
+    assert "top-secret-token" not in " ".join(command)
+    assert lm_eval_api_key(target, environ={}) == "top-secret-token"
+
+
+def test_lm_eval_api_key_env_must_exist_and_overrides_ambient_openai_key():
+    target = Endpoint(
+        name="remote",
+        protocol=OPENAI_CHAT,
+        model="served-model",
+        base_url="http://remote.test/v1",
+        api_key_env="VLLM_API_KEY",
+    )
+
+    assert lm_eval_api_key(
+        target,
+        environ={"VLLM_API_KEY": "target-key", "OPENAI_API_KEY": "unrelated-key"},
+    ) == "target-key"
+    with pytest.raises(ConfigError, match="VLLM_API_KEY"):
+        lm_eval_api_key(target, environ={"OPENAI_API_KEY": "unrelated-key"})
+
+
+def test_lm_eval_rejects_invalid_env_api_key_without_disclosing_it():
+    target = Endpoint(
+        name="remote",
+        protocol=OPENAI_CHAT,
+        model="served-model",
+        base_url="http://remote.test/v1",
+        api_key_env="VLLM_API_KEY",
+    )
+
+    with pytest.raises(ConfigError) as caught:
+        lm_eval_api_key(
+            target,
+            environ={"VLLM_API_KEY": "top-secret-token\nInjected: yes"},
+        )
+
+    assert "top-secret-token" not in str(caught.value)
+    assert "Injected" not in str(caught.value)
 
 
 def test_release_quality_tasks_pin_dataset_revisions():

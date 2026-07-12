@@ -1,14 +1,27 @@
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping
+
 from llm_refinery.benchmarks.lm_eval.config import LmEvalConfig
+from llm_refinery.core.config import ConfigError
 from llm_refinery.core.endpoints import Endpoint
+from llm_refinery.providers.openai_chat import validate_http_headers
+
+_BEARER_AUTHORIZATION = re.compile(r"Bearer[ \t]+([^\s]+)", re.IGNORECASE)
 
 
 def build_lm_eval_command(config: LmEvalConfig, target: Endpoint) -> list[str]:
+    validate_lm_eval_headers(target)
     output_path = str(config.output_root / target.name)
+    base_url = (
+        target.completions_url
+        if config.model_backend == "local-completions"
+        else target.chat_completions_url
+    )
     model_args_parts = [
         f"model={target.model}",
-        f"base_url={target.chat_completions_url}",
+        f"base_url={base_url}",
         f"num_concurrent={config.num_concurrent}",
         f"max_retries={config.max_retries}",
         f"max_length={config.max_length}",
@@ -64,3 +77,52 @@ def build_lm_eval_command(config: LmEvalConfig, target: Endpoint) -> list[str]:
 
     cmd.extend(["--output_path", output_path])
     return cmd
+
+
+def validate_lm_eval_headers(target: Endpoint) -> None:
+    """Reject headers that lm-eval cannot receive without exposing values in argv."""
+    validate_http_headers(target.headers)
+    authorization = [
+        value for key, value in target.headers.items() if key.casefold() == "authorization"
+    ]
+    unsupported = sorted(
+        key for key in target.headers if key.casefold() != "authorization"
+    )
+    if unsupported:
+        raise ConfigError(
+            "lm-eval does not safely support custom endpoint headers; unsupported header "
+            f"name(s): {', '.join(unsupported)}. Use api_key_env for Bearer authentication"
+        )
+    if len(authorization) > 1:
+        raise ConfigError("lm-eval endpoint defines Authorization more than once")
+    if authorization and _BEARER_AUTHORIZATION.fullmatch(authorization[0].strip()) is None:
+        raise ConfigError(
+            "lm-eval supports only a Bearer Authorization endpoint header; "
+            "prefer api_key_env so the credential stays out of configuration and argv"
+        )
+    if authorization:
+        validate_http_headers({"Authorization": authorization[0]})
+
+
+def lm_eval_api_key(
+    target: Endpoint,
+    *,
+    environ: Mapping[str, str],
+) -> str | None:
+    """Resolve target Bearer auth for the subprocess environment, never its argv."""
+    validate_lm_eval_headers(target)
+    for key, value in target.headers.items():
+        if key.casefold() == "authorization":
+            match = _BEARER_AUTHORIZATION.fullmatch(value.strip())
+            assert match is not None  # validated above
+            return match.group(1)
+    if target.api_key_env:
+        token = environ.get(target.api_key_env)
+        if not token:
+            raise ConfigError(
+                "lm-eval endpoint API key environment variable is not set: "
+                f"{target.api_key_env}"
+            )
+        validate_http_headers({"Authorization": f"Bearer {token}"})
+        return token
+    return None

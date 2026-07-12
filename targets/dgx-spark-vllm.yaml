@@ -11,6 +11,9 @@ target:
     connect_timeout_s: 5
     command_timeout_s: 20
     required: true
+    # After a trusted first inspection, pin host.profile.host_fingerprint here.
+    # This remains valid when --ssh-destination selects a different SSH alias.
+    # expected_fingerprint: host-0123456789abcdef
 
   # This is the data-plane address used by the benchmark client. It need not
   # match the SSH alias above.
@@ -23,9 +26,6 @@ target:
   model:
     # Select automatically only when /v1/models returns exactly one model.
     selection: single
-    # For RULER or aliases/local model paths, set a tokenizer accessible from
-    # the machine running lm-eval:
-    # tokenizer: organization/model-tokenizer
 
   discovery:
     service_required: true

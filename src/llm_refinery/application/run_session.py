@@ -78,6 +78,14 @@ class RunSession:
             system_profile if system_profile is not None else context_system_profile
         )
         if resume_state is not None:
+            if provided_system_profile is None:
+                try:
+                    provided_system_profile = get_system_profile()
+                except Exception as exc:  # noqa: BLE001 - resume must verify its executor
+                    raise RuntimeError(
+                        "cannot verify resume executor host because system profile "
+                        f"capture failed: {type(exc).__name__}: {exc}"
+                    ) from exc
             self._validate_resume_provenance(
                 resume_state,
                 system_profile=provided_system_profile,

@@ -25,7 +25,16 @@ from llm_refinery.core.targets import (
     load_target_spec,
 )
 from llm_refinery.probes import linux_dgx_probe
+from llm_refinery.providers import openai_discovery as openai_discovery_module
 from llm_refinery.providers.openai_discovery import OpenAIDiscoveryClient
+
+
+@pytest.fixture(autouse=True)
+def _resolve_discovery_test_hosts_to_lan(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        lambda host, port, **kwargs: [(2, 1, 6, "", ("192.168.1.41", port))],
+    )
 
 
 def _target_mapping(
@@ -48,7 +57,7 @@ def _target_mapping(
     host: dict[str, Any] = {"access": access}
     if destination is not None:
         host["destination"] = destination
-    model: dict[str, Any] = {"selection": selection, "tokenizer": "org/model-tokenizer"}
+    model: dict[str, Any] = {"selection": selection}
     if model_id is not None:
         model["id"] = model_id
     return {
@@ -146,7 +155,6 @@ target:
     api_key_env: VLLM_API_KEY
   model:
     selection: single
-    tokenizer: nvidia/tokenizer
   discovery:
     service_required: true
     server_info: optional
@@ -193,6 +201,11 @@ def test_target_spec_validates_explicit_model_and_unknown_fields():
     with pytest.raises(ConfigError, match="unknown field.*launch_command"):
         TargetSpec.from_mapping(raw)
 
+    raw = _target_mapping()
+    raw["model"]["tokenizer"] = "inert/tokenizer"
+    with pytest.raises(ConfigError, match="target.model has unknown field.*tokenizer"):
+        TargetSpec.from_mapping(raw)
+
 
 def test_target_spec_normalizes_bare_vllm_server_url_to_openai_v1():
     raw = _target_mapping()
@@ -201,9 +214,15 @@ def test_target_spec_normalizes_bare_vllm_server_url_to_openai_v1():
     spec = TargetSpec.from_mapping(raw)
 
     assert spec.endpoint.base_url == "http://spark.local:8000/v1"
-    assert spec.endpoint.resolve("served").chat_completions_url.endswith(
-        "/v1/chat/completions"
-    )
+    assert spec.endpoint.resolve("served").chat_completions_url.endswith("/v1/chat/completions")
+
+
+def test_target_spec_rejects_protocols_discovery_cannot_resolve():
+    raw = _target_mapping()
+    raw["endpoint"]["protocol"] = "ollama_chat"
+
+    with pytest.raises(ConfigError, match="requires endpoint.protocol 'openai_chat'"):
+        TargetSpec.from_mapping(raw)
 
 
 def test_target_spec_rejects_ssh_inventory_with_client_loopback_endpoint():
@@ -211,6 +230,114 @@ def test_target_spec_rejects_ssh_inventory_with_client_loopback_endpoint():
     raw["endpoint"]["base_url"] = "http://127.0.0.1:8000/v1"
 
     with pytest.raises(ConfigError, match="loopback"):
+        TargetSpec.from_mapping(raw)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://127.1:8000/v1",
+        "http://0.0.0.0:8000/v1",
+        "http://[::]:8000/v1",
+        "http://localhost.localdomain:8000/v1",
+        "http://model.localhost:8000/v1",
+    ],
+)
+def test_target_spec_rejects_all_client_local_urls_for_ssh_targets(base_url: str):
+    raw = _target_mapping()
+    raw["endpoint"]["base_url"] = base_url
+
+    with pytest.raises(ConfigError, match="loopback or wildcard"):
+        TargetSpec.from_mapping(raw)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://user:secret@spark.local:8000/v1",
+        "http://spark.local:8000/v1?tenant=one",
+        "http://spark.local:8000/v1#fragment",
+    ],
+)
+def test_target_spec_rejects_url_credentials_queries_and_fragments(base_url: str):
+    raw = _target_mapping()
+    raw["endpoint"]["base_url"] = base_url
+
+    with pytest.raises(ConfigError, match="user information|query or fragment"):
+        TargetSpec.from_mapping(raw)
+
+
+@pytest.mark.parametrize("section", ["host", "endpoint", "model", "discovery"])
+@pytest.mark.parametrize("value", [False, [], "not-a-mapping"])
+def test_target_spec_rejects_falsey_or_malformed_sections(section: str, value: Any):
+    raw = _target_mapping()
+    raw[section] = value
+
+    with pytest.raises(ConfigError, match=rf"target\.{section} must be a mapping"):
+        TargetSpec.from_mapping(raw)
+
+
+@pytest.mark.parametrize(
+    ("section", "key"),
+    [
+        ("host", "required"),
+        ("discovery", "service_required"),
+        ("discovery", "metrics"),
+    ],
+)
+def test_target_spec_rejects_quoted_booleans(section: str, key: str):
+    raw = _target_mapping()
+    raw[section][key] = "false"
+
+    with pytest.raises(ConfigError, match=rf"target\.{section}\.{key} must be a boolean"):
+        TargetSpec.from_mapping(raw)
+
+
+@pytest.mark.parametrize(
+    ("section", "key"),
+    [
+        ("host", "access"),
+        ("host", "destination"),
+        ("model", "selection"),
+        ("model", "id"),
+        ("endpoint", "api_key_env"),
+    ],
+)
+@pytest.mark.parametrize("value", [False, None, ""])
+def test_target_spec_rejects_falsey_present_string_fields(
+    section: str,
+    key: str,
+    value: Any,
+):
+    raw = _target_mapping()
+    raw[section][key] = value
+
+    with pytest.raises(ConfigError, match=rf"target\.{section}\.{key} must be a non-empty string"):
+        TargetSpec.from_mapping(raw)
+
+
+def test_target_spec_rejects_empty_authorization_header():
+    raw = _target_mapping()
+    raw["endpoint"]["headers"] = {"Authorization": ""}
+
+    with pytest.raises(ConfigError, match="Authorization cannot be empty"):
+        TargetSpec.from_mapping(raw)
+
+
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), "-inf", True])
+def test_target_spec_rejects_non_finite_or_boolean_timeouts(timeout: Any):
+    raw = _target_mapping()
+    raw["host"]["connect_timeout_s"] = timeout
+
+    with pytest.raises(ConfigError, match="positive finite number"):
+        TargetSpec.from_mapping(raw)
+
+
+def test_target_spec_rejects_falsey_non_mapping_headers():
+    raw = _target_mapping()
+    raw["endpoint"]["headers"] = []
+
+    with pytest.raises(ConfigError, match="target.endpoint.headers must be a mapping"):
         TargetSpec.from_mapping(raw)
 
 
@@ -374,6 +501,7 @@ def test_remote_probe_keeps_gpu_identity_when_memory_queries_are_unsupported(
         }
     ]
     assert profile["cuda_runtime_version"] == "13.0"
+    assert profile["cuda_driver_supported_version"] == "13.0"
 
 
 def test_resolver_uses_local_profile_and_selects_the_only_served_model():
@@ -392,10 +520,7 @@ def test_resolver_uses_local_profile_and_selects_the_only_served_model():
     assert resolved.endpoint.base_url == "http://spark.local:8000/v1"
     assert resolved.host.profile["hostname"] == "local-mac"
     assert resolved.selection == "single_discovered"
-    assert resolved.topology == {
-        "measurement_scope": "local_client_to_network_endpoint"
-    }
-    assert resolved.tokenizer == "org/model-tokenizer"
+    assert resolved.topology == {"measurement_scope": "local_client_to_network_endpoint"}
 
 
 def test_resolver_uses_ssh_inventory_and_verifies_explicit_model():
@@ -406,9 +531,7 @@ def test_resolver_uses_ssh_inventory_and_verifies_explicit_model():
         service_client=service,  # type: ignore[arg-type]
     )
 
-    resolved = resolver.resolve(
-        _spec(selection="explicit", model_id="chosen")
-    )
+    resolved = resolver.resolve(_spec(selection="explicit", model_id="chosen"))
 
     assert len(ssh.calls) == 1
     assert resolved.endpoint.model == "chosen"
@@ -421,6 +544,47 @@ def test_resolver_uses_ssh_inventory_and_verifies_explicit_model():
         "first",
         "chosen",
     ]
+
+
+def test_resolver_verifies_pinned_host_fingerprint_independent_of_ssh_alias():
+    raw = _target_mapping(destination="another-ssh-alias")
+    raw["host"]["expected_fingerprint"] = "host-example"
+    spec = TargetSpec.from_mapping(raw)
+    resolver = TargetResolver(
+        ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+        service_client=_FakeService(_service("served-model")),  # type: ignore[arg-type]
+    )
+
+    inspection = resolver.inspect(spec)
+
+    assert inspection.available is True
+    assert inspection.safe_json()["host_identity_binding"] == {
+        "expected_fingerprint": "host-example",
+        "actual_fingerprint": "host-example",
+        "verified": True,
+    }
+
+
+@pytest.mark.parametrize("actual", ["host-other", None])
+def test_resolver_fails_closed_on_host_fingerprint_mismatch(actual: str | None):
+    raw = _target_mapping()
+    raw["host"]["expected_fingerprint"] = "host-example"
+    raw["discovery"]["service_required"] = False
+    profile = dict(_host().profile)
+    if actual is None:
+        profile.pop("host_fingerprint")
+    else:
+        profile["host_fingerprint"] = actual
+    resolver = TargetResolver(
+        ssh_client=_FakeSSH(HostDiscovery(transport="ssh", destination="dgx", profile=profile)),  # type: ignore[arg-type]
+        service_client=_FakeService(error="connection refused"),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(RuntimeError, match="fingerprint does not match"):
+        resolver.inspect(
+            TargetSpec.from_mapping(raw),
+            allow_service_unavailable=True,
+        )
 
 
 @pytest.mark.parametrize(
@@ -492,6 +656,8 @@ def test_openai_discovery_uses_api_auth_and_sanitizes_server_info(
                     "max_num_batched_tokens": 8192,
                     "api_key": "server-secret",
                     "hf_token": "server-secret",
+                    "github_token": "server-secret",
+                    "admin-token": "server-secret",
                     "nested": {
                         "authorization": "server-secret",
                         "password": "server-secret",
@@ -537,15 +703,320 @@ def test_openai_discovery_uses_api_auth_and_sanitizes_server_info(
     assert metrics == "vllm:num_requests_running 0\n"
 
 
+def test_openai_discovery_bounds_streams_before_buffering(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(openai_discovery_module, "MAX_RESPONSE_BYTES", 32)
+    model_chunks_read = 0
+
+    class ModelStream(httpx.SyncByteStream):
+        def __iter__(self):
+            nonlocal model_chunks_read
+            for chunk in (b'{"data":[]}', b"x" * 30, b"must-not-be-read"):
+                model_chunks_read += 1
+                yield chunk
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, text="")
+        if request.url.path == "/version":
+            return httpx.Response(200, json={"version": "v"})
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, stream=ModelStream())
+        return httpx.Response(404)
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as client,
+        pytest.raises(ConfigError, match="model discovery.*response is too large"),
+    ):
+        OpenAIDiscoveryClient(client=client).discover(
+            _spec().endpoint, DiscoveryPolicy(server_info="off")
+        )
+
+    assert model_chunks_read == 2
+
+
+def test_offline_tolerance_does_not_suppress_oversized_health_response(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(openai_discovery_module, "MAX_RESPONSE_BYTES", 32)
+    health_body_read = False
+
+    class HealthStream(httpx.SyncByteStream):
+        def __iter__(self):
+            nonlocal health_body_read
+            health_body_read = True
+            yield b"must-not-be-read"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-length": "100"},
+            stream=HealthStream(),
+            request=request,
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        resolver = TargetResolver(
+            ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+            service_client=OpenAIDiscoveryClient(client=client),
+        )
+        with pytest.raises(ConfigError, match="health.*response is too large"):
+            resolver.inspect(_spec(), allow_service_unavailable=True)
+
+    assert health_body_read is False
+
+
+def test_openai_discovery_bounds_metrics_while_streaming(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(openai_discovery_module, "MAX_RESPONSE_BYTES", 8)
+    chunks_read = 0
+
+    class MetricsStream(httpx.SyncByteStream):
+        def __iter__(self):
+            nonlocal chunks_read
+            for chunk in (b"1234", b"56789", b"must-not-be-read"):
+                chunks_read += 1
+                yield chunk
+
+    with (
+        httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, stream=MetricsStream())
+            )
+        ) as client,
+        pytest.raises(RuntimeError, match="response is too large"),
+    ):
+        OpenAIDiscoveryClient(client=client).metrics(_spec().endpoint)
+
+    assert chunks_read == 2
+
+
+def test_openai_discovery_applies_total_stream_deadline(monkeypatch: pytest.MonkeyPatch):
+    ticks = iter((0.0, 0.1, 6.0))
+    monkeypatch.setattr(openai_discovery_module, "_monotonic", lambda: next(ticks))
+
+    class TricklingStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"still arriving"
+
+    with (
+        httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, stream=TricklingStream())
+            )
+        ) as client,
+        pytest.raises(RuntimeError, match="exceeded the total timeout"),
+    ):
+        OpenAIDiscoveryClient(client=client, timeout_s=5.0).metrics(_spec().endpoint)
+
+
 def test_openai_discovery_requires_configured_api_key(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_API_KEY", raising=False)
-    with httpx.Client(
-        transport=httpx.MockTransport(lambda request: pytest.fail("must not send request"))
-    ) as client, pytest.raises(RuntimeError, match="VLLM_API_KEY"):
+    with (
+        httpx.Client(
+            transport=httpx.MockTransport(lambda request: pytest.fail("must not send request"))
+        ) as client,
+        pytest.raises(ConfigError, match="VLLM_API_KEY"),
+    ):
         OpenAIDiscoveryClient(client=client).discover(
             _spec(api_key_env="VLLM_API_KEY").endpoint,
             DiscoveryPolicy(),
         )
+
+
+@pytest.mark.parametrize(
+    ("headers", "api_key_env"),
+    [
+        ({"Authorization": "Bearer super-secret\nInjected: yes"}, None),
+        ({}, "VLLM_API_KEY"),
+    ],
+)
+def test_invalid_authorization_never_reaches_transport_or_error_text(
+    monkeypatch: pytest.MonkeyPatch,
+    headers: dict[str, str],
+    api_key_env: str | None,
+):
+    if api_key_env is not None:
+        monkeypatch.setenv(api_key_env, "super-secret\nInjected: yes")
+    endpoint = EndpointSpec(
+        name="spark",
+        protocol="openai_chat",
+        base_url="http://spark.local:8000/v1",
+        headers=headers,
+        api_key_env=api_key_env,
+    )
+    with (
+        httpx.Client(
+            transport=httpx.MockTransport(lambda request: pytest.fail("must not send request"))
+        ) as client,
+        pytest.raises(ConfigError) as caught,
+    ):
+        OpenAIDiscoveryClient(client=client).discover(endpoint, DiscoveryPolicy())
+
+    assert "super-secret" not in str(caught.value)
+    assert "Injected" not in str(caught.value)
+
+
+def test_offline_tolerance_does_not_suppress_missing_api_key_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("VLLM_API_KEY", raising=False)
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda request: pytest.fail("must not send request"))
+    ) as client:
+        resolver = TargetResolver(
+            ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+            service_client=OpenAIDiscoveryClient(client=client),
+        )
+        with pytest.raises(ConfigError, match="VLLM_API_KEY"):
+            resolver.inspect(
+                _spec(api_key_env="VLLM_API_KEY"),
+                allow_service_unavailable=True,
+            )
+
+
+@pytest.mark.parametrize("unauthorized_path", ["/health", "/v1/models"])
+def test_offline_tolerance_does_not_suppress_discovery_authorization_failures(
+    unauthorized_path: str,
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == unauthorized_path:
+            return httpx.Response(401, request=request)
+        if request.url.path == "/health":
+            return httpx.Response(200, request=request)
+        if request.url.path == "/version":
+            return httpx.Response(200, json={"version": "0.10.0"}, request=request)
+        return httpx.Response(404, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        resolver = TargetResolver(
+            ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+            service_client=OpenAIDiscoveryClient(client=client),
+        )
+        with pytest.raises(ConfigError, match="authorization failed with HTTP 401"):
+            resolver.inspect(_spec(), allow_service_unavailable=True)
+
+
+def test_optional_server_info_authorization_failure_remains_a_warning():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, request=request)
+        if request.url.path == "/version":
+            return httpx.Response(200, json={"version": "0.10.0"}, request=request)
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "served-model"}]},
+                request=request,
+            )
+        return httpx.Response(403, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        resolver = TargetResolver(
+            ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+            service_client=OpenAIDiscoveryClient(client=client),
+        )
+        inspection = resolver.inspect(_spec())
+
+    assert inspection.available is True
+    assert "server_info: HTTP 403" in inspection.errors
+
+
+def test_offline_tolerance_does_not_suppress_reachable_wrong_http_service():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(404, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        resolver = TargetResolver(
+            ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+            service_client=OpenAIDiscoveryClient(client=client),
+        )
+        with pytest.raises(ConfigError, match="health failed with HTTP 404"):
+            resolver.inspect(_spec(), allow_service_unavailable=True)
+
+    assert [request.url.path for request in requests] == ["/health"]
+
+
+def test_discovery_rejects_cross_origin_redirect_before_following_it(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        lambda host, port, **kwargs: [
+            (2, 1, 6, "", ("192.168.1.41", port))
+        ],
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            307,
+            headers={"location": "http://127.0.0.1:8000/health"},
+            request=request,
+        )
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as client,
+        pytest.raises(ConfigError, match="remain on the configured.*origin"),
+    ):
+        OpenAIDiscoveryClient(client=client).discover(
+            _spec().endpoint, DiscoveryPolicy(server_info="off")
+        )
+
+    assert len(requests) == 1
+
+
+def test_discovery_rejects_dns_name_that_resolves_to_client_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        lambda host, port, **kwargs: [(2, 1, 6, "", ("127.0.0.1", port))],
+    )
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda request: pytest.fail("must not send request"))
+    ) as client:
+        resolver = TargetResolver(
+            ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+            service_client=OpenAIDiscoveryClient(client=client),
+        )
+        with pytest.raises(ConfigError, match="client-local"):
+            resolver.inspect(_spec(), allow_service_unavailable=True)
+
+
+def test_discovery_allows_dgx_local_name_that_resolves_to_lan_address(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        lambda host, port, **kwargs: [(2, 1, 6, "", ("192.168.1.41", port))],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, request=request)
+        if request.url.path == "/version":
+            return httpx.Response(200, json={"version": "v"}, request=request)
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "served-model"}]},
+                request=request,
+            )
+        return httpx.Response(404, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        resolver = TargetResolver(
+            ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+            service_client=OpenAIDiscoveryClient(client=client),
+        )
+        inspection = resolver.inspect(_spec())
+
+    assert inspection.service is not None
+    assert inspection.service.health == "ok"
+    assert [model.id for model in inspection.service.models] == ["served-model"]
 
 
 def test_openai_discovery_preserves_explicit_auth_and_short_circuits_offline_host(
@@ -596,6 +1067,57 @@ def test_resolver_can_return_inventory_when_service_is_unavailable():
 
     with pytest.raises(RuntimeError, match="connection refused"):
         resolver.resolve(_spec())
+
+
+def test_allow_service_unavailable_does_not_suppress_required_host_failure():
+    class FailingSSH:
+        def collect_host_profile(self, access: HostAccess) -> HostDiscovery:
+            raise RuntimeError("permission denied")
+
+    resolver = TargetResolver(
+        ssh_client=FailingSSH(),  # type: ignore[arg-type]
+        service_client=_FakeService(error="connection refused"),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(RuntimeError, match="host: permission denied"):
+        resolver.inspect(_spec(), allow_service_unavailable=True)
+
+
+@pytest.mark.parametrize(
+    ("spec", "service", "message"),
+    [
+        (_spec(), _service("alpha", "beta"), "selection is ambiguous"),
+        (
+            _spec(selection="explicit", model_id="missing"),
+            _service("available"),
+            "configured model 'missing' is not served",
+        ),
+    ],
+)
+def test_offline_tolerance_does_not_suppress_healthy_service_model_errors(
+    spec: TargetSpec,
+    service: ServiceDiscovery,
+    message: str,
+):
+    resolver = TargetResolver(
+        ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+        service_client=_FakeService(service),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        resolver.inspect(spec, allow_service_unavailable=True)
+
+
+def test_service_required_false_does_not_suppress_healthy_service_model_errors():
+    raw = _target_mapping()
+    raw["discovery"]["service_required"] = False
+    resolver = TargetResolver(
+        ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+        service_client=_FakeService(_service("alpha", "beta")),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(RuntimeError, match="selection is ambiguous"):
+        resolver.inspect(TargetSpec.from_mapping(raw))
 
 
 def test_service_required_false_makes_default_inspection_host_only():

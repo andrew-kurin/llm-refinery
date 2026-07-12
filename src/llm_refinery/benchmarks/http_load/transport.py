@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 import time
 import uuid
 from collections.abc import Iterator
@@ -13,8 +14,12 @@ import httpx
 
 from llm_refinery.benchmarks.http_load.config import HttpLoadTrial, HttpScenario
 from llm_refinery.benchmarks.http_load.models import RequestResult
+from llm_refinery.core.config import ConfigError
 from llm_refinery.core.endpoints import OLLAMA_CHAT, OPENAI_CHAT, Endpoint
+from llm_refinery.core.http_safety import HttpOrigin, http_origin, validate_request_url
 from llm_refinery.providers.openai_chat import json_headers
+
+_MAX_REDIRECTS = 5
 
 
 def run_requests(
@@ -77,15 +82,22 @@ def pooled_http_client(trial: HttpLoadTrial) -> Iterator[httpx.Client]:
 
 
 def _new_http_client(trial: HttpLoadTrial) -> httpx.Client:
-    return httpx.Client(
+    validated_origin = validate_request_url(trial.target.base_url)
+    verify: bool | ssl.SSLContext = True
+    if trial.transport.ca_bundle is not None:
+        verify = ssl.create_default_context(cafile=str(trial.transport.ca_bundle))
+    client = httpx.Client(
         limits=httpx.Limits(
             max_connections=trial.concurrency,
             max_keepalive_connections=trial.concurrency,
             keepalive_expiry=None,
         ),
-        follow_redirects=True,
-        trust_env=False,
+        follow_redirects=False,
+        trust_env=trial.transport.trust_env,
+        verify=verify,
     )
+    client._llm_refinery_validated_origins = {validated_origin}  # type: ignore[attr-defined]
+    return client
 
 
 def execute_http_request(
@@ -184,7 +196,8 @@ def post_json(
     try:
         with (
             client_context as active_client,
-            active_client.stream(
+            _safe_stream(
+                active_client,
                 "POST",
                 url,
                 content=json.dumps(payload).encode("utf-8"),
@@ -216,6 +229,55 @@ def post_json(
             latency_s=time.perf_counter() - start,
             error=f"{type(exc).__name__}: {exc}",
         )
+
+
+@contextmanager
+def _safe_stream(
+    client: httpx.Client,
+    method: str,
+    url: str,
+    **kwargs: Any,
+) -> Iterator[httpx.Response]:
+    """Stream a request while permitting only same-origin, method-preserving redirects."""
+    expected_origin = http_origin(url)
+    validated_origins: set[HttpOrigin] = getattr(
+        client, "_llm_refinery_validated_origins", set()
+    )
+    if expected_origin not in validated_origins:
+        validate_request_url(url, expected_origin=expected_origin)
+        validated_origins.add(expected_origin)
+        client._llm_refinery_validated_origins = validated_origins  # type: ignore[attr-defined]
+    current_url = url
+    for _redirect_count in range(_MAX_REDIRECTS + 1):
+        validate_request_url(
+            current_url,
+            expected_origin=expected_origin,
+            resolve_addresses=False,
+        )
+        with client.stream(
+            method,
+            current_url,
+            follow_redirects=False,
+            **kwargs,
+        ) as response:
+            if response.has_redirect_location:
+                if response.status_code not in {307, 308}:
+                    raise ConfigError(
+                        "HTTP load refuses redirects that can change the request method"
+                    )
+                redirect_url = str(response.url.join(response.headers["location"]))
+                validate_request_url(
+                    redirect_url,
+                    expected_origin=expected_origin,
+                    resolve_addresses=False,
+                )
+                current_url = redirect_url
+                continue
+            if 300 <= response.status_code < 400:
+                raise ConfigError("HTTP load received a redirect without a usable location")
+            yield response
+            return
+    raise ConfigError("HTTP load exceeded the maximum same-origin redirects")
 
 
 def read_openai_stream(

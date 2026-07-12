@@ -8,6 +8,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from llm_refinery.core.config import ConfigError
 from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
 
 DEFAULT_USER_AGENT = (
@@ -90,6 +91,7 @@ def json_headers(
     api_key_env: str | None = None,
     accept: bool = True,
 ) -> dict[str, str]:
+    validate_http_headers(headers or {})
     resolved: dict[str, str] = {
         "Content-Type": "application/json",
         "User-Agent": DEFAULT_USER_AGENT,
@@ -108,11 +110,39 @@ def json_headers(
         token = os.environ.get(api_key_env)
         if token:
             resolved["Authorization"] = f"Bearer {token}"
+    validate_http_headers(resolved)
     return resolved
 
 
 def has_header(headers: dict[str, str], name: str) -> bool:
     return any(key.casefold() == name.casefold() for key in headers)
+
+
+def validate_http_headers(headers: dict[str, str]) -> None:
+    """Validate headers without ever including a header value in an error."""
+    seen: set[str] = set()
+    token_characters = frozenset(
+        "!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    )
+    for name, value in headers.items():
+        if not isinstance(name, str) or not name or any(
+            character not in token_characters for character in name
+        ):
+            raise ConfigError("HTTP header name is invalid")
+        normalized = name.casefold()
+        if normalized in seen:
+            raise ConfigError("HTTP header names must be unique case-insensitively")
+        seen.add(normalized)
+        if not isinstance(value, str):
+            raise ConfigError(f"HTTP header {name!r} value must be a string")
+        try:
+            value.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ConfigError(f"HTTP header {name!r} value must contain only ASCII") from exc
+        if value != value.strip(" \t") or any(
+            ord(character) < 32 or ord(character) == 127 for character in value
+        ):
+            raise ConfigError(f"HTTP header {name!r} value contains invalid characters")
 
 
 def post_json_body(

@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from llm_refinery.core.config import ConfigError
 from llm_refinery.core.targets import (
     HostDiscovery,
     ModelDescriptor,
@@ -126,6 +127,84 @@ def test_suite_calls_services_directly_and_links_child_runs(tmp_path: Path):
     assert set(runs[0]["artifacts"]) == {"system_before", "system_after", "preflight"}
 
 
+def test_legacy_suite_preserves_http_manifest_targets(tmp_path: Path):
+    http_config = tmp_path / "http-load.yaml"
+    http_config.write_text(
+        f"""
+name: legacy-http
+database: {tmp_path / "http.duckdb"}
+targets:
+  - name: ollama-a
+    protocol: ollama_chat
+    base_url: http://127.0.0.1:11434
+    model: model-a
+  - name: ollama-b
+    protocol: ollama_chat
+    base_url: http://127.0.0.1:11435
+    model: model-b
+scenarios:
+  - name: short
+    prompt: hello
+    max_tokens: [8]
+    concurrency: [1]
+    requests: 1
+""",
+        encoding="utf-8",
+    )
+    config = SuiteConfig.from_mapping(
+        {
+            "schema_version": 1,
+            "name": "legacy-suite",
+            "database": str(tmp_path / "runs.duckdb"),
+            "endpoint": {
+                "name": "quality-openai",
+                "protocol": "openai_chat",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "model": "quality-model",
+            },
+            "quality": {"enabled": False},
+            "http_load": {
+                "config": str(http_config),
+                "targets": ["ollama-a", "ollama-b"],
+            },
+            "preflight": {"enabled": False},
+        }
+    )
+    calls = []
+
+    def fake_http_load(load_config, **kwargs):
+        calls.append((load_config, kwargs))
+        return []
+
+    BenchmarkSuiteWorkflow(
+        config,
+        http_load_runner=fake_http_load,
+        system_snapshot=lambda: "snapshot",
+    ).execute()
+
+    assert [target.protocol for target in calls[0][0].targets] == [
+        "ollama_chat",
+        "ollama_chat",
+    ]
+    assert [target.base_url for target in calls[0][0].targets] == [
+        "http://127.0.0.1:11434",
+        "http://127.0.0.1:11435",
+    ]
+    assert calls[0][1]["target_names"] == ("ollama-a", "ollama-b")
+
+
+def test_schema_v2_suite_requires_endpoint_or_target():
+    with pytest.raises(ConfigError, match="requires exactly one"):
+        SuiteConfig.from_mapping({"schema_version": 2, "name": "missing-target"})
+
+
+def test_schema_v1_suite_keeps_legacy_default_endpoint():
+    config = SuiteConfig.from_mapping({"schema_version": 1, "name": "legacy-default"})
+
+    assert config.endpoint is not None
+    assert config.endpoint.base_url == "http://127.0.0.1:8080/v1"
+
+
 def test_suite_can_require_the_response_model_identity(tmp_path: Path):
     config = SuiteConfig.from_mapping(
         {
@@ -164,7 +243,7 @@ def _resolved_dgx_target(*, max_model_len: int = 32768) -> tuple[TargetSpec, Tar
                 "protocol": "openai_chat",
                 "base_url": "http://aitopatom-41de.local:8000/v1",
             },
-            "model": {"selection": "single", "tokenizer": "org/model-tokenizer"},
+            "model": {"selection": "single"},
         }
     )
     host = HostDiscovery(
@@ -196,7 +275,6 @@ def _resolved_dgx_target(*, max_model_len: int = 32768) -> tuple[TargetSpec, Tar
         service=service,
         model=model,
         selection="single_discovered",
-        tokenizer=spec.model.tokenizer,
     )
     return spec, TargetInspection(
         spec=spec,
@@ -220,7 +298,6 @@ def _target_config_mapping(spec: TargetSpec) -> dict[str, object]:
         },
         "model": {
             "selection": spec.model.selection,
-            "tokenizer": spec.model.tokenizer,
         },
     }
 
@@ -330,7 +407,7 @@ def test_remote_suite_resolves_once_for_children_and_overlays_http_target(tmp_pa
 
     assert [call[0] for call in calls] == ["quality", "load"]
     assert calls[0][1].targets["spark"].model == "served-model"
-    assert calls[0][1].tokenizer == "org/model-tokenizer"
+    assert calls[0][1].tokenizer is None
     assert calls[1][1].targets[0].base_url == "http://aitopatom-41de.local:8000/v1"
     assert calls[1][1].targets[0].model == "served-model"
     assert calls[0][2]["run_context"].to_target_json()["host"]["destination"] == "dgx"
@@ -350,6 +427,33 @@ def test_remote_suite_resolves_once_for_children_and_overlays_http_target(tmp_pa
         "vllm_metrics_before",
         "vllm_metrics_after",
     }
+
+
+def test_remote_suite_preflight_defaults_to_discovered_model_identity(tmp_path: Path):
+    spec, inspection = _resolved_dgx_target()
+    config = SuiteConfig.from_mapping(
+        {
+            "schema_version": 2,
+            "name": "spark-model-binding",
+            "database": str(tmp_path / "runs.duckdb"),
+            "target": _target_config_mapping(spec),
+            "quality": {"enabled": False},
+            "http_load": {"enabled": False},
+            "preflight": {"enabled": True, "require_clean": False},
+        }
+    )
+    workflow = BenchmarkSuiteWorkflow(
+        config,
+        target_resolver=_FakeTargetResolver(inspection),
+        sanity_checker=lambda _endpoint: {
+            "success": True,
+            "response_model": "different-served-model",
+        },
+        system_snapshot=lambda: "snapshot",
+    )
+
+    with pytest.raises(RuntimeError, match="served-model"):
+        workflow.execute()
 
 
 def test_remote_suite_persists_unavailable_discovery_and_starts_no_children(tmp_path: Path):

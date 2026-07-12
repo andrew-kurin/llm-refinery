@@ -24,7 +24,10 @@ from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
 )
 @click.option(
     "--tokenizer",
-    help="Tokenizer id/path for token-aware tasks such as RULER.",
+    help=(
+        "Tokenizer id/path for a backend that supports client tokenization; "
+        "local-chat-completions rejects this option because it ignores it."
+    ),
 )
 @click.option(
     "--metadata",

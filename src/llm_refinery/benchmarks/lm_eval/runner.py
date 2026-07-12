@@ -9,7 +9,7 @@ from pathlib import Path
 
 from llm_refinery.application.run_context import RunContext
 from llm_refinery.application.run_session import RunSession
-from llm_refinery.benchmarks.lm_eval.command import build_lm_eval_command
+from llm_refinery.benchmarks.lm_eval.command import build_lm_eval_command, lm_eval_api_key
 from llm_refinery.benchmarks.lm_eval.config import LmEvalConfig, resolve_target_names
 from llm_refinery.benchmarks.lm_eval.parser import (
     ParsedLmEvalSample,
@@ -20,7 +20,7 @@ from llm_refinery.benchmarks.lm_eval.parser import (
     summarize_lm_eval_samples,
 )
 from llm_refinery.benchmarks.lm_eval.presets import default_targets
-from llm_refinery.core.runs import CompletedRun, RunSpec
+from llm_refinery.core.runs import CompletedRun, RunSpec, stable_hash
 from llm_refinery.storage.duckdb import ResultStore
 from llm_refinery.storage.models import SampleRecord
 
@@ -75,6 +75,7 @@ def run_lm_eval(
                 target_model=target.model,
                 target_base_url=target.base_url,
                 target_api_key_env=target.api_key_env,
+                target_headers=target.headers,
                 command_text=command_text,
                 database=active_store.database,
                 parent_run_id=parent_run_id,
@@ -86,8 +87,12 @@ def run_lm_eval(
                 result_path = run.artifact("result", "result.json", "application/json")
                 result_started_mtime = time.time()
                 target_env = env.copy()
-                if target.api_key_env and os.environ.get(target.api_key_env):
-                    target_env["OPENAI_API_KEY"] = os.environ[target.api_key_env]
+                # lm-eval's API adapter reads only OPENAI_API_KEY. Resolve the target's
+                # credential into the child environment and never place it in command argv.
+                target_env.pop("OPENAI_API_KEY", None)
+                api_key = lm_eval_api_key(target, environ=os.environ)
+                if api_key is not None:
+                    target_env["OPENAI_API_KEY"] = api_key
                 completed = subprocess.run(
                     cmd,
                     env=target_env,
@@ -171,6 +176,7 @@ def _run_spec(
     target_model: str,
     target_base_url: str,
     target_api_key_env: str | None,
+    target_headers: dict[str, str],
     command_text: str,
     database: str | Path,
     parent_run_id: str | None,
@@ -186,6 +192,8 @@ def _run_spec(
         "model": target_model,
         "base_url": target_base_url,
         "api_key_env": target_api_key_env,
+        "header_names": sorted(target_headers),
+        "headers_hash": stable_hash(target_headers) if target_headers else None,
         "tasks": config.tasks,
         "limit": config.limit,
         "num_concurrent": config.num_concurrent,

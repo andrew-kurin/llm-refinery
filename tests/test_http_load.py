@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from llm_refinery.application.run_context import RunContext
+from llm_refinery.benchmarks.http_load import transport as http_transport
 from llm_refinery.benchmarks.http_load.config import (
     HttpLoadConfig,
     HttpScenario,
@@ -63,6 +64,136 @@ def test_expand_http_load_trials_crosses_targets_scenarios_concurrency_and_token
     assert {trial.concurrency for trial in trials} == {1, 2}
     assert {trial.max_tokens for trial in trials} == {32, 64}
     assert all("params" in trial.as_jsonable() for trial in trials)
+    assert all(trial.transport.trust_env is True for trial in trials)
+
+
+def test_http_transport_config_supports_direct_mode_and_relative_ca_bundle(tmp_path):
+    ca_bundle = tmp_path / "private-ca.pem"
+    ca_bundle.write_text("test certificate bundle", encoding="utf-8")
+    config = HttpLoadConfig.from_mapping(
+        {
+            "transport": {"trust_env": False, "ca_bundle": ca_bundle.name},
+            "targets": [
+                {
+                    "name": "remote",
+                    "protocol": "openai_chat",
+                    "base_url": "https://remote.test/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello"}],
+        },
+        source_path=tmp_path / "http-load.yaml",
+    )
+
+    trial = expand_http_load_trials(config)[0]
+
+    assert trial.transport.trust_env is False
+    assert trial.transport.ca_bundle == ca_bundle
+    assert trial.as_jsonable()["transport"] == {
+        "trust_env": False,
+        "ca_bundle": str(ca_bundle),
+    }
+
+
+def test_http_transport_config_rejects_string_boolean():
+    with pytest.raises(ConfigError, match="transport.trust_env must be a boolean"):
+        HttpLoadConfig.from_mapping(
+            {
+                "transport": {"trust_env": "false"},
+                "targets": [
+                    {
+                        "name": "local",
+                        "protocol": "openai_chat",
+                        "base_url": "http://127.0.0.1:8080/v1",
+                        "model": "local",
+                    }
+                ],
+                "scenarios": [{"name": "chat", "prompt": "hello"}],
+            }
+        )
+
+
+def test_http_client_applies_transport_proxy_and_ca_settings(tmp_path, monkeypatch):
+    ca_bundle = tmp_path / "private-ca.pem"
+    ca_bundle.write_text("test certificate bundle", encoding="utf-8")
+    config = HttpLoadConfig.from_mapping(
+        {
+            "transport": {"trust_env": False, "ca_bundle": str(ca_bundle)},
+            "targets": [
+                {
+                    "name": "remote",
+                    "protocol": "openai_chat",
+                    "base_url": "https://remote.test/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello"}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    ssl_context = object()
+    captured = {}
+
+    monkeypatch.setattr(
+        http_transport.ssl,
+        "create_default_context",
+        lambda *, cafile: ssl_context if cafile == str(ca_bundle) else None,
+    )
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(http_transport.httpx, "Client", FakeClient)
+
+    http_transport._new_http_client(trial)
+
+    assert captured["trust_env"] is False
+    assert captured["verify"] is ssl_context
+
+
+def test_http_client_resolves_remote_origin_once_before_measured_requests(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "dgx",
+                    "protocol": "openai_chat",
+                    "base_url": "http://aitopatom-41de.local:8000/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [
+                {"name": "chat", "prompt": "hello", "stream": False, "requests": 2}
+            ],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    resolutions = 0
+
+    def resolve(host, port, **kwargs):
+        nonlocal resolutions
+        resolutions += 1
+        return [(2, 1, 6, "", ("192.168.1.41", port))]
+
+    monkeypatch.setattr("llm_refinery.core.http_safety.socket.getaddrinfo", resolve)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"completion_tokens": 1},
+            },
+            request=request,
+        )
+
+    with pooled_http_client(trial) as client:
+        client._transport = httpx.MockTransport(handler)  # type: ignore[attr-defined]
+        assert all(result.ok for result in run_requests(trial, count=2, client=client))
+
+    assert resolutions == 1
 
 
 def test_http_scenario_supports_prompt_pools_and_explicit_unique_cache_mode():
@@ -424,6 +555,125 @@ def test_connection_pool_reuses_http11_connections_across_batches():
 
     assert request_count == 6
     assert 1 <= len(connections) <= trial.concurrency
+
+
+def test_http_load_rejects_dns_name_resolving_to_client_loopback(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "remote-alias",
+                    "protocol": "openai_chat",
+                    "base_url": "http://local-alias.example:8000/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello"}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        lambda host, port, **kwargs: [(2, 1, 6, "", ("127.0.0.1", port))],
+    )
+
+    with pytest.raises(ConfigError, match="client-local"):
+        http_transport._new_http_client(trial)
+
+
+def test_http_load_rejects_cross_origin_redirect_before_following(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "dgx",
+                    "protocol": "openai_chat",
+                    "base_url": "http://aitopatom-41de.local:8000/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [
+                {"name": "chat", "prompt": "hello", "stream": False, "requests": 1}
+            ],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        lambda host, port, **kwargs: [(2, 1, 6, "", ("192.168.1.41", port))],
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            307,
+            headers={"location": "http://127.0.0.1:9000/v1/chat/completions"},
+            request=request,
+        )
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as client,
+        pytest.raises(ConfigError, match="remain on the configured.*origin"),
+    ):
+        http_transport.execute_http_request(trial, 0, client=client)
+
+    assert len(requests) == 1
+
+
+def test_http_load_follows_same_origin_method_preserving_redirect(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "dgx",
+                    "protocol": "openai_chat",
+                    "base_url": "http://aitopatom-41de.local:8000/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [
+                {"name": "chat", "prompt": "hello", "stream": False, "requests": 1}
+            ],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    resolutions = 0
+
+    def resolve(host, port, **kwargs):
+        nonlocal resolutions
+        resolutions += 1
+        return [(2, 1, 6, "", ("192.168.1.41", port))]
+
+    monkeypatch.setattr("llm_refinery.core.http_safety.socket.getaddrinfo", resolve)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/chat/completions"):
+            return httpx.Response(
+                307,
+                headers={"location": "/v1/redirected-chat"},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"completion_tokens": 1},
+            },
+            request=request,
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = http_transport.execute_http_request(trial, 0, client=client)
+
+    assert result.ok is True
+    assert [request.url.path for request in requests] == [
+        "/v1/chat/completions",
+        "/v1/redirected-chat",
+    ]
+    assert resolutions == 1
 
 
 def test_read_ollama_stream_extracts_thinking_content():

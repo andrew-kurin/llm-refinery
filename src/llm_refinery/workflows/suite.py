@@ -212,14 +212,17 @@ class BenchmarkSuiteWorkflow:
         sanity = self.sanity_checker(endpoint)
         if not sanity["success"]:
             raise RuntimeError(str(sanity["error"]))
+        expected_response_model = config.expected_response_model
+        if expected_response_model is None and self._resolved_target is not None:
+            expected_response_model = endpoint.model
         if (
-            config.expected_response_model is not None
-            and sanity.get("response_model") != config.expected_response_model
+            expected_response_model is not None
+            and sanity.get("response_model") != expected_response_model
         ):
             raise RuntimeError(
                 "endpoint returned model "
                 f"{sanity.get('response_model')!r}; expected "
-                f"{config.expected_response_model!r}"
+                f"{expected_response_model!r}"
             )
         for key in (
             "elapsed_s",
@@ -239,9 +242,6 @@ class BenchmarkSuiteWorkflow:
         if not quality.enabled:
             return []
         endpoint = self._effective_endpoint()
-        tokenizer = quality.tokenizer
-        if tokenizer is None and self._resolved_target is not None:
-            tokenizer = self._resolved_target.tokenizer
         self._log(f"Running lm-eval quality (tasks={quality.tasks}, limit={quality.limit})")
         lm_config = LmEvalConfig(
             target=endpoint.name,
@@ -249,7 +249,7 @@ class BenchmarkSuiteWorkflow:
             tasks=quality.tasks,
             max_length=quality.max_length,
             eos_string=quality.eos_string,
-            tokenizer=tokenizer,
+            tokenizer=quality.tokenizer,
             metadata=quality.metadata,
             num_fewshot=quality.num_fewshot,
             gen_kwargs=quality.gen_kwargs,
@@ -276,6 +276,22 @@ class BenchmarkSuiteWorkflow:
             return []
         assert step.config is not None
         http_config = load_http_load_config(step.config)
+        if self.config.target is None:
+            endpoint = self._effective_endpoint()
+            targets = step.targets or (endpoint.name,)
+            self._log(f"Running HTTP load (targets={','.join(targets)})")
+            outcomes = self.http_load_runner(
+                http_config,
+                target_names=targets,
+                scenario_names=step.scenarios,
+                database_override=self.config.database,
+                parent_run_id=parent_run_id,
+                store=store,
+                run_context=self._run_context,
+            )
+            self._print_http_comparison(store, http_config.name)
+            return outcomes
+
         if len(step.targets) > 1:
             raise ConfigError("suite HTTP load supports one resolved target")
         endpoint = self._effective_endpoint()

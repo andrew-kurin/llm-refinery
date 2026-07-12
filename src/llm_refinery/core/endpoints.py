@@ -91,6 +91,14 @@ class Endpoint:
             return self.base_url
         return f"{self.base_url}/chat/completions"
 
+    @property
+    def completions_url(self) -> str:
+        if self.base_url.endswith("/chat/completions"):
+            return self.base_url[: -len("/chat/completions")] + "/completions"
+        if self.base_url.endswith("/completions"):
+            return self.base_url
+        return f"{self.base_url}/completions"
+
     def safe_json(self) -> dict[str, Any]:
         return {
             "name": self.name,

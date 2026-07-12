@@ -93,6 +93,13 @@ The runner warms every concurrency slot and warns when a cell is too small for u
 tail inspection. It records all-request latency (including failures), visible and
 reasoning TTFT, TPOT, approximate streaming-event ITL, and explicit correctness failures.
 
+HTTP load honors the standard proxy and private-CA environment by default,
+including `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, and
+`SSL_CERT_DIR`. A manifest can set `transport.trust_env: false` for a
+deterministic direct path, or set `transport.ca_bundle` to a PEM bundle (relative
+to the manifest) without disabling certificate verification. The recommended
+local manifest uses direct mode explicitly.
+
 Compare HTTP load results by latency, TTFT, throughput, and optionally host metadata:
 
 ```bash

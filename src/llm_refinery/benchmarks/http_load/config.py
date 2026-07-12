@@ -158,18 +158,58 @@ class HttpScenario:
 
 
 @dataclass(frozen=True)
+class HttpTransportConfig:
+    """HTTP client environment and TLS settings shared by every trial."""
+
+    trust_env: bool = True
+    ca_bundle: Path | None = None
+
+    @classmethod
+    def from_mapping(
+        cls,
+        raw: dict[str, Any] | None,
+        *,
+        base_dir: Path,
+    ) -> HttpTransportConfig:
+        if raw is None:
+            return cls()
+        if not isinstance(raw, dict):
+            raise ConfigError("HTTP-load transport must be a mapping")
+        reject_unknown_keys(raw, {"trust_env", "ca_bundle"}, context="HTTP-load transport")
+        trust_env = raw.get("trust_env", True)
+        if not isinstance(trust_env, bool):
+            raise ConfigError("HTTP-load transport.trust_env must be a boolean")
+        ca_bundle_raw = raw.get("ca_bundle")
+        ca_bundle = Path(str(ca_bundle_raw)) if ca_bundle_raw else None
+        if ca_bundle is not None and not ca_bundle.is_absolute():
+            ca_bundle = base_dir / ca_bundle
+        if ca_bundle is not None and not ca_bundle.is_file():
+            raise ConfigError(
+                f"HTTP-load transport.ca_bundle is not a file: {ca_bundle}"
+            )
+        return cls(trust_env=trust_env, ca_bundle=ca_bundle)
+
+    def safe_json(self) -> dict[str, Any]:
+        return {
+            "trust_env": self.trust_env,
+            "ca_bundle": str(self.ca_bundle) if self.ca_bundle else None,
+        }
+
+
+@dataclass(frozen=True)
 class HttpLoadConfig:
     name: str
     database: Path
     targets: list[Endpoint]
     scenarios: list[HttpScenario]
+    transport: HttpTransportConfig = HttpTransportConfig()
     source_path: Path | None = None
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any], source_path: Path | None = None) -> HttpLoadConfig:
         reject_unknown_keys(
             raw,
-            {"name", "database", "targets", "scenarios"},
+            {"name", "database", "targets", "scenarios", "transport"},
             context="HTTP-load configuration",
         )
         name = str(raw.get("name") or (source_path.stem if source_path else "http-load"))
@@ -194,6 +234,7 @@ class HttpLoadConfig:
             for item in targets_raw
         ]
         scenarios = [HttpScenario.from_mapping(item, base_dir=base_dir) for item in scenarios_raw]
+        transport = HttpTransportConfig.from_mapping(raw.get("transport"), base_dir=base_dir)
         _require_unique_names([target.name for target in targets], context="HTTP target")
         _require_unique_names([scenario.name for scenario in scenarios], context="HTTP scenario")
         return cls(
@@ -201,6 +242,7 @@ class HttpLoadConfig:
             database=Path(str(raw.get("database") or "results/llm_refinery.duckdb")),
             targets=targets,
             scenarios=scenarios,
+            transport=transport,
             source_path=source_path,
         )
 
@@ -212,6 +254,7 @@ class HttpLoadTrial:
     key: str
     target: Endpoint
     scenario: HttpScenario
+    transport: HttpTransportConfig
     concurrency: int
     max_tokens: int
 
@@ -238,6 +281,7 @@ class HttpLoadTrial:
             "model": {"name": self.target.model},
             "target": self.target.safe_json(),
             "scenario": self.scenario.safe_json(),
+            "transport": self.transport.safe_json(),
             "prompt_tokens": None,
             "gen_tokens": self.max_tokens,
             "params": {
@@ -296,6 +340,7 @@ def expand_http_load_trials(
                         "suite": config.name,
                         "target": target.safe_json(),
                         "scenario": scenario.safe_json(),
+                        "transport": config.transport.safe_json(),
                         "concurrency": concurrency,
                         "max_tokens": max_tokens,
                     }
@@ -317,6 +362,7 @@ def expand_http_load_trials(
                             key=key,
                             target=target,
                             scenario=scenario,
+                            transport=config.transport,
                             concurrency=concurrency,
                             max_tokens=max_tokens,
                         )

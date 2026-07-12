@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ipaddress
+import math
+import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -19,19 +21,39 @@ MODEL_SELECTION_MODES = frozenset({MODEL_SELECTION_EXPLICIT, MODEL_SELECTION_SIN
 SERVER_INFO_OFF = "off"
 SERVER_INFO_OPTIONAL = "optional"
 SERVER_INFO_REQUIRED = "required"
-SERVER_INFO_MODES = frozenset(
-    {SERVER_INFO_OFF, SERVER_INFO_OPTIONAL, SERVER_INFO_REQUIRED}
-)
+SERVER_INFO_MODES = frozenset({SERVER_INFO_OFF, SERVER_INFO_OPTIONAL, SERVER_INFO_REQUIRED})
 
 
 def _positive_float(value: Any, *, context: str) -> float:
+    if isinstance(value, bool):
+        raise ConfigError(f"{context} must be a positive finite number")
     try:
         parsed = float(value)
     except (TypeError, ValueError) as exc:
-        raise ConfigError(f"{context} must be a positive number") from exc
-    if parsed <= 0:
-        raise ConfigError(f"{context} must be a positive number")
+        raise ConfigError(f"{context} must be a positive finite number") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ConfigError(f"{context} must be a positive finite number")
     return parsed
+
+
+def _strict_bool(value: Any, *, context: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"{context} must be a boolean")
+    return value
+
+
+def _mapping_section(
+    raw: dict[str, Any],
+    key: str,
+    *,
+    context: str,
+) -> dict[str, Any]:
+    if key not in raw:
+        return {}
+    value = raw[key]
+    if not isinstance(value, dict):
+        raise ConfigError(f"{context}.{key} must be a mapping")
+    return value
 
 
 @dataclass(frozen=True)
@@ -54,12 +76,22 @@ class EndpointSpec:
             raise ConfigError("endpoint spec name cannot be empty")
         if protocol not in CHAT_PROTOCOLS:
             raise ConfigError(
-                f"endpoint spec protocol must be one of {sorted(CHAT_PROTOCOLS)}, "
-                f"got {protocol!r}"
+                f"endpoint spec protocol must be one of {sorted(CHAT_PROTOCOLS)}, got {protocol!r}"
             )
         parsed = urlparse(base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ConfigError("endpoint spec base_url must be an HTTP(S) URL")
+        try:
+            hostname = parsed.hostname
+            _port = parsed.port
+        except ValueError as exc:
+            raise ConfigError("endpoint spec base_url must be a valid HTTP(S) URL") from exc
+        if hostname is None:
+            raise ConfigError("endpoint spec base_url must include a hostname")
+        if parsed.username is not None or parsed.password is not None:
+            raise ConfigError("endpoint spec base_url cannot include user information")
+        if parsed.query or parsed.fragment or "?" in base_url or "#" in base_url:
+            raise ConfigError("endpoint spec base_url cannot include a query or fragment")
         if (
             protocol == OPENAI_CHAT
             and not base_url.endswith("/v1")
@@ -85,19 +117,50 @@ class EndpointSpec:
             {"name", "protocol", "base_url", "model", "api_key_env", "headers"},
             context=context,
         )
-        name = str(raw.get("name") or default_name or "").strip()
+        if "name" in raw:
+            name_value = raw["name"]
+            if not isinstance(name_value, str) or not name_value.strip():
+                raise ConfigError(f"{context}.name must be a non-empty string")
+            name = name_value.strip()
+        else:
+            name = (default_name or "").strip()
         if not name:
             raise ConfigError(f"{context} requires a non-empty 'name'")
-        headers_raw = raw.get("headers") or {}
-        if not isinstance(headers_raw, dict):
-            raise ConfigError(f"{context} headers must be a mapping")
+        protocol = raw.get("protocol")
+        if not isinstance(protocol, str) or not protocol.strip():
+            raise ConfigError(f"{context}.protocol must be a non-empty string")
+        base_url = raw.get("base_url")
+        if not isinstance(base_url, str) or not base_url.strip():
+            raise ConfigError(f"{context}.base_url must be a non-empty string")
+        model = None
+        if "model" in raw:
+            model_value = raw["model"]
+            if not isinstance(model_value, str) or not model_value.strip():
+                raise ConfigError(f"{context}.model must be a non-empty string")
+            model = model_value.strip()
+        api_key_env = None
+        if "api_key_env" in raw:
+            api_key_env_value = raw["api_key_env"]
+            if not isinstance(api_key_env_value, str) or not api_key_env_value.strip():
+                raise ConfigError(f"{context}.api_key_env must be a non-empty string")
+            api_key_env = api_key_env_value.strip()
+        headers_raw = _mapping_section(raw, "headers", context=context)
+        headers: dict[str, str] = {}
+        for key, value in headers_raw.items():
+            if not isinstance(key, str) or not key.strip():
+                raise ConfigError(f"{context}.headers keys must be non-empty strings")
+            if not isinstance(value, str):
+                raise ConfigError(f"{context}.headers[{key!r}] must be a string")
+            if key.casefold() == "authorization" and not value.strip():
+                raise ConfigError(f"{context}.headers Authorization cannot be empty")
+            headers[key] = value
         return cls(
             name=name,
-            protocol=str(raw.get("protocol") or "").strip(),
-            base_url=str(raw.get("base_url") or "").strip(),
-            model=str(raw["model"]).strip() if raw.get("model") else None,
-            api_key_env=str(raw["api_key_env"]).strip() if raw.get("api_key_env") else None,
-            headers={str(key): str(value) for key, value in headers_raw.items()},
+            protocol=protocol,
+            base_url=base_url,
+            model=model,
+            api_key_env=api_key_env,
+            headers=headers,
         )
 
     @property
@@ -143,10 +206,16 @@ class HostAccess:
     connect_timeout_s: float = 5.0
     command_timeout_s: float = 20.0
     required: bool = True
+    expected_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         access = self.access.strip().lower()
         destination = self.destination.strip() if self.destination else None
+        if self.expected_fingerprint is not None and not isinstance(self.expected_fingerprint, str):
+            raise ConfigError("host.expected_fingerprint must be a non-empty string")
+        expected_fingerprint = (
+            self.expected_fingerprint.strip() if self.expected_fingerprint else None
+        )
         if access not in HOST_ACCESS_MODES:
             raise ConfigError(
                 f"host access must be one of {sorted(HOST_ACCESS_MODES)}, got {access!r}"
@@ -165,8 +234,13 @@ class HostAccess:
             raise ConfigError(
                 "SSH destination cannot start with '-' or contain whitespace/control characters"
             )
+        if self.expected_fingerprint is not None and not expected_fingerprint:
+            raise ConfigError("host.expected_fingerprint cannot be empty")
+        required = _strict_bool(self.required, context="host.required")
         object.__setattr__(self, "access", access)
         object.__setattr__(self, "destination", destination)
+        object.__setattr__(self, "expected_fingerprint", expected_fingerprint)
+        object.__setattr__(self, "required", required)
         object.__setattr__(
             self,
             "connect_timeout_s",
@@ -185,21 +259,45 @@ class HostAccess:
             "connect_timeout_s": self.connect_timeout_s,
             "command_timeout_s": self.command_timeout_s,
             "required": self.required,
+            "expected_fingerprint": self.expected_fingerprint,
         }
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any], *, context: str = "target.host") -> HostAccess:
         reject_unknown_keys(
             raw,
-            {"access", "destination", "connect_timeout_s", "command_timeout_s", "required"},
+            {
+                "access",
+                "destination",
+                "connect_timeout_s",
+                "command_timeout_s",
+                "required",
+                "expected_fingerprint",
+            },
             context=context,
         )
+        expected_fingerprint = None
+        if "expected_fingerprint" in raw:
+            value = raw["expected_fingerprint"]
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError(f"{context}.expected_fingerprint must be a non-empty string")
+            expected_fingerprint = value
+        access_value = raw.get("access", HOST_ACCESS_LOCAL)
+        if not isinstance(access_value, str) or not access_value.strip():
+            raise ConfigError(f"{context}.access must be a non-empty string")
+        destination = None
+        if "destination" in raw:
+            destination_value = raw["destination"]
+            if not isinstance(destination_value, str) or not destination_value.strip():
+                raise ConfigError(f"{context}.destination must be a non-empty string")
+            destination = destination_value
         return cls(
-            access=str(raw.get("access") or HOST_ACCESS_LOCAL),
-            destination=str(raw["destination"]) if raw.get("destination") else None,
+            access=access_value,
+            destination=destination,
             connect_timeout_s=raw.get("connect_timeout_s", 5.0),
             command_timeout_s=raw.get("command_timeout_s", 20.0),
-            required=bool(raw.get("required", True)),
+            required=_strict_bool(raw.get("required", True), context=f"{context}.required"),
+            expected_fingerprint=expected_fingerprint,
         )
 
 
@@ -207,16 +305,13 @@ class HostAccess:
 class ModelSelection:
     selection: str = MODEL_SELECTION_SINGLE
     model_id: str | None = None
-    tokenizer: str | None = None
 
     def __post_init__(self) -> None:
         selection = self.selection.strip().lower()
         model_id = self.model_id.strip() if self.model_id else None
-        tokenizer = self.tokenizer.strip() if self.tokenizer else None
         if selection not in MODEL_SELECTION_MODES:
             raise ConfigError(
-                f"model selection must be one of {sorted(MODEL_SELECTION_MODES)}, "
-                f"got {selection!r}"
+                f"model selection must be one of {sorted(MODEL_SELECTION_MODES)}, got {selection!r}"
             )
         if selection == MODEL_SELECTION_EXPLICIT and not model_id:
             raise ConfigError("explicit model selection requires a non-empty id")
@@ -224,7 +319,6 @@ class ModelSelection:
             raise ConfigError("single model selection does not accept an id")
         object.__setattr__(self, "selection", selection)
         object.__setattr__(self, "model_id", model_id)
-        object.__setattr__(self, "tokenizer", tokenizer)
 
     @classmethod
     def from_mapping(
@@ -234,8 +328,13 @@ class ModelSelection:
         endpoint_model: str | None = None,
         context: str = "target.model",
     ) -> ModelSelection:
-        reject_unknown_keys(raw, {"selection", "id", "tokenizer"}, context=context)
-        configured_id = str(raw["id"]).strip() if raw.get("id") else None
+        reject_unknown_keys(raw, {"selection", "id"}, context=context)
+        configured_id = None
+        if "id" in raw:
+            id_value = raw["id"]
+            if not isinstance(id_value, str) or not id_value.strip():
+                raise ConfigError(f"{context}.id must be a non-empty string")
+            configured_id = id_value.strip()
         if configured_id and endpoint_model and configured_id != endpoint_model:
             raise ConfigError(
                 f"{context}.id conflicts with target.endpoint.model: "
@@ -243,17 +342,18 @@ class ModelSelection:
             )
         model_id = configured_id or endpoint_model
         selection_default = MODEL_SELECTION_EXPLICIT if model_id else MODEL_SELECTION_SINGLE
+        selection = raw.get("selection", selection_default)
+        if not isinstance(selection, str) or not selection.strip():
+            raise ConfigError(f"{context}.selection must be a non-empty string")
         return cls(
-            selection=str(raw.get("selection") or selection_default),
+            selection=selection,
             model_id=model_id,
-            tokenizer=str(raw["tokenizer"]).strip() if raw.get("tokenizer") else None,
         )
 
     def safe_json(self) -> dict[str, Any]:
         return {
             "selection": self.selection,
             "id": self.model_id,
-            "tokenizer": self.tokenizer,
         }
 
 
@@ -271,6 +371,16 @@ class DiscoveryPolicy:
                 f"got {server_info!r}"
             )
         object.__setattr__(self, "server_info", server_info)
+        object.__setattr__(
+            self,
+            "service_required",
+            _strict_bool(self.service_required, context="discovery.service_required"),
+        )
+        object.__setattr__(
+            self,
+            "metrics",
+            _strict_bool(self.metrics, context="discovery.metrics"),
+        )
 
     @classmethod
     def from_mapping(
@@ -287,10 +397,15 @@ class DiscoveryPolicy:
         server_info_raw = raw.get("server_info", SERVER_INFO_OPTIONAL)
         if isinstance(server_info_raw, bool):
             server_info_raw = SERVER_INFO_OPTIONAL if server_info_raw else SERVER_INFO_OFF
+        elif not isinstance(server_info_raw, str) or not server_info_raw.strip():
+            raise ConfigError(f"{context}.server_info must be a boolean or non-empty string")
         return cls(
-            service_required=bool(raw.get("service_required", True)),
+            service_required=_strict_bool(
+                raw.get("service_required", True),
+                context=f"{context}.service_required",
+            ),
             server_info=str(server_info_raw),
-            metrics=bool(raw.get("metrics", True)),
+            metrics=_strict_bool(raw.get("metrics", True), context=f"{context}.metrics"),
         )
 
     def safe_json(self) -> dict[str, Any]:
@@ -371,10 +486,12 @@ class TargetSpec:
     def __post_init__(self) -> None:
         if not self.name.strip():
             raise ConfigError("target name cannot be empty")
+        if self.endpoint.protocol != OPENAI_CHAT:
+            raise ConfigError("target discovery currently requires endpoint.protocol 'openai_chat'")
         endpoint_host = urlparse(self.endpoint.base_url).hostname
-        if self.host.access == HOST_ACCESS_SSH and _is_loopback_host(endpoint_host):
+        if self.host.access == HOST_ACCESS_SSH and _is_client_local_host(endpoint_host):
             raise ConfigError(
-                "SSH target endpoint cannot use a loopback URL; configure the "
+                "SSH target endpoint cannot use a loopback or wildcard URL; configure the "
                 "client-visible DGX address"
             )
 
@@ -385,23 +502,33 @@ class TargetSpec:
             {"name", "host", "endpoint", "model", "discovery"},
             context=context,
         )
-        name = str(raw.get("name") or "").strip()
-        if not name:
+        name_value = raw.get("name")
+        if not isinstance(name_value, str) or not name_value.strip():
             raise ConfigError(f"{context} requires a non-empty 'name'")
-        for key in ("host", "endpoint", "model", "discovery"):
-            value = raw.get(key) or {}
-            if not isinstance(value, dict):
-                raise ConfigError(f"{context}.{key} must be a mapping")
-        endpoint = EndpointSpec.from_mapping(raw.get("endpoint") or {}, default_name=name)
+        name = name_value.strip()
+        host_raw = _mapping_section(raw, "host", context=context)
+        endpoint_raw = _mapping_section(raw, "endpoint", context=context)
+        model_raw = _mapping_section(raw, "model", context=context)
+        discovery_raw = _mapping_section(raw, "discovery", context=context)
+        endpoint = EndpointSpec.from_mapping(
+            endpoint_raw,
+            default_name=name,
+            context=f"{context}.endpoint",
+        )
         model = ModelSelection.from_mapping(
-            raw.get("model") or {}, endpoint_model=endpoint.model
+            model_raw,
+            endpoint_model=endpoint.model,
+            context=f"{context}.model",
         )
         return cls(
             name=name,
-            host=HostAccess.from_mapping(raw.get("host") or {}),
+            host=HostAccess.from_mapping(host_raw, context=f"{context}.host"),
             endpoint=endpoint,
             model=model,
-            discovery=DiscoveryPolicy.from_mapping(raw.get("discovery") or {}),
+            discovery=DiscoveryPolicy.from_mapping(
+                discovery_raw,
+                context=f"{context}.discovery",
+            ),
         )
 
     def safe_json(self) -> dict[str, Any]:
@@ -413,6 +540,7 @@ class TargetSpec:
             "discovery": self.discovery.safe_json(),
         }
 
+
 @dataclass(frozen=True)
 class ResolvedTarget:
     spec_name: str
@@ -421,7 +549,7 @@ class ResolvedTarget:
     service: ServiceDiscovery
     model: ModelDescriptor
     selection: str
-    tokenizer: str | None = None
+    expected_host_fingerprint: str | None = None
 
     @property
     def topology(self) -> dict[str, str]:
@@ -438,10 +566,9 @@ class ResolvedTarget:
             {
                 "requested_id": self.endpoint.model,
                 "selection": self.selection,
-                "tokenizer": self.tokenizer,
             }
         )
-        return {
+        result = {
             "schema_version": 1,
             "name": self.spec_name,
             "host": self.host.safe_json(),
@@ -449,6 +576,13 @@ class ResolvedTarget:
             "model": model_json,
             "topology": self.topology,
         }
+        binding = _host_identity_binding(
+            self.expected_host_fingerprint,
+            self.host,
+        )
+        if binding is not None:
+            result["host_identity_binding"] = binding
+        return result
 
 
 @dataclass(frozen=True)
@@ -471,7 +605,7 @@ class TargetInspection:
             result["status"] = "available"
             result["errors"] = list(self.errors)
             return result
-        return {
+        result = {
             "schema_version": 1,
             "name": self.spec.name,
             "status": "unavailable",
@@ -486,23 +620,68 @@ class TargetInspection:
             },
             "errors": list(self.errors),
         }
+        binding = _host_identity_binding(
+            self.spec.host.expected_fingerprint,
+            self.host,
+        )
+        if binding is not None:
+            result["host_identity_binding"] = binding
+        return result
 
 
 def _is_loopback_host(hostname: str | None) -> bool:
     if hostname is None:
         return False
-    if hostname.casefold() == "localhost":
+    normalized = hostname.casefold().rstrip(".")
+    if (
+        normalized == "localhost"
+        or normalized.startswith("localhost.")
+        or normalized.endswith(".localhost")
+        or normalized in {"ip6-localhost", "localhost6", "localhost6.localdomain6"}
+    ):
         return True
     try:
-        return ipaddress.ip_address(hostname).is_loopback
+        return ipaddress.ip_address(normalized).is_loopback
     except ValueError:
-        return False
+        try:
+            packed = socket.inet_aton(normalized)
+        except OSError:
+            return False
+        return ipaddress.ip_address(packed).is_loopback
+
+
+def _is_client_local_host(hostname: str | None) -> bool:
+    if hostname is None or _is_loopback_host(hostname):
+        return hostname is not None
+    normalized = hostname.casefold().rstrip(".")
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError:
+        try:
+            address = ipaddress.ip_address(socket.inet_aton(normalized))
+        except OSError:
+            return False
+    return address.is_unspecified
+
+
+def _host_identity_binding(
+    expected_fingerprint: str | None,
+    host: HostDiscovery | None,
+) -> dict[str, Any] | None:
+    if expected_fingerprint is None:
+        return None
+    actual = host.profile.get("host_fingerprint") if host is not None else None
+    return {
+        "expected_fingerprint": expected_fingerprint,
+        "actual_fingerprint": actual,
+        "verified": actual == expected_fingerprint,
+    }
 
 
 def _measurement_scope(host_access: str, base_url: str) -> str:
     if host_access == HOST_ACCESS_SSH:
         return "remote_client_to_server"
-    if _is_loopback_host(urlparse(base_url).hostname):
+    if _is_client_local_host(urlparse(base_url).hostname):
         return "local_loopback"
     return "local_client_to_network_endpoint"
 
@@ -512,7 +691,7 @@ def load_target_spec(path: str | Path) -> tuple[Path, TargetSpec]:
     if "target" in raw:
         reject_unknown_keys(raw, {"schema_version", "target"}, context=str(config_path))
         schema_version = raw.get("schema_version", 1)
-        if schema_version != 1:
+        if isinstance(schema_version, bool) or schema_version != 1:
             raise ConfigError(f"{config_path} schema_version must be 1, got {schema_version!r}")
         target_raw = raw["target"]
         if not isinstance(target_raw, dict):

@@ -92,7 +92,11 @@ def test_linux_system_profile_projects_proc_nvidia_and_dgx_metadata(monkeypatch)
     monkeypatch.setattr(
         system,
         "_nvidia_profile",
-        lambda: {"driver_version": "580.10", "cuda_runtime_version": "13.0"},
+        lambda: {
+            "driver_version": "580.10",
+            "cuda_driver_supported_version": "13.0",
+            "cuda_runtime_version": "13.0",
+        },
     )
     monkeypatch.setattr(system, "_dgx_profile", lambda _linux: {"model": "DGX Spark"})
     monkeypatch.setattr(system, "_git_output", lambda *_args: None)
@@ -106,6 +110,7 @@ def test_linux_system_profile_projects_proc_nvidia_and_dgx_metadata(monkeypatch)
     assert profile["hardware"]["chip"] == "NVIDIA Grace"
     assert profile["hardware"]["memory_gb"] == 128.0
     assert profile["nvidia"]["cuda_runtime_version"] == "13.0"
+    assert profile["nvidia"]["cuda_driver_supported_version"] == "13.0"
     assert profile["dgx"]["model"] == "DGX Spark"
 
 
@@ -134,6 +139,7 @@ def test_nvidia_profile_captures_driver_cuda_and_gpu_details(monkeypatch):
 
     assert profile["driver_version"] == "580.10"
     assert profile["cuda_runtime_version"] == "13.0"
+    assert profile["cuda_driver_supported_version"] == "13.0"
     assert profile["cuda_toolkit_version"] == "13.0"
     assert profile["gpus"][0]["name"] == "NVIDIA GB10"
     assert profile["gpus"][0]["memory_total_mb"] == 122880.0

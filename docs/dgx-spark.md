@@ -13,13 +13,23 @@ The harness never starts, stops, signals, or reconfigures the model service.
 Copy `targets/dgx-spark-vllm.yaml` and set:
 
 - `host.destination` to an OpenSSH destination such as `dgx`.
+- `host.expected_fingerprint` after the first trusted inspection when the SSH
+  alias should be pinned to one physical machine.
 - `endpoint.base_url` to the client-visible URL, including `/v1`.
 - `model.id` with `selection: explicit` when the server exposes multiple IDs.
-- `model.tokenizer` when lm-eval cannot load the served ID as a tokenizer.
 
 The SSH destination and HTTP hostname intentionally do not have to match. For
 example, SSH can use `dgx` while requests use
 `http://aitopatom-41de.local:8000/v1`.
+
+For an identity-pinned setup, first inspect the intended machine over a trusted
+SSH connection and copy `host.profile.host_fingerprint` into
+`host.expected_fingerprint`. Future inspections fail closed if the SSH alias
+resolves to a different machine or inventory cannot provide that fingerprint.
+This binding works across SSH alias and username overrides and does not require
+the SSH control-plane name to equal the HTTP data-plane hostname. vLLM does not
+expose the probe fingerprint over its HTTP API, so the target configuration is
+still the explicit association between that pinned host and the service URL.
 
 ## Inspect while vLLM is offline
 
@@ -57,12 +67,29 @@ recording dtype, context, parallelism, cache, and tokenizer configuration, but
 the suite does not depend on its version-specific shape.
 
 Set `discovery.service_required: false` for a host profile that should inspect
-successfully while vLLM is offline. Benchmark suites still require a healthy
-service and concrete model. Set `discovery.metrics: false` when the server's
-Prometheus endpoint should not be sampled.
+successfully while vLLM is offline. This tolerates only service unavailability;
+required-host inventory failures, fingerprint mismatches, malformed discovery
+responses, and missing or ambiguous model selections still fail. Benchmark
+suites require a healthy service and concrete model. Set
+`discovery.metrics: false` when the server's Prometheus endpoint should not be
+sampled.
 
 Keep the vLLM port on a trusted network. Some observability endpoints, including
 server configuration and metrics, may not be protected by the OpenAI API key.
+
+For an authenticated endpoint, set `endpoint.api_key_env` to the name of an
+environment variable containing the Bearer token. Discovery, preflight, load,
+and lm-eval then use the same credential. The lm-eval child receives the token
+only in its environment, never in command arguments. Because the pinned
+lm-eval API adapter cannot safely receive arbitrary headers, quality runs reject
+custom headers and non-Bearer `Authorization` values instead of silently
+dropping them.
+
+The pinned `local-chat-completions` backend does not perform client-side
+tokenization or token-aware truncation. The harness therefore rejects a quality
+`tokenizer` setting rather than pretending it is active. Keep quality request
+sizes within the discovered `max_model_len`; use a completions backend only when
+the service actually exposes `/v1/completions` and the selected tasks support it.
 
 ## Run the smoke suite
 
@@ -94,4 +121,7 @@ target and `http://127.0.0.1:8000/v1`; this is a different comparison topology.
 
 DGX Spark uses unified CPU/GPU memory. The probe records `/proc/meminfo` as the
 system capacity and labels NVIDIA's value as reported device memory rather than
-assuming discrete VRAM.
+assuming discrete VRAM. NVIDIA-SMI's `CUDA Version` is recorded as
+`cuda_driver_supported_version`, because it is the newest CUDA level supported
+by the driver rather than an observed runtime; `cuda_runtime_version` remains a
+schema-compatibility alias.

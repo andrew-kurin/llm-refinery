@@ -20,6 +20,7 @@ def test_endpoint_uses_protocol_and_rejects_legacy_provider_field():
 
     assert endpoint.base_url == "https://example.test/v1"
     assert endpoint.chat_completions_url == "https://example.test/v1/chat/completions"
+    assert endpoint.completions_url == "https://example.test/v1/completions"
     assert endpoint.safe_json() == {
         "name": "remote",
         "protocol": "openai_chat",

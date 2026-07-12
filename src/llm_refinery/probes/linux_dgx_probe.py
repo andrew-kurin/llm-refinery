@@ -143,12 +143,17 @@ def _nvidia_profile():
     summary = _command([executable], timeout=2) or ""
     driver_match = re.search(r"Driver Version:\s*([0-9.]+)", summary)
     cuda_match = re.search(r"CUDA Version:\s*([0-9.]+)", summary)
+    driver_supported_cuda = cuda_match.group(1) if cuda_match else None
     profile = _drop_none(
         {
             "available": True,
             "query_supported": output is not None,
             "driver_version": driver_match.group(1) if driver_match else None,
-            "cuda_runtime_version": cuda_match.group(1) if cuda_match else None,
+            # nvidia-smi reports the newest CUDA version supported by the
+            # installed driver, not the CUDA runtime loaded by this process.
+            "cuda_driver_supported_version": driver_supported_cuda,
+            # Retain the original field for consumers of probe schema v1.
+            "cuda_runtime_version": driver_supported_cuda,
         }
     )
     nvcc = shutil.which("nvcc")

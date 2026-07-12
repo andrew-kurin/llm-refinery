@@ -369,6 +369,9 @@ def _nvidia_profile() -> dict[str, Any]:
             profile["driver_version"] = driver_match.group(1)
         cuda_match = re.search(r"CUDA Version:\s*([0-9.]+)", summary or "")
         if cuda_match:
+            # This is the driver's maximum supported CUDA level, not a loaded
+            # runtime. Keep the old key as a schema-v2 compatibility alias.
+            profile["cuda_driver_supported_version"] = cuda_match.group(1)
             profile["cuda_runtime_version"] = cuda_match.group(1)
         if not gpus:
             listed_gpus = _parse_nvidia_gpu_list(_command_output([smi_path, "-L"], timeout=5) or "")

@@ -269,12 +269,17 @@ class SuiteConfig:
                 raise ConfigError("suite target must be a mapping or target YAML path")
             endpoint = None
         else:
-            endpoint_value = endpoint_value or {
-                "name": "local",
-                "protocol": OPENAI_CHAT,
-                "base_url": "http://127.0.0.1:8080/v1",
-                "model": "local-model",
-            }
+            if endpoint_value is None:
+                if schema_version >= 2:
+                    raise ConfigError(
+                        "suite schema_version 2 requires exactly one of 'endpoint' or 'target'"
+                    )
+                endpoint_value = {
+                    "name": "local",
+                    "protocol": OPENAI_CHAT,
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "model": "local-model",
+                }
             if not isinstance(endpoint_value, dict):
                 raise ConfigError("suite endpoint must be a mapping")
             endpoint = Endpoint.from_mapping(
