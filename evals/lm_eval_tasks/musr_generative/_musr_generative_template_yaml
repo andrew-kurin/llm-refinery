@@ -1,0 +1,31 @@
+dataset_path: TAUR-Lab/MuSR
+dataset_kwargs:
+  revision: 7c365b439a222150f317764d4f16ae6c96d7d94a
+output_type: generate_until
+process_docs: !function utils.process_docs
+doc_to_text: !function utils.doc_to_text
+doc_to_target: answer_label
+generation_kwargs:
+  until:
+    - "</s>"
+    - "<|im_end|>"
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 32
+filter_list:
+  - name: strict-match
+    filter:
+      - function: regex
+        regex_pattern: "^\\s*([1-9])\\s*[.)]?\\s*$"
+      - function: take_first
+  - name: flexible-extract
+    filter:
+      - function: regex
+        regex_pattern: "(?i)(?:answer|choice|option)(?:\\s+is)?\\s*[:#-]?\\s*([1-9])|^\\s*([1-9])"
+      - function: take_first
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0-llm-refinery-generative

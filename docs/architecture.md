@@ -63,14 +63,15 @@ execution, parser, and metrics where applicable:
 - `http_load`
 - `lm_eval`
 - `agent`
+- `dabstep`
 
 `benchmarks.registry` maps `benchmark_kind` to the correct artifact reparser. A
 reparser must never inspect artifacts owned by another benchmark kind.
 
 Agent benchmark implementations have a second, agent-specific registry. This is
-appropriate for request/scoring adapters such as GeoAnalystBench. External-process
-benchmarks such as DABStep should receive their own top-level benchmark slice rather
-than being forced into the chat request protocol.
+appropriate for request/scoring adapters such as GeoAnalystBench. DABStep has its
+own top-level external-process slice, which preserves the upstream agent loop while
+using the shared lifecycle, artifacts, samples, resume checks, and reparsing system.
 
 ## Endpoints and protocols
 

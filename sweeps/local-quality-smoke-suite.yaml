@@ -1,0 +1,33 @@
+name: local-quality-smoke
+
+database: results/llm_refinery.duckdb
+
+endpoint:
+  name: local
+  protocol: openai_chat
+  base_url: http://127.0.0.1:8080/v1
+  model: local-model
+
+# Pipeline validation only. Do not use this limited tier to rank models.
+quality:
+  enabled: true
+  tasks: ifeval_pinned,ifbench,gpqa_diamond_fixed_generative,musr_generative,mmlu_pro_pinned
+  limit: 10
+  max_length: 32768
+  include_path: ../evals/lm_eval_tasks
+  package_spec: "lm-eval[api]==0.4.12"
+  extra_packages:
+    - "ifbench @ git+https://github.com/allenai/IFBench.git@1091c4c3de6c1f6ed12c012ed68f11ea450b0117"
+    - emoji==2.15.0
+    - nltk==3.9.2
+    - setuptools==80.9.0
+    - syllapy==0.7.2
+  offline: false
+
+http_load:
+  enabled: false
+
+preflight:
+  enabled: true
+  require_clean: true
+  sanity_check: true

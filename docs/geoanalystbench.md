@@ -15,19 +15,24 @@ and aggregate metrics.
 Current normalized metrics include:
 
 - `request_count`
-- `success_count`
-- `success_rate`
+- `response_count`
+- `response_availability_rate` (transport succeeded and non-empty content was returned)
 - `error_count`
 - latency percentiles
 - response character statistics
 - token totals/throughput when the endpoint reports usage
 - `workflow_step_count_avg`
 - `workflow_step_abs_error_avg`
-- `code_syntax_pass_rate`
+- `code_syntax_valid_rate`
+- `code_model_function_rate`
+- `code_contract_pass_rate` (valid Python with a top-level `model()` function)
+- `code_reference_import_recall_avg` and `code_reference_call_recall_avg`
 
-These are intentionally lightweight automatic checks. They do not fully reproduce
-human/judge workflow similarity scoring from the paper, and code syntax success is
-not the same as executing GIS outputs against the original data.
+These are intentionally structural diagnostics, not correctness scores. Response
+availability says nothing about task quality. The code contract does not execute the
+program, and reference import/call recall only measures overlap with one human reference;
+valid alternative solutions may have low overlap. These checks do not reproduce the
+paper's human/judge workflow similarity scoring or validate GIS outputs.
 
 ## Smoke run
 
@@ -43,10 +48,11 @@ Compare results:
 ```bash
 uv run llm-refinery compare results/llm_refinery.duckdb \
   --suite geoanalystbench-smoke \
-  --metric success_rate \
+  --metric response_availability_rate \
   --metric workflow_step_abs_error_avg \
-  --metric code_syntax_pass_rate \
-  --sort success_rate \
+  --metric code_contract_pass_rate \
+  --metric code_reference_call_recall_avg \
+  --sort code_contract_pass_rate \
   --param target \
   --param response_types \
   --param system.hardware.model \
@@ -87,5 +93,7 @@ targets:
 - Add optional judge-based workflow similarity scoring.
 - Add code execution for tasks whose data can be downloaded locally.
 - Add resume semantics on top of the existing task-level `samples` table.
-- Add a separate external-process adapter for DABStep rather than forcing it
-  through the chat-request-specific agent interface.
+
+DABStep uses the separate external-process adapter documented in
+[`dabstep.md`](dabstep.md); it is intentionally not routed through this
+chat-request interface.

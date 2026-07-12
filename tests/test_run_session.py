@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from llm_refinery.application.run_session import RunSession
 from llm_refinery.core.runs import RunSpec
 from llm_refinery.storage.duckdb import ResultStore
@@ -37,3 +39,36 @@ def test_run_session_records_identity_metrics_and_typed_artifacts(tmp_path: Path
     assert rows[0]["metrics"] == {"success_count": 1.0}
     assert rows[0]["artifacts"]["responses"]["media_type"] == "application/x-ndjson"
     assert Path(rows[0]["artifacts"]["responses"]["path"]).read_text() == '{"ok": true}\n'
+
+
+def test_run_session_refuses_to_resume_with_a_different_spec(tmp_path: Path):
+    database = tmp_path / "runs.duckdb"
+    original = RunSpec.create(
+        benchmark_kind="dabstep",
+        suite="dabstep",
+        label="dabstep/local",
+        command="python baseline/run.py --max-steps 10",
+        config_json={"max_steps": 10},
+        database=database,
+    )
+    changed = RunSpec.create(
+        benchmark_kind="dabstep",
+        suite="dabstep",
+        label="dabstep/local",
+        command="python baseline/run.py --max-steps 20",
+        config_json={"max_steps": 20},
+        database=database,
+    )
+
+    with ResultStore(database) as store:
+        with RunSession(store, original, system_profile={}) as run:
+            run.complete(status="failed", error="interrupted")
+        with (
+            pytest.raises(RuntimeError, match="does not match"),
+            RunSession(
+                store,
+                changed,
+                resume_run_id=run.run_id,
+            ),
+        ):
+            pass

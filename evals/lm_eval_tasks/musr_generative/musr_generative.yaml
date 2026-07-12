@@ -1,0 +1,9 @@
+group: musr_generative
+task:
+  - musr_murder_mysteries_generative
+  - musr_object_placements_generative
+  - musr_team_allocation_generative
+aggregate_metric_list:
+  - metric: exact_match
+    aggregation: mean
+    weight_by_size: true

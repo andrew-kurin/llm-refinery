@@ -1,4 +1,6 @@
 dataset_path: Idavidrein/gpqa
+dataset_kwargs:
+  revision: 633f5ee89ab8ad4522a9f850766b73f62147ffdd
 tag: gpqa_fixed
 output_type: generate_until
 process_docs: !function utils.process_docs
@@ -34,4 +36,5 @@ metric_list:
     ignore_case: true
     ignore_punctuation: true
 metadata:
-  version: 2.3-llm-refinery-question-marker-fix
+  version: 2.4-llm-refinery-deterministic-choice-order
+  dataset_revision: 633f5ee89ab8ad4522a9f850766b73f62147ffdd

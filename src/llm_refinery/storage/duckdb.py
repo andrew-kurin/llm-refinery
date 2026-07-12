@@ -127,6 +127,32 @@ class ResultStore:
             for row in rows
         ]
 
+    def run_resume_state(self, run_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT benchmark_kind, spec_hash, parent_run_id, schema_version, trial_name,
+                   status, started_at, duration_s, system_json
+            FROM runs
+            WHERE run_id = ?
+            """,
+            [run_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "run_id": run_id,
+            "benchmark_kind": row[0],
+            "spec_hash": row[1],
+            "parent_run_id": row[2],
+            "schema_version": row[3],
+            "trial_name": row[4],
+            "status": row[5],
+            "started_at": row[6],
+            "duration_s": float(row[7]),
+            "system_json": json.loads(row[8] or "{}"),
+            "artifacts": self.artifacts_for_runs([run_id]).get(run_id, {}),
+        }
+
     def recent_runs(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             """

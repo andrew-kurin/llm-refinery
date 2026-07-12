@@ -7,8 +7,10 @@ import duckdb
 
 from llm_refinery import __version__
 from llm_refinery.commands.agent_eval import agent_eval_command
+from llm_refinery.commands.dabstep import dabstep_command
 from llm_refinery.commands.http_load import http_load_command
 from llm_refinery.commands.lm_eval import lm_eval_command
+from llm_refinery.commands.quality_compare import quality_compare_command
 from llm_refinery.commands.reporting import compare_command, reparse_command, report_command
 from llm_refinery.commands.suite import suite_command
 from llm_refinery.commands.sweep import bench_command, init_command, plan_command, server_command
@@ -41,10 +43,12 @@ main.add_command(agent_eval_command)
 main.add_command(backfill_system_metadata_command)
 main.add_command(bench_command)
 main.add_command(compare_command)
+main.add_command(dabstep_command)
 main.add_command(http_load_command)
 main.add_command(init_command)
 main.add_command(lm_eval_command)
 main.add_command(plan_command)
+main.add_command(quality_compare_command)
 main.add_command(reparse_command)
 main.add_command(report_command)
 main.add_command(server_command)

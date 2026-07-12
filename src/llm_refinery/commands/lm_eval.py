@@ -18,7 +18,18 @@ from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
 @click.option("--num-concurrent", type=int, default=1, show_default=True)
 @click.option("--max-retries", type=int, default=3, show_default=True)
 @click.option("--max-length", type=int, default=16384, show_default=True)
-@click.option("--eos-string", default="<turn|>", show_default=True)
+@click.option(
+    "--eos-string",
+    help="Optional model-specific EOS string; omit to use the evaluator/backend default.",
+)
+@click.option(
+    "--tokenizer",
+    help="Tokenizer id/path for token-aware tasks such as RULER.",
+)
+@click.option(
+    "--metadata",
+    help='lm-eval metadata JSON, e.g. {"max_seq_lengths":[4096,8192]}.',
+)
 @click.option("--gen-kwargs", help="Extra lm-eval generation kwargs for API backends.")
 @click.option(
     "--model-backend",
@@ -29,9 +40,15 @@ from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
 )
 @click.option(
     "--package-spec",
-    default="lm-eval[api]",
+    default="lm-eval[api]==0.4.12",
     show_default=True,
     help="uvx package spec; pin a version for reproducible runs.",
+)
+@click.option(
+    "--with-package",
+    "extra_packages",
+    multiple=True,
+    help="Additional pinned package for the evaluator environment; repeat as needed.",
 )
 @click.option(
     "--apply-chat-template/--no-apply-chat-template",
@@ -72,7 +89,7 @@ from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
     "--offline/--online",
     default=True,
     show_default=True,
-    help="Set HF_DATASETS_OFFLINE.",
+    help="Set Hugging Face datasets and hub offline mode.",
 )
 @click.option("--dry-run", is_flag=True, help="Print uvx commands without running lm-eval.")
 def lm_eval_command(
@@ -82,10 +99,13 @@ def lm_eval_command(
     num_concurrent: int,
     max_retries: int,
     max_length: int,
-    eos_string: str,
+    eos_string: str | None,
+    tokenizer: str | None,
+    metadata: str | None,
     gen_kwargs: str | None,
     model_backend: str,
     package_spec: str,
+    extra_packages: tuple[str, ...],
     apply_chat_template: bool,
     include_path: Path | None,
     suite_name: str,
@@ -138,6 +158,8 @@ def lm_eval_command(
             max_retries=max_retries,
             max_length=max_length,
             eos_string=eos_string,
+            tokenizer=tokenizer,
+            metadata=metadata,
             log_samples=log_samples,
             num_fewshot=num_fewshot,
             gen_kwargs=gen_kwargs,
@@ -145,6 +167,7 @@ def lm_eval_command(
             offline=offline,
             model_backend=model_backend,
             package_spec=package_spec,
+            extra_packages=extra_packages,
             apply_chat_template=apply_chat_template,
             include_path=include_path,
             suite_name=suite_name,

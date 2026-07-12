@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,11 +21,15 @@ class QualityStep:
     limit: int | None = 50
     num_fewshot: int | None = None
     max_length: int = 8192
-    eos_string: str = "<turn|>"
+    eos_string: str | None = None
+    tokenizer: str | None = None
+    metadata: str | None = None
     gen_kwargs: str | None = None
     include_path: Path | None = None
     output_root: Path = Path("results/lm_eval")
-    package_spec: str = "lm-eval[api]"
+    package_spec: str = "lm-eval[api]==0.4.12"
+    extra_packages: tuple[str, ...] = ()
+    offline: bool = True
 
     def __post_init__(self) -> None:
         if self.limit is not None and self.limit <= 0:
@@ -33,6 +38,15 @@ class QualityStep:
             raise ConfigError("suite quality.max_length must be positive")
         if not self.package_spec.strip():
             raise ConfigError("suite quality.package_spec cannot be empty")
+        if any(not package.strip() for package in self.extra_packages):
+            raise ConfigError("suite quality.extra_packages cannot contain empty values")
+        if self.metadata is not None:
+            try:
+                metadata = json.loads(self.metadata)
+            except json.JSONDecodeError as exc:
+                raise ConfigError(f"suite quality.metadata must be valid JSON: {exc}") from exc
+            if not isinstance(metadata, dict):
+                raise ConfigError("suite quality.metadata must be a JSON object")
 
     @classmethod
     def from_mapping(
@@ -48,10 +62,14 @@ class QualityStep:
                 "num_fewshot",
                 "max_length",
                 "eos_string",
+                "tokenizer",
+                "metadata",
                 "gen_kwargs",
                 "include_path",
                 "output_root",
                 "package_spec",
+                "extra_packages",
+                "offline",
             },
             context="suite quality step",
         )
@@ -65,19 +83,31 @@ class QualityStep:
         include_path = Path(str(raw["include_path"])) if raw.get("include_path") else None
         if include_path is not None and source_path is not None and not include_path.is_absolute():
             include_path = source_path.parent / include_path
+        metadata_raw = raw.get("metadata")
+        metadata = (
+            json.dumps(metadata_raw, sort_keys=True, separators=(",", ":"))
+            if isinstance(metadata_raw, dict)
+            else str(metadata_raw)
+            if metadata_raw is not None
+            else None
+        )
         return cls(
             enabled=bool(raw.get("enabled", True)),
             tasks=str(raw.get("tasks") or "ifeval,gsm8k"),
             limit=limit,
-            num_fewshot=int(raw["num_fewshot"])
-            if raw.get("num_fewshot") is not None
-            else None,
+            num_fewshot=int(raw["num_fewshot"]) if raw.get("num_fewshot") is not None else None,
             max_length=max_length,
-            eos_string=str(raw.get("eos_string") or "<turn|>"),
+            eos_string=str(raw["eos_string"]) if raw.get("eos_string") else None,
+            tokenizer=str(raw["tokenizer"]) if raw.get("tokenizer") else None,
+            metadata=metadata,
             gen_kwargs=str(raw["gen_kwargs"]) if raw.get("gen_kwargs") else None,
             include_path=include_path,
             output_root=Path(str(raw.get("output_root") or "results/lm_eval")),
-            package_spec=str(raw.get("package_spec") or "lm-eval[api]"),
+            package_spec=str(raw.get("package_spec") or "lm-eval[api]==0.4.12"),
+            extra_packages=tuple(
+                str(package) for package in coerce_list(raw.get("extra_packages"))
+            ),
+            offline=bool(raw.get("offline", True)),
         )
 
     def safe_json(self) -> dict[str, Any]:
@@ -88,10 +118,14 @@ class QualityStep:
             "num_fewshot": self.num_fewshot,
             "max_length": self.max_length,
             "eos_string": self.eos_string,
+            "tokenizer": self.tokenizer,
+            "metadata": self.metadata,
             "gen_kwargs": self.gen_kwargs,
             "include_path": str(self.include_path) if self.include_path else None,
             "output_root": str(self.output_root),
             "package_spec": self.package_spec,
+            "extra_packages": list(self.extra_packages),
+            "offline": self.offline,
         }
 
 
@@ -103,9 +137,7 @@ class HttpLoadStep:
     scenarios: tuple[str, ...] = ()
 
     @classmethod
-    def from_mapping(
-        cls, raw: dict[str, Any] | None, *, source_path: Path | None
-    ) -> HttpLoadStep:
+    def from_mapping(cls, raw: dict[str, Any] | None, *, source_path: Path | None) -> HttpLoadStep:
         raw = raw or {}
         reject_unknown_keys(
             raw,
@@ -140,18 +172,24 @@ class PreflightStep:
     require_clean: bool = True
     forbidden_ports: tuple[int, ...] = (8081, 8082, 8083)
     sanity_check: bool = True
+    expected_response_model: str | None = None
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any] | None) -> PreflightStep:
         raw = raw or {}
         reject_unknown_keys(
             raw,
-            {"enabled", "require_clean", "forbidden_ports", "sanity_check"},
+            {
+                "enabled",
+                "require_clean",
+                "forbidden_ports",
+                "sanity_check",
+                "expected_response_model",
+            },
             context="suite preflight step",
         )
         forbidden_ports = tuple(
-            int(value)
-            for value in coerce_list(raw.get("forbidden_ports", [8081, 8082, 8083]))
+            int(value) for value in coerce_list(raw.get("forbidden_ports", [8081, 8082, 8083]))
         )
         if any(port <= 0 or port > 65535 for port in forbidden_ports):
             raise ConfigError("suite preflight.forbidden_ports must be valid TCP ports")
@@ -160,6 +198,9 @@ class PreflightStep:
             require_clean=bool(raw.get("require_clean", True)),
             forbidden_ports=forbidden_ports,
             sanity_check=bool(raw.get("sanity_check", True)),
+            expected_response_model=(
+                str(raw["expected_response_model"]) if raw.get("expected_response_model") else None
+            ),
         )
 
     def safe_json(self) -> dict[str, Any]:
@@ -168,6 +209,7 @@ class PreflightStep:
             "require_clean": self.require_clean,
             "forbidden_ports": list(self.forbidden_ports),
             "sanity_check": self.sanity_check,
+            "expected_response_model": self.expected_response_model,
         }
 
 

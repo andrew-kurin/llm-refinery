@@ -1,0 +1,21 @@
+name: dabstep-smoke
+database: results/llm_refinery.duckdb
+
+endpoint:
+  name: local
+  protocol: openai_chat
+  base_url: http://127.0.0.1:8080/v1
+  model: local-model
+
+dabstep:
+  workspace: ../vendor/DABstep
+  command: [.venv/bin/python, baseline/run.py]
+  dataset_repo: adyen/DABstep
+  dataset_revision: e68a4553c079601b09131851f4b7c6be9680d560
+  split: dev
+  task_ids: [5, 49]
+  limit: all
+  concurrency: 1
+  max_steps: 10
+  timeout_s: 900
+  retries: 1

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -64,10 +65,15 @@ class BenchmarkSuiteWorkflow:
         with ResultStore(self.config.database) as store, RunSession(store, spec) as run:
             before_path = run.artifact("system_before", "system-before.txt", "text/plain")
             after_path = run.artifact("system_after", "system-after.txt", "text/plain")
+            preflight_path = run.artifact("preflight", "preflight.json", "application/json")
             try:
                 before_snapshot = self.system_snapshot()
                 before_path.write_text(before_snapshot, encoding="utf-8")
-                self.preflight(before_snapshot)
+                preflight_result = self.preflight(before_snapshot)
+                preflight_path.write_text(
+                    json.dumps(preflight_result, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
                 children.extend(self.run_quality(store, parent_run_id=run.run_id))
                 children.extend(self.run_load(store, parent_run_id=run.run_id))
             finally:
@@ -90,10 +96,10 @@ class BenchmarkSuiteWorkflow:
         self._log("Done.")
         return SuiteResult(run=outcome, children=tuple(children))
 
-    def preflight(self, snapshot: str | None = None) -> None:
+    def preflight(self, snapshot: str | None = None) -> dict[str, Any]:
         config = self.config.preflight
         if not config.enabled:
-            return
+            return {"enabled": False}
         self._log("Performing preflight checks...")
         endpoint = self.config.endpoint
         parsed = urlparse(endpoint.base_url)
@@ -115,20 +121,33 @@ class BenchmarkSuiteWorkflow:
         self._log("Memory/process snapshot before")
         self.console.print(snapshot if snapshot is not None else self.system_snapshot())
         if not config.sanity_check:
-            return
+            return {"enabled": True, "sanity_check": False}
 
         self._log("Sanity check: content present")
         sanity = self.sanity_checker(endpoint)
         if not sanity["success"]:
             raise RuntimeError(str(sanity["error"]))
+        if (
+            config.expected_response_model is not None
+            and sanity.get("response_model") != config.expected_response_model
+        ):
+            raise RuntimeError(
+                "endpoint returned model "
+                f"{sanity.get('response_model')!r}; expected "
+                f"{config.expected_response_model!r}"
+            )
         for key in (
             "elapsed_s",
             "content_len",
             "reasoning_len",
             "finish_reason",
+            "requested_model",
+            "response_model",
+            "model_matches",
             "content_preview",
         ):
             self.console.print(f"    {key}={sanity.get(key)}")
+        return {"enabled": True, "sanity_check": True, "sanity": sanity}
 
     def run_quality(self, store: ResultStore, *, parent_run_id: str) -> list[CompletedRun]:
         quality = self.config.quality
@@ -142,11 +161,15 @@ class BenchmarkSuiteWorkflow:
             tasks=quality.tasks,
             max_length=quality.max_length,
             eos_string=quality.eos_string,
+            tokenizer=quality.tokenizer,
+            metadata=quality.metadata,
             num_fewshot=quality.num_fewshot,
             gen_kwargs=quality.gen_kwargs,
             include_path=quality.include_path,
             output_root=quality.output_root,
             package_spec=quality.package_spec,
+            extra_packages=quality.extra_packages,
+            offline=quality.offline,
             suite_name=self.config.name,
             database=self.config.database,
             log_samples=True,
@@ -182,13 +205,15 @@ class BenchmarkSuiteWorkflow:
         rows = build_compare_rows(
             runs,
             metrics=(
-                "latency_p95_s",
-                "ttft_p95_s",
+                "observed_latency_p95_s",
+                "visible_ttft_p95_s",
+                "reasoning_ttft_p95_s",
+                "tpot_p95_s",
                 "completion_tokens_per_second",
                 "check_pass_rate",
             ),
             params=("target", "protocol", "scenario", "concurrency"),
-            sort_key="latency_p95_s",
+            sort_key="observed_latency_p95_s",
             ascending=True,
             limit=20,
         )

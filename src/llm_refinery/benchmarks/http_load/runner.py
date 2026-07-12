@@ -7,6 +7,7 @@ from pathlib import Path
 
 from llm_refinery.application.run_session import RunSession
 from llm_refinery.benchmarks.http_load.config import (
+    RECOMMENDED_MEASURED_REQUESTS,
     HttpLoadConfig,
     HttpLoadTrial,
     expand_http_load_trials,
@@ -114,22 +115,35 @@ def _run_one_http_load(
 
     print(f"[{index}/{total}] {spec.trial_name}")
     print(trial.command_text)
+    if trial.scenario.requests < RECOMMENDED_MEASURED_REQUESTS:
+        print(
+            "warning: only "
+            f"{trial.scenario.requests} measured requests; tail metrics are exploratory below "
+            f"the recommended minimum of {RECOMMENDED_MEASURED_REQUESTS}"
+        )
 
     with RunSession(store, spec) as run:
-        responses_path = run.artifact(
-            "responses", "responses.jsonl", "application/x-ndjson"
-        )
+        responses_path = run.artifact("responses", "responses.jsonl", "application/x-ndjson")
         errors_path = run.artifact("errors", "errors.txt", "text/plain")
         measurement_path = run.artifact("measurement", "measurement.json", "application/json")
 
-        if trial.scenario.warmup_requests:
-            run_requests(trial, count=trial.scenario.warmup_requests)
+        warmup_count = trial.effective_warmup_requests
+        warmup_results = run_requests(trial, count=warmup_count)
 
         measurement_started = time.perf_counter()
         results = run_requests(trial, count=trial.scenario.requests)
         duration_s = time.perf_counter() - measurement_started
         measurement_path.write_text(
-            json.dumps({"wall_duration_s": duration_s}, sort_keys=True),
+            json.dumps(
+                {
+                    "wall_duration_s": duration_s,
+                    "measured_request_count": trial.scenario.requests,
+                    "configured_warmup_requests": trial.scenario.warmup_requests,
+                    "effective_warmup_requests": warmup_count,
+                    "cache_mode": trial.scenario.cache_mode,
+                },
+                sort_keys=True,
+            ),
             encoding="utf-8",
         )
         metrics = summarize_request_results(
@@ -138,8 +152,16 @@ def _run_one_http_load(
             concurrency=trial.concurrency,
             max_tokens=trial.max_tokens,
         )
-        status = "ok" if metrics["error_count"] == 0 and metrics["success_count"] > 0 else "failed"
-        error = _first_error(results) if status != "ok" else None
+        warmup_errors = [result for result in warmup_results if not result.ok]
+        metrics["configured_warmup_requests"] = float(trial.scenario.warmup_requests)
+        metrics["effective_warmup_requests"] = float(warmup_count)
+        metrics["warmup_error_count"] = float(len(warmup_errors))
+        status = (
+            "ok"
+            if not warmup_errors and metrics["error_count"] == 0 and metrics["success_count"] > 0
+            else "failed"
+        )
+        error = _first_error([*warmup_results, *results]) if status != "ok" else None
 
         responses_path.write_text(
             "\n".join(json.dumps(result.as_jsonable(), sort_keys=True) for result in results)
@@ -147,7 +169,20 @@ def _run_one_http_load(
             encoding="utf-8",
         )
         errors_path.write_text(
-            "\n".join(result.error or "" for result in results if result.error),
+            "\n".join(
+                [
+                    *(
+                        f"warmup[{result.index}]: {result.error}"
+                        for result in warmup_results
+                        if result.error
+                    ),
+                    *(
+                        f"request[{result.index}]: {result.error}"
+                        for result in results
+                        if result.error
+                    ),
+                ]
+            ),
             encoding="utf-8",
         )
         for result in results:
@@ -157,7 +192,7 @@ def _run_one_http_load(
                     sample_id=str(result.index),
                     status="ok" if result.ok else "failed",
                     payload_json=_sample_payload(result),
-                    metrics={"latency_s": result.latency_s},
+                    metrics=_sample_metrics(result),
                     artifact_path=str(responses_path),
                     error=result.error,
                 )
@@ -177,7 +212,20 @@ def _run_one_http_load(
 def _sample_payload(result: RequestResult) -> dict[str, object]:
     payload = result.as_jsonable()
     payload.pop("response_text", None)
+    payload.pop("visible_response_text", None)
+    payload.pop("reasoning_response_text", None)
     return payload
+
+
+def _sample_metrics(result: RequestResult) -> dict[str, float]:
+    values = {
+        "latency_s": result.latency_s,
+        "ttft_s": result.ttft_s,
+        "visible_ttft_s": result.visible_ttft_s,
+        "reasoning_ttft_s": result.reasoning_ttft_s,
+        "tpot_s": result.tpot_s,
+    }
+    return {key: float(value) for key, value in values.items() if value is not None}
 
 
 def _first_error(results: list[RequestResult]) -> str | None:
@@ -190,8 +238,10 @@ def _first_error(results: list[RequestResult]) -> str | None:
 def _http_metric_summary(metrics: dict[str, float]) -> str:
     keys = [
         "requests_per_second",
-        "latency_p95_s",
-        "ttft_p95_s",
+        "observed_latency_p95_s",
+        "visible_ttft_p95_s",
+        "reasoning_ttft_p95_s",
+        "tpot_p95_s",
         "completion_tokens_per_second",
         "check_pass_rate",
         "error_count",

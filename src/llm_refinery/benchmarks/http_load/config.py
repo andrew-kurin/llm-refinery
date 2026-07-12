@@ -13,6 +13,9 @@ from llm_refinery.core.config import (
 from llm_refinery.core.endpoints import CHAT_PROTOCOLS, Endpoint
 from llm_refinery.core.runs import stable_hash
 
+CACHE_MODES = {"shared", "unique"}
+RECOMMENDED_MEASURED_REQUESTS = 100
+
 
 @dataclass(frozen=True)
 class HttpScenario:
@@ -29,6 +32,8 @@ class HttpScenario:
     timeout_s: float = 300.0
     prompt_repeat: int = 1
     expected_contains: list[str] = field(default_factory=list)
+    prompt_pool: tuple[str, ...] = ()
+    cache_mode: str = "shared"
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any], *, base_dir: Path) -> HttpScenario:
@@ -38,6 +43,8 @@ class HttpScenario:
                 "name",
                 "prompt",
                 "prompt_file",
+                "prompts",
+                "prompt_files",
                 "system",
                 "max_tokens",
                 "concurrency",
@@ -48,6 +55,7 @@ class HttpScenario:
                 "stream",
                 "timeout_s",
                 "prompt_repeat",
+                "cache_mode",
                 "expected_contains",
             },
             context="HTTP scenario",
@@ -56,13 +64,14 @@ class HttpScenario:
         if not name:
             raise ConfigError("each HTTP scenario requires a non-empty 'name'")
 
-        prompt = _scenario_prompt(raw, base_dir=base_dir)
+        prompts = _scenario_prompts(raw, base_dir=base_dir)
         max_tokens = [int(value) for value in coerce_list(raw.get("max_tokens", 128))]
         concurrency = [int(value) for value in coerce_list(raw.get("concurrency", 1))]
         requests = int(raw.get("requests", 8))
         warmup_requests = int(raw.get("warmup_requests", 0))
         prompt_repeat = int(raw.get("prompt_repeat", 1))
         timeout_s = float(raw.get("timeout_s", 300.0))
+        cache_mode = str(raw.get("cache_mode", "shared")).strip().lower()
 
         if any(value <= 0 for value in max_tokens):
             raise ConfigError(f"scenario {name!r} max_tokens values must be positive")
@@ -70,16 +79,22 @@ class HttpScenario:
             raise ConfigError(f"scenario {name!r} concurrency values must be positive")
         if requests <= 0:
             raise ConfigError(f"scenario {name!r} requests must be positive")
+        if any(value > requests for value in concurrency):
+            raise ConfigError(f"scenario {name!r} concurrency cannot exceed requests ({requests})")
         if warmup_requests < 0:
             raise ConfigError(f"scenario {name!r} warmup_requests cannot be negative")
         if prompt_repeat <= 0:
             raise ConfigError(f"scenario {name!r} prompt_repeat must be positive")
         if timeout_s <= 0:
             raise ConfigError(f"scenario {name!r} timeout_s must be positive")
+        if cache_mode not in CACHE_MODES:
+            choices = ", ".join(sorted(CACHE_MODES))
+            raise ConfigError(f"scenario {name!r} cache_mode must be one of: {choices}")
 
         return cls(
             name=name,
-            prompt=prompt,
+            prompt=prompts[0],
+            prompt_pool=tuple(prompts),
             system=str(raw["system"]) if raw.get("system") else None,
             max_tokens=max_tokens,
             concurrency=concurrency,
@@ -90,21 +105,44 @@ class HttpScenario:
             stream=bool(raw.get("stream", True)),
             timeout_s=timeout_s,
             prompt_repeat=prompt_repeat,
+            cache_mode=cache_mode,
             expected_contains=[str(value) for value in coerce_list(raw.get("expected_contains"))],
         )
 
     @property
     def rendered_prompt(self) -> str:
-        return "\n\n".join([self.prompt] * self.prompt_repeat)
+        return self.rendered_prompt_for(0)
+
+    @property
+    def prompts(self) -> tuple[str, ...]:
+        """Return the configured pool while retaining ``prompt`` compatibility."""
+        return self.prompt_pool or (self.prompt,)
+
+    def rendered_prompt_for(self, index: int, *, request_nonce: str | None = None) -> str:
+        """Select a prompt deterministically and apply the configured cache policy.
+
+        ``shared`` sends pool entries unchanged (a one-item pool is the legacy repeated-prompt
+        behavior). ``unique`` adds a nonce before the prompt, preventing a long shared user-prefix
+        from dominating measurements even when the pool wraps.
+        """
+        prompt = self.prompts[index % len(self.prompts)]
+        rendered = "\n\n".join([prompt] * self.prompt_repeat)
+        if self.cache_mode == "unique":
+            nonce = request_nonce or "direct"
+            return f"[llm-refinery cache-bust {nonce}:{index}]\n\n{rendered}"
+        return rendered
 
     def safe_json(self) -> dict[str, Any]:
-        rendered = self.rendered_prompt
+        rendered_prompts = ["\n\n".join([prompt] * self.prompt_repeat) for prompt in self.prompts]
+        rendered = rendered_prompts[0]
         return {
             "name": self.name,
             "system": self.system,
             "prompt_preview": rendered[:240],
             "prompt_chars": len(rendered),
             "prompt_hash": stable_hash(rendered),
+            "prompt_hashes": [stable_hash(prompt) for prompt in rendered_prompts],
+            "prompt_pool_size": len(rendered_prompts),
             "max_tokens": self.max_tokens,
             "concurrency": self.concurrency,
             "requests": self.requests,
@@ -114,6 +152,7 @@ class HttpScenario:
             "stream": self.stream,
             "timeout_s": self.timeout_s,
             "prompt_repeat": self.prompt_repeat,
+            "cache_mode": self.cache_mode,
             "expected_contains": self.expected_contains,
         }
 
@@ -182,8 +221,14 @@ class HttpLoadTrial:
             f"http-load protocol={self.target.protocol} base_url={self.target.base_url} "
             f"model={self.target.model} scenario={self.scenario.name} "
             f"concurrency={self.concurrency} requests={self.scenario.requests} "
-            f"max_tokens={self.max_tokens} stream={self.scenario.stream}"
+            f"max_tokens={self.max_tokens} stream={self.scenario.stream} "
+            f"cache_mode={self.scenario.cache_mode}"
         )
+
+    @property
+    def effective_warmup_requests(self) -> int:
+        """Warm every client slot, even when old manifests requested fewer warmups."""
+        return max(self.scenario.warmup_requests, self.concurrency)
 
     def as_jsonable(self) -> dict[str, Any]:
         return {
@@ -205,6 +250,10 @@ class HttpLoadTrial:
                 "max_tokens": self.max_tokens,
                 "stream": self.scenario.stream,
                 "temperature": self.scenario.temperature,
+                "cache_mode": self.scenario.cache_mode,
+                "prompt_pool_size": len(self.scenario.prompts),
+                "warmup_requests": self.effective_warmup_requests,
+                "recommended_measured_requests": RECOMMENDED_MEASURED_REQUESTS,
             },
         }
 
@@ -300,15 +349,34 @@ def _require_unique_names(names: list[str], *, context: str) -> None:
         raise ConfigError(f"{context} names must be unique")
 
 
-def _scenario_prompt(raw: dict[str, Any], *, base_dir: Path) -> str:
-    has_prompt = raw.get("prompt") is not None
-    has_prompt_file = raw.get("prompt_file") is not None
-    if has_prompt == has_prompt_file:
-        raise ConfigError("each HTTP scenario must set exactly one of 'prompt' or 'prompt_file'")
-    if has_prompt:
-        return str(raw["prompt"])
+def _scenario_prompts(raw: dict[str, Any], *, base_dir: Path) -> list[str]:
+    sources = [
+        key
+        for key in ("prompt", "prompt_file", "prompts", "prompt_files")
+        if raw.get(key) is not None
+    ]
+    if len(sources) != 1:
+        raise ConfigError(
+            "each HTTP scenario must set exactly one of 'prompt', 'prompt_file', "
+            "'prompts', or 'prompt_files'"
+        )
 
-    prompt_path = Path(str(raw["prompt_file"]))
+    source = sources[0]
+    if source == "prompt":
+        prompts = [str(raw[source])]
+    elif source == "prompts":
+        prompts = [str(value) for value in coerce_list(raw[source])]
+    else:
+        paths = coerce_list(raw[source])
+        prompts = [_read_prompt_file(value, base_dir=base_dir) for value in paths]
+
+    if not prompts or any(not prompt.strip() for prompt in prompts):
+        raise ConfigError("HTTP scenario prompt pools must contain non-empty prompts")
+    return prompts
+
+
+def _read_prompt_file(value: Any, *, base_dir: Path) -> str:
+    prompt_path = Path(str(value))
     if not prompt_path.is_absolute():
         prompt_path = base_dir / prompt_path
     return prompt_path.read_text(encoding="utf-8")

@@ -37,18 +37,15 @@ def run_api_sanity_check(
         )
 
         if not content.strip():
-            if not reasoning.strip():
-                raise ValueError("empty content returned")
-            return {
-                "success": True,
-                "elapsed_s": round(response.latency_s, 3),
-                "content_len": 0,
-                "reasoning_len": len(reasoning),
-                "finish_reason": choice.get("finish_reason"),
-                "content_preview": "[Still thinking...]",
-            }
+            detail = (
+                "reasoning was returned but visible content was empty"
+                if reasoning.strip()
+                else "empty content returned"
+            )
+            raise ValueError(detail)
         if has_reasoning_tags(content):
             raise ValueError("reasoning/thinking tags present in content")
+        response_model = response.raw.get("model")
         return {
             "success": True,
             "elapsed_s": round(response.latency_s, 3),
@@ -56,6 +53,11 @@ def run_api_sanity_check(
             "reasoning_len": len(reasoning),
             "finish_reason": choice.get("finish_reason"),
             "content_preview": content[:200],
+            "requested_model": endpoint.model,
+            "response_model": str(response_model) if response_model is not None else None,
+            "model_matches": response_model == endpoint.model
+            if response_model is not None
+            else None,
         }
     except Exception as exc:  # noqa: BLE001 - sanity failures are returned as result data
         return {"success": False, "error": f"sanity failed: {exc}"}

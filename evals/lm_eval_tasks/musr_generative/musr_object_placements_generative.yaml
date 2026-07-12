@@ -1,0 +1,3 @@
+include: _musr_generative_template_yaml
+task: musr_object_placements_generative
+test_split: object_placements

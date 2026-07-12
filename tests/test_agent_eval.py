@@ -9,6 +9,11 @@ from click.testing import CliRunner
 from llm_refinery.benchmarks.agent.base import AgentEvalResult
 from llm_refinery.benchmarks.agent.config import AgentEvalConfig
 from llm_refinery.benchmarks.agent.geoanalystbench import GeoAnalystBenchSpec
+from llm_refinery.benchmarks.agent.geoanalystbench_scoring import (
+    code_structure_diagnostics,
+    extract_workflow_step_count,
+)
+from llm_refinery.benchmarks.agent.parser import reparse_agent_eval_run
 from llm_refinery.benchmarks.agent.runner import run_agent_eval
 from llm_refinery.cli import main
 from llm_refinery.core.endpoints import Endpoint
@@ -41,7 +46,9 @@ def write_geoanalyst_csv(path: Path) -> None:
                 "schools.geojson has points.",
                 "1. Load dataset\n2. Buffer\n3. Save",
                 "3",
-                "def model():\n    return None",
+                "import geopandas as gpd\n"
+                "def model():\n"
+                "    return gpd.read_file('schools.geojson').buffer(1)",
             ]
         )
         writer.writerow(
@@ -66,7 +73,7 @@ def test_agent_eval_dry_run_plans_geoanalystbench_requests(tmp_path: Path):
     config.write_text(
         f"""
 name: geo-smoke
-database: {tmp_path / 'runs.duckdb'}
+database: {tmp_path / "runs.duckdb"}
 benchmark:
   kind: geoanalystbench
   dataset: {dataset}
@@ -141,15 +148,87 @@ def test_geoanalystbench_agent_eval_records_metrics_and_artifacts(tmp_path: Path
     assert all(sample["status"] == "ok" for sample in samples)
     run = runs[0]
     metrics = run["metrics"]
-    assert metrics["success_rate"] == 1.0
+    assert metrics["response_availability_rate"] == 1.0
+    assert metrics["response_count"] == 2.0
+    assert "success_rate" not in metrics
     assert metrics["workflow_step_abs_error_avg"] == 0.0
-    assert metrics["code_syntax_pass_rate"] == 1.0
+    assert metrics["code_syntax_valid_rate"] == 1.0
+    assert metrics["code_model_function_rate"] == 1.0
+    assert metrics["code_contract_pass_rate"] == 1.0
+    assert metrics["code_reference_import_recall_avg"] == 0.0
+    assert metrics["code_reference_call_recall_avg"] == 0.0
     assert run["system_json"]["platform"]["python_version"]
 
     responses_path = Path(run["artifacts"]["responses"]["path"])
     responses = [json.loads(line) for line in responses_path.read_text().splitlines()]
     assert len(responses) == 2
     assert responses[0]["request"]["task"]["task_id"] == 1
+
+
+def test_geoanalyst_code_contract_requires_model_function_and_reports_reference_overlap():
+    reference = """
+import geopandas as gpd
+
+def model():
+    schools = gpd.read_file("schools.geojson")
+    return schools.buffer(100)
+"""
+    unrelated = code_structure_diagnostics("pass", reference_code=reference)
+    overlapping = code_structure_diagnostics(
+        """
+import geopandas as gpd
+
+def model():
+    return gpd.read_file("schools.geojson")
+""",
+        reference_code=reference,
+    )
+
+    assert unrelated.syntax_ok is True
+    assert unrelated.model_function_present is False
+    assert unrelated.contract_ok is False
+    assert unrelated.reference_import_recall == 0.0
+    assert unrelated.reference_call_recall == 0.0
+    assert overlapping.contract_ok is True
+    assert overlapping.reference_import_recall == 1.0
+    assert overlapping.reference_call_recall == 0.5
+
+
+def test_geoanalyst_workflow_step_count_counts_steps_not_largest_label():
+    assert extract_workflow_step_count("1. Load\n3. Buffer\n99. Save") == 3
+
+
+def test_agent_reparse_renames_availability_and_backfills_code_contract(tmp_path: Path):
+    responses = tmp_path / "responses.jsonl"
+    measurement = tmp_path / "measurement.json"
+    responses.write_text(
+        json.dumps(
+            {
+                "request": {"response_type": "code"},
+                "ok": True,
+                "latency_s": 1.0,
+                "response_text": "pass",
+                "code_syntax_ok": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    measurement.write_text(json.dumps({"wall_duration_s": 1.0}), encoding="utf-8")
+
+    metrics = reparse_agent_eval_run(
+        {
+            "artifacts": {
+                "responses": {"path": str(responses)},
+                "measurement": {"path": str(measurement)},
+            }
+        }
+    )
+
+    assert metrics["response_availability_rate"] == 1.0
+    assert "success_rate" not in metrics
+    assert metrics["code_syntax_valid_rate"] == 1.0
+    assert metrics["code_contract_pass_rate"] == 0.0
 
 
 def test_load_agent_eval_config_rejects_unknown_benchmark(tmp_path: Path):

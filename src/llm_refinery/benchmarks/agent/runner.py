@@ -162,12 +162,8 @@ def _run_target(
             "benchmark": benchmark.kind,
             "target": target.name,
             "model": target.model,
-            "prompt_variants": ",".join(
-                sorted({request.prompt_variant for request in requests})
-            ),
-            "response_types": ",".join(
-                sorted({request.response_type for request in requests})
-            ),
+            "prompt_variants": ",".join(sorted({request.prompt_variant for request in requests})),
+            "response_types": ",".join(sorted({request.response_type for request in requests})),
             "task_count": len({request.task_key for request in requests}),
             "request_count": len(requests),
         },
@@ -238,9 +234,7 @@ def _run_target(
     return outcome
 
 
-def _selected_targets(
-    targets: list[Endpoint], target_names: tuple[str, ...]
-) -> list[Endpoint]:
+def _selected_targets(targets: list[Endpoint], target_names: tuple[str, ...]) -> list[Endpoint]:
     wanted = set(target_names)
     selected = [target for target in targets if not wanted or target.name in wanted]
     missing = wanted - {target.name for target in selected}
@@ -264,10 +258,16 @@ def _result_metrics(result: AgentEvalResult) -> dict[str, float]:
         "total_tokens": result.total_tokens,
         "workflow_step_count": result.workflow_step_count,
         "workflow_step_abs_error": result.workflow_step_abs_error,
+        "code_reference_import_recall": result.code_reference_import_recall,
+        "code_reference_call_recall": result.code_reference_call_recall,
     }
     metrics.update({key: float(value) for key, value in optional.items() if value is not None})
     if result.code_syntax_ok is not None:
         metrics["code_syntax_ok"] = float(result.code_syntax_ok)
+    if result.code_model_function_present is not None:
+        metrics["code_model_function_present"] = float(result.code_model_function_present)
+    if result.code_contract_ok is not None:
+        metrics["code_contract_ok"] = float(result.code_contract_ok)
     return metrics
 
 
@@ -280,10 +280,11 @@ def _first_error(results: list[AgentEvalResult]) -> str | None:
 
 def _metric_summary(metrics: dict[str, float]) -> str:
     keys = [
-        "success_rate",
+        "response_availability_rate",
         "latency_p95_s",
         "workflow_step_abs_error_avg",
-        "code_syntax_pass_rate",
+        "code_contract_pass_rate",
+        "code_reference_call_recall_avg",
         "error_count",
     ]
     return ", ".join(f"{key}={metrics[key]:.3f}" for key in keys if key in metrics)

@@ -1,0 +1,3 @@
+include: _musr_generative_template_yaml
+task: musr_murder_mysteries_generative
+test_split: murder_mysteries

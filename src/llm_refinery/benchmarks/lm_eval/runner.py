@@ -10,10 +10,18 @@ from pathlib import Path
 from llm_refinery.application.run_session import RunSession
 from llm_refinery.benchmarks.lm_eval.command import build_lm_eval_command
 from llm_refinery.benchmarks.lm_eval.config import LmEvalConfig, resolve_target_names
-from llm_refinery.benchmarks.lm_eval.parser import latest_lm_eval_result, parse_lm_eval_metrics
+from llm_refinery.benchmarks.lm_eval.parser import (
+    ParsedLmEvalSample,
+    latest_lm_eval_result,
+    lm_eval_sample_files,
+    parse_lm_eval_metrics,
+    parse_lm_eval_samples,
+    summarize_lm_eval_samples,
+)
 from llm_refinery.benchmarks.lm_eval.presets import default_targets
 from llm_refinery.core.runs import CompletedRun, RunSpec
 from llm_refinery.storage.duckdb import ResultStore
+from llm_refinery.storage.models import SampleRecord
 
 
 class LmEvalFailed(RuntimeError):
@@ -32,7 +40,9 @@ def run_lm_eval(
     config.output_root.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
-    env["HF_DATASETS_OFFLINE"] = "1" if config.offline else "0"
+    offline_value = "1" if config.offline else "0"
+    env["HF_DATASETS_OFFLINE"] = offline_value
+    env["HF_HUB_OFFLINE"] = offline_value
     if store is not None and store.database != config.database.resolve():
         raise ValueError(
             f"lm-eval database {config.database.resolve()} does not match shared store"
@@ -49,8 +59,7 @@ def run_lm_eval(
             cmd = build_lm_eval_command(config, target)
             command_text = shlex.join(cmd)
             print(
-                f"==> Running lm-eval target={target.name} "
-                f"tasks={config.tasks} limit={limit_text}"
+                f"==> Running lm-eval target={target.name} tasks={config.tasks} limit={limit_text}"
             )
             print(f"    model={target.model} base_url={target.base_url}")
             print(f"    output_path={output_path}")
@@ -90,16 +99,58 @@ def run_lm_eval(
                     newer_than=result_started_mtime,
                 )
                 metrics: dict[str, float] = {}
+                parsed_samples: list[ParsedLmEvalSample] = []
+                sample_error: str | None = None
+                source_samples: list[Path] = []
                 if source_result is not None:
                     result_path.write_bytes(source_result.read_bytes())
                     metrics = parse_lm_eval_metrics(result_path)
+                    source_samples = lm_eval_sample_files(source_result)
+                    try:
+                        for sample_index, source_sample in enumerate(source_samples):
+                            sample_path = run.artifact(
+                                f"samples.{sample_index}",
+                                f"samples/{source_sample.name}",
+                                "application/x-ndjson",
+                            )
+                            sample_path.write_bytes(source_sample.read_bytes())
+                            file_samples = parse_lm_eval_samples(
+                                sample_path,
+                                result_path=source_result,
+                            )
+                            parsed_samples.extend(file_samples)
+                            for sample in file_samples:
+                                active_store.record_sample(
+                                    SampleRecord(
+                                        run_id=run.run_id,
+                                        sample_id=sample.sample_id,
+                                        status="ok",
+                                        payload_json=sample.payload,
+                                        metrics=sample.metrics,
+                                        artifact_path=str(sample_path),
+                                    )
+                                )
+                    except (OSError, ValueError) as exc:
+                        sample_error = f"could not retain lm-eval samples: {exc}"
+                    if source_samples:
+                        metrics.update(summarize_lm_eval_samples(parsed_samples))
 
-                success = completed.returncode == 0 and source_result is not None
+                missing_samples = config.log_samples and not parsed_samples
+                success = (
+                    completed.returncode == 0
+                    and source_result is not None
+                    and sample_error is None
+                    and not missing_samples
+                )
                 status = "ok" if success else "failed"
                 if completed.returncode != 0:
                     error = f"exit code {completed.returncode}"
                 elif source_result is None:
                     error = "lm-eval produced no result artifact"
+                elif sample_error is not None:
+                    error = sample_error
+                elif missing_samples:
+                    error = "lm-eval was asked to log samples but produced no sample records"
                 else:
                     error = None
                 outcome = run.complete(status=status, metrics=metrics, error=error)
@@ -125,6 +176,7 @@ def _run_spec(
         "benchmark": "lm_eval",
         "model_backend": config.model_backend,
         "package_spec": config.package_spec,
+        "extra_packages": list(config.extra_packages),
         "apply_chat_template": config.apply_chat_template,
         "target": target_name,
         "model": target_model,
@@ -136,6 +188,8 @@ def _run_spec(
         "max_retries": config.max_retries,
         "max_length": config.max_length,
         "eos_string": config.eos_string,
+        "tokenizer": config.tokenizer,
+        "metadata": config.metadata,
         "log_samples": config.log_samples,
         "num_fewshot": config.num_fewshot,
         "gen_kwargs": config.gen_kwargs,

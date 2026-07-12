@@ -16,8 +16,17 @@ from llm_refinery.workflows.suite_config import load_suite_config
 @click.option("--tasks", help="Comma-separated tasks for lm-eval.")
 @click.option("--max-length", type=int, help="Maximum lm-eval context length.")
 @click.option("--eos-string", help="EOS string for lm-eval.")
+@click.option("--tokenizer", help="Tokenizer id/path for token-aware lm-eval tasks.")
+@click.option("--metadata", help="lm-eval metadata JSON.")
 @click.option("--gen-kwargs", help="Extra lm-eval generation kwargs.")
 @click.option("--package-spec", help="Override the uvx lm-eval package spec.")
+@click.option(
+    "--with-package",
+    "extra_packages",
+    multiple=True,
+    help="Additional pinned evaluator package; repeat as needed.",
+)
+@click.option("--offline/--online", default=None, help="Override Hugging Face offline mode.")
 @click.option(
     "--include-path",
     type=click.Path(file_okay=False, path_type=Path),
@@ -52,8 +61,12 @@ def suite_command(
     tasks: str | None,
     max_length: int | None,
     eos_string: str | None,
+    tokenizer: str | None,
+    metadata: str | None,
     gen_kwargs: str | None,
     package_spec: str | None,
+    extra_packages: tuple[str, ...],
+    offline: bool | None,
     include_path: Path | None,
     run_lm_eval: bool | None,
     run_http_load: bool | None,
@@ -72,38 +85,32 @@ def suite_command(
     quality = replace(
         suite.quality,
         enabled=suite.quality.enabled if run_lm_eval is None else run_lm_eval,
-        limit=(
-            parse_lm_eval_limit(limit_text)
-            if limit_text is not None
-            else suite.quality.limit
-        ),
+        limit=(parse_lm_eval_limit(limit_text) if limit_text is not None else suite.quality.limit),
         tasks=tasks or suite.quality.tasks,
         max_length=max_length or suite.quality.max_length,
         eos_string=eos_string or suite.quality.eos_string,
+        tokenizer=tokenizer or suite.quality.tokenizer,
+        metadata=metadata or suite.quality.metadata,
         gen_kwargs=gen_kwargs if gen_kwargs is not None else suite.quality.gen_kwargs,
         package_spec=package_spec or suite.quality.package_spec,
+        extra_packages=extra_packages or suite.quality.extra_packages,
+        offline=suite.quality.offline if offline is None else offline,
         include_path=include_path if include_path is not None else suite.quality.include_path,
     )
     http_config_path = http_load_config or suite.http_load.config
     http_load = replace(
         suite.http_load,
-        enabled=(
-            suite.http_load.enabled if run_http_load is None else run_http_load
-        ),
+        enabled=(suite.http_load.enabled if run_http_load is None else run_http_load),
         config=http_config_path,
         targets=(target,) if target else suite.http_load.targets,
     )
     if http_load_config is not None and run_http_load is None:
         http_load = replace(http_load, enabled=True)
     if http_load.enabled and http_load.config is None:
-        raise click.BadParameter(
-            "--http-load-config is required when HTTP load is enabled"
-        )
+        raise click.BadParameter("--http-load-config is required when HTTP load is enabled")
     preflight = replace(
         suite.preflight,
-        require_clean=(
-            suite.preflight.require_clean if require_clean is None else require_clean
-        ),
+        require_clean=(suite.preflight.require_clean if require_clean is None else require_clean),
     )
     effective = replace(
         suite,
