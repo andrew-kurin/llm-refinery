@@ -91,7 +91,7 @@ class BenchmarkSuiteWorkflow:
         with ResultStore(self.config.database) as store, RunSession(store, spec) as run:
             metrics_before_path = None
             target_spec = self.config.target
-            discovery_attempted = False
+            initial_host_snapshot_available = False
             child_failure: Exception | None = None
             try:
                 before_snapshot = self.system_snapshot()
@@ -102,7 +102,6 @@ class BenchmarkSuiteWorkflow:
                 )
                 before_path.write_text(before_snapshot, encoding="utf-8")
                 if target_spec is not None:
-                    discovery_attempted = True
                     try:
                         inspection = self.target_resolver.inspect(
                             target_spec,
@@ -125,6 +124,7 @@ class BenchmarkSuiteWorkflow:
                                 errors=(detail,),
                             )
                         )
+                        initial_host_snapshot_available = inspection.host is not None
                         failure = inspection.safe_json()
                         failure["failure_stage"] = "target_discovery"
                         failure["requested_target"] = target_spec.safe_json()
@@ -147,6 +147,7 @@ class BenchmarkSuiteWorkflow:
                         )
                         run.set_target_json(failure)
                         raise
+                    initial_host_snapshot_available = inspection.host is not None
                     discovery_path = run.artifact(
                         "target_discovery",
                         "target-discovery.json",
@@ -197,7 +198,7 @@ class BenchmarkSuiteWorkflow:
                 except Exception as exc:  # noqa: BLE001 - summarize persisted children first
                     child_failure = exc
             finally:
-                if target_spec is not None and discovery_attempted:
+                if target_spec is not None and initial_host_snapshot_available:
                     try:
                         after_profile = self.target_resolver.snapshot_host(target_spec).profile
                     except Exception as exc:  # noqa: BLE001 - retain best-effort telemetry
@@ -493,7 +494,11 @@ class BenchmarkSuiteWorkflow:
         self.console.print(f"[yellow]warning:[/yellow] {warning}")
 
     def _print_http_comparison(self, store: ResultStore, suite_name: str) -> None:
-        runs = [run for run in store.comparison_runs() if run["suite"] == suite_name]
+        runs = [
+            run
+            for run in store.comparison_runs(latest_per_trial=False)
+            if run["suite"] == suite_name
+        ]
         rows = build_compare_rows(
             runs,
             metrics=(

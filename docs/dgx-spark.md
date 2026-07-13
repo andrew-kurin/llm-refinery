@@ -28,9 +28,16 @@ example, SSH can use `dgx` while requests use
 For an identity-pinned setup, first inspect the intended machine over a trusted
 SSH connection. Copy `host.profile.host_fingerprint` into
 `host.expected_fingerprint` only when `host_fingerprint_strength` is `hardware`
-or `installation`. A hardware fingerprint hashes the system's DMI product UUID;
-an installation fingerprint hashes Linux's machine-id. Neither raw identifier
-is recorded. The hostname fallback is marked `weak` and cannot satisfy a pin.
+or `installation`. Linux machine-id is preferred for the primary fingerprint so
+the same machine has the same identity when inspected locally or through SSH;
+this installation identity also preserves existing local-run and resume keys.
+When available, the separately reported `host_hardware_fingerprint` hashes a
+canonical DMI product UUID and becomes the primary identity if machine-id is not
+usable. Neither raw identifier is recorded. The hostname fallback is marked
+`weak` and cannot satisfy a pin.
+Strong hashes emitted by earlier versions of this discovery code are retained as
+finite compatibility aliases, so an existing hardware or installation pin
+continues to verify after the primary identity format changes.
 Future inspections fail closed if the SSH alias resolves to a different identity
 or inventory cannot provide a verifiable fingerprint. Reinstalling the OS can
 change an installation fingerprint, while replacing hardware changes a hardware

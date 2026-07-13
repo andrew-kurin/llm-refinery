@@ -38,6 +38,7 @@ SYSCTL_PROFILE_KEYS = (
     "machdep.cpu.brand_string",
 )
 LINUX_MACHINE_ID_PATHS = (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id"))
+LINUX_HARDWARE_UUID_PATHS = (Path("/sys/devices/virtual/dmi/id/product_uuid"),)
 DGX_RELEASE_PATHS = (Path("/etc/dgx-release"), Path("/etc/nvidia/dgx-release"))
 LINUX_DMI_PATHS = {
     "sys_vendor": Path("/sys/devices/virtual/dmi/id/sys_vendor"),
@@ -99,15 +100,26 @@ def get_system_profile() -> dict[str, Any]:
     linux = _linux_profile() if system_name == "Linux" else {}
 
     hardware = _hardware_profile(system_name, sysctl_values=sysctl_values, linux=linux)
+    (
+        host_fingerprint,
+        fingerprint_source,
+        fingerprint_strength,
+        hardware_fingerprint,
+        fingerprint_aliases,
+    ) = _current_host_identity(
+        system_name=system_name,
+        hostname=hostname,
+        hardware=hardware,
+    )
     profile: dict[str, Any] = {
         "schema_version": 2,
         "captured_at": datetime.now(UTC).isoformat(),
         "hostname": hostname,
-        "host_fingerprint": _current_host_fingerprint(
-            system_name=system_name,
-            hostname=hostname,
-            hardware=hardware,
-        ),
+        "host_fingerprint": host_fingerprint,
+        "host_fingerprint_source": fingerprint_source,
+        "host_fingerprint_strength": fingerprint_strength,
+        "host_hardware_fingerprint": hardware_fingerprint,
+        "host_fingerprint_aliases": fingerprint_aliases,
         "platform": {
             "system": system_name,
             "release": platform.release(),
@@ -213,13 +225,38 @@ def _hardware_profile(
 
 
 def _current_host_fingerprint(*, system_name: str, hostname: str, hardware: dict[str, Any]) -> str:
+    """Return the primary identity while retaining the historical helper API."""
+    return _current_host_identity(
+        system_name=system_name,
+        hostname=hostname,
+        hardware=hardware,
+    )[0]
+
+
+def _current_host_identity(
+    *,
+    system_name: str,
+    hostname: str,
+    hardware: dict[str, Any],
+) -> tuple[str, str, str, str | None, list[dict[str, str]]]:
     machine_identifier = _machine_identifier(system_name)
+    hardware_uuid = _linux_hardware_uuid() if system_name == "Linux" else None
+    hardware_fingerprint = None
+    if hardware_uuid:
+        hardware_identity = _hardware_uuid_identity(system_name, hardware_uuid)
+        hardware_fingerprint = f"host-{_stable_digest(hardware_identity)}"
     if machine_identifier:
         identity: dict[str, Any] = {
             "version": 1,
             "system": system_name,
             "machine_identifier": machine_identifier,
         }
+        source = "machine_id" if system_name == "Linux" else "platform_uuid"
+        strength = "installation" if system_name == "Linux" else "hardware"
+    elif hardware_uuid:
+        identity = _hardware_uuid_identity(system_name, hardware_uuid)
+        source = "dmi_product_uuid"
+        strength = "hardware"
     else:
         identity = {
             "version": 1,
@@ -230,7 +267,59 @@ def _current_host_fingerprint(*, system_name: str, hostname: str, hardware: dict
             "chip": hardware.get("chip"),
             "memory_bytes": hardware.get("memory_bytes"),
         }
-    return f"host-{_stable_digest(identity)}"
+        source = "hostname"
+        strength = "weak"
+    primary_fingerprint = f"host-{_stable_digest(identity)}"
+    aliases: list[dict[str, str]] = []
+    if hardware_fingerprint and hardware_fingerprint != primary_fingerprint:
+        aliases.append(
+            {
+                "fingerprint": hardware_fingerprint,
+                "source": "dmi_product_uuid",
+                "strength": "hardware",
+            }
+        )
+    if system_name == "Linux" and machine_identifier:
+        legacy_identity = {
+            "version": 1,
+            "system": system_name,
+            "machine_id": machine_identifier,
+        }
+        legacy_fingerprint = f"host-{_stable_digest(legacy_identity)}"
+        if legacy_fingerprint != primary_fingerprint:
+            aliases.append(
+                {
+                    "fingerprint": legacy_fingerprint,
+                    "source": "legacy_machine_id",
+                    "strength": "installation",
+                }
+            )
+    return primary_fingerprint, source, strength, hardware_fingerprint, aliases
+
+
+def _hardware_uuid_identity(system_name: str, hardware_uuid: str) -> dict[str, Any]:
+    return {
+        "version": 2,
+        "system": system_name,
+        "hardware_uuid": hardware_uuid,
+    }
+
+
+def _canonical_hardware_uuid(value: str | None) -> str | None:
+    if not value:
+        return None
+    compact = value.strip().casefold().replace("-", "")
+    if re.fullmatch(r"[0-9a-f]{32}", compact) is None or set(compact) in ({"0"}, {"f"}):
+        return None
+    return "-".join((compact[:8], compact[8:12], compact[12:16], compact[16:20], compact[20:]))
+
+
+def _linux_hardware_uuid() -> str | None:
+    for path in LINUX_HARDWARE_UUID_PATHS:
+        value = _canonical_hardware_uuid(_read_text(path, max_chars=256))
+        if value:
+            return value
+    return None
 
 
 def _machine_identifier(system_name: str) -> str | None:
@@ -238,7 +327,11 @@ def _machine_identifier(system_name: str) -> str | None:
         for path in LINUX_MACHINE_ID_PATHS:
             value = _read_text(path, max_chars=256)
             if value:
-                return value.strip()
+                normalized = value.strip().casefold()
+                if re.fullmatch(r"[0-9a-f]{32}", normalized) is not None and set(
+                    normalized
+                ) not in ({"0"}, {"f"}):
+                    return normalized
         return None
 
     if system_name == "Darwin":

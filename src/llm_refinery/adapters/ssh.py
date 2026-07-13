@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import selectors
 import signal
 import subprocess
@@ -107,10 +108,10 @@ class OpenSSHClient:
             raise RuntimeError("target host inventory returned invalid JSON") from exc
         if not isinstance(profile, dict):
             raise RuntimeError("target host inventory must return a JSON object")
-        if profile.get("schema_version") != 1:
+        schema_version = profile.get("schema_version")
+        if type(schema_version) is not int or schema_version != 1:
             raise RuntimeError(
-                "target host inventory returned unsupported schema_version "
-                f"{profile.get('schema_version')!r}"
+                f"target host inventory returned unsupported schema_version {schema_version!r}"
             )
         return HostDiscovery(
             transport=access.access,
@@ -242,14 +243,24 @@ def linux_dgx_probe_source() -> str:
 
 def _sanitize_profile(profile: dict[str, Any]) -> dict[str, Any]:
     """Defense in depth against accidental raw IDs or process data from future probes."""
-    forbidden = {"machine_id", "machine-id", "command_line", "cmdline", "environment"}
+    forbidden = {
+        "machineid",
+        "machineidentifier",
+        "hardwareuuid",
+        "productuuid",
+        "commandline",
+        "cmdline",
+        "environment",
+    }
+
+    def forbidden_key(key: Any) -> bool:
+        normalized = re.sub(r"[^a-z0-9]", "", str(key).casefold())
+        return normalized in forbidden
 
     def sanitize(value: Any) -> Any:
         if isinstance(value, dict):
             return {
-                str(key): sanitize(item)
-                for key, item in value.items()
-                if str(key).casefold() not in forbidden
+                str(key): sanitize(item) for key, item in value.items() if not forbidden_key(key)
             }
         if isinstance(value, list):
             return [sanitize(item) for item in value]

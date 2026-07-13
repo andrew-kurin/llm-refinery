@@ -285,6 +285,50 @@ def test_http_client_resolves_remote_origin_once_before_measured_requests(monkey
     assert resolutions == 1
 
 
+def test_http_client_uses_active_proxy_without_ip_pinning(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "remote",
+                    "protocol": "openai_chat",
+                    "base_url": "http://model.example:8000/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello"}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.getproxies",
+        lambda: {"http": "http://proxy.example:3128"},
+    )
+
+    def unexpected_resolution(*args, **kwargs):
+        raise AssertionError("proxy-routed origins must not be resolved or IP-pinned locally")
+
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        unexpected_resolution,
+    )
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(http_transport.httpx, "Client", FakeClient)
+
+    client = http_transport._new_http_client(trial)
+
+    assert captured["trust_env"] is True
+    assert client._llm_refinery_routes == {  # type: ignore[attr-defined]
+        ("http", "model.example", 8000): None
+    }
+
+
 def test_http_scenario_supports_prompt_pools_and_explicit_unique_cache_mode():
     config = HttpLoadConfig.from_mapping(
         {
@@ -722,6 +766,32 @@ def test_http_client_pool_keeps_deadline_cancellation_request_local():
             assert second.is_closed is False
 
         assert len([client for client in pool._clients if not client.is_closed]) == 2
+
+
+def test_deadline_watchdog_cancel_waits_for_dequeued_callback():
+    watchdog = http_transport._DeadlineWatchdog()
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    cancellation_finished = threading.Event()
+
+    def callback() -> None:
+        callback_started.set()
+        assert release_callback.wait(timeout=2)
+
+    token = watchdog.schedule(time.perf_counter() - 1, callback)
+    assert callback_started.wait(timeout=1)
+
+    def cancel() -> None:
+        watchdog.cancel(token)
+        cancellation_finished.set()
+
+    thread = threading.Thread(target=cancel)
+    thread.start()
+    assert not cancellation_finished.wait(timeout=0.05)
+    release_callback.set()
+    thread.join(timeout=1)
+
+    assert cancellation_finished.is_set()
 
 
 def test_http_load_rejects_dns_name_resolving_to_client_loopback(monkeypatch):

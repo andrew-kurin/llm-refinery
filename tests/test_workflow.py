@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
 from llm_refinery.application.run_session import RunSession
 from llm_refinery.core.config import ConfigError
@@ -144,6 +145,84 @@ def test_suite_calls_services_directly_and_links_child_runs(tmp_path: Path):
     assert len(runs) == 1
     assert runs[0]["benchmark_kind"] == "suite"
     assert set(runs[0]["artifacts"]) == {"system_before", "system_after", "preflight"}
+
+
+def test_suite_http_comparison_keeps_runs_from_distinct_executors(tmp_path: Path):
+    target_json = {
+        "name": "spark",
+        "host": {
+            "profile": {"hostname": "spark", "host_fingerprint": "host-spark"},
+        },
+        "topology": {"measurement_scope": "remote_lan_end_to_end"},
+    }
+    shared = {
+        "benchmark_kind": "http-load",
+        "suite": "http-suite",
+        "trial_name": "http-suite/spark/short/c1/t8/r1",
+        "status": "ok",
+        "duration_s": 1.0,
+        "spec_hash": "shared-spec",
+        "config_json": {
+            "model": "served-model",
+            "params": {
+                "target": "spark",
+                "protocol": "openai_chat",
+                "scenario": "short",
+                "concurrency": 1,
+            },
+        },
+        "target_json": target_json,
+        "metrics": {"observed_latency_p95_s": 1.0},
+    }
+
+    class ComparisonStore:
+        def comparison_runs(self, *, include_failed=False, latest_per_trial=True):
+            assert include_failed is False
+            assert latest_per_trial is False
+            return [
+                {
+                    **shared,
+                    "run_id": "mac-a-run",
+                    "system_json": {
+                        "hostname": "mac-a",
+                        "host_fingerprint": "host-mac-a",
+                    },
+                },
+                {
+                    **shared,
+                    "run_id": "mac-b-run",
+                    "system_json": {
+                        "hostname": "mac-b",
+                        "host_fingerprint": "host-mac-b",
+                    },
+                },
+            ]
+
+    config = SuiteConfig.from_mapping(
+        {
+            "name": "comparison",
+            "database": str(tmp_path / "runs.duckdb"),
+            "endpoint": {
+                "name": "local",
+                "protocol": "openai_chat",
+                "base_url": "http://127.0.0.1:8080/v1",
+                "model": "local-model",
+            },
+            "quality": {"enabled": False},
+            "http_load": {"enabled": False},
+            "preflight": {"enabled": False},
+        }
+    )
+    console = Console(record=True, width=220)
+
+    BenchmarkSuiteWorkflow(config, console=console)._print_http_comparison(
+        ComparisonStore(),  # type: ignore[arg-type]
+        "http-suite",
+    )
+
+    rendered = console.export_text()
+    assert "mac-a" in rendered
+    assert "mac-b" in rendered
 
 
 @pytest.mark.parametrize("failed_step", ["quality", "http_load"])
@@ -869,6 +948,56 @@ def test_remote_suite_persists_unavailable_discovery_and_starts_no_children(tmp_
     assert "connection refused" in run["error"]
     assert "local telemetry failed" not in run["error"]
     assert "preflight" not in run["artifacts"]
+    assert resolver.snapshot_calls == 1
+
+
+def test_remote_suite_does_not_retry_failed_initial_host_inventory(tmp_path: Path):
+    spec, _inspection = _resolved_dgx_target()
+
+    class InventoryFailureResolver:
+        def __init__(self):
+            self.snapshot_calls = 0
+
+        def inspect(self, target_spec, *, allow_service_unavailable=False):
+            assert target_spec == spec
+            assert allow_service_unavailable is True
+            raise RuntimeError("ssh inventory timed out")
+
+        def snapshot_host(self, target_spec):
+            assert target_spec == spec
+            self.snapshot_calls += 1
+            raise AssertionError("failed initial inventory must not be retried")
+
+    resolver = InventoryFailureResolver()
+    config = SuiteConfig.from_mapping(
+        {
+            "schema_version": 2,
+            "name": "inventory-timeout",
+            "database": str(tmp_path / "runs.duckdb"),
+            "target": _target_config_mapping(spec),
+            "quality": {"enabled": False},
+            "http_load": {"enabled": False},
+            "preflight": {"enabled": False},
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="ssh inventory timed out"):
+        BenchmarkSuiteWorkflow(
+            config,
+            target_resolver=resolver,
+            system_snapshot=lambda: "snapshot",
+        ).execute()
+
+    with ResultStore(config.database) as store:
+        run = store.comparison_runs(include_failed=True)[0]
+    assert resolver.snapshot_calls == 0
+    assert set(run["artifacts"]) == {
+        "server_before",
+        "system_after",
+        "system_before",
+        "target_discovery",
+    }
+    assert "server_after" not in run["artifacts"]
 
 
 def test_remote_suite_does_not_register_empty_artifacts_before_discovery(tmp_path: Path):

@@ -20,6 +20,7 @@ from llm_refinery.core.targets import (
     ResolvedTarget,
     TargetInspection,
     TargetSpec,
+    host_fingerprint_candidates,
 )
 from llm_refinery.providers.openai_discovery import OpenAIDiscoveryClient
 from llm_refinery.utils.system import get_system_profile
@@ -106,7 +107,7 @@ class TargetResolver:
 
         host_identity_matches = spec.host.expected_fingerprint is None or (
             host is not None
-            and host.profile.get("host_fingerprint") == spec.host.expected_fingerprint
+            and spec.host.expected_fingerprint in host_fingerprint_candidates(host.profile)
         )
         host_ready = (host is not None or not spec.host.required) and host_identity_matches
         service_ready = (
@@ -171,9 +172,8 @@ class TargetResolver:
         else:
             host = self._ssh_client.collect_host_profile(spec.host)
         expected_fingerprint = spec.host.expected_fingerprint
-        if expected_fingerprint is not None and (
-            host.profile.get("host_fingerprint") != expected_fingerprint
-        ):
+        fingerprint_candidates = host_fingerprint_candidates(host.profile)
+        if expected_fingerprint is not None and expected_fingerprint not in fingerprint_candidates:
             raise RuntimeError(
                 "target host inventory fingerprint does not match "
                 f"host.expected_fingerprint ({host.profile.get('host_fingerprint')!r} != "
@@ -182,13 +182,12 @@ class TargetResolver:
         if (
             expected_fingerprint is not None
             and spec.host.access == HOST_ACCESS_SSH
-            and host.profile.get("host_fingerprint_strength")
-            not in {"hardware", "installation"}
+            and fingerprint_candidates.get(expected_fingerprint) not in {"hardware", "installation"}
         ):
             raise RuntimeError(
                 "target host inventory fingerprint is not strong enough for "
                 "host.expected_fingerprint verification "
-                f"(strength={host.profile.get('host_fingerprint_strength')!r})"
+                f"(strength={fingerprint_candidates.get(expected_fingerprint)!r})"
             )
         return host
 

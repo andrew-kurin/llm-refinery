@@ -104,7 +104,10 @@ including `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, and
 `SSL_CERT_DIR`. A manifest can set `transport.trust_env: false` for a
 deterministic direct path, or set `transport.ca_bundle` to a PEM bundle (relative
 to the manifest) without disabling certificate verification. The recommended
-local manifest uses direct mode explicitly.
+local manifest uses direct mode explicitly. Standalone HTTP-load manifests keep
+proxy-routed origins route-less so the proxy receives the logical hostname;
+DGX target suites instead use their discovered IP-pinned route and reject an
+active proxy unless the logical host is covered by `NO_PROXY`.
 
 Compare HTTP load results by latency, TTFT, throughput, and optionally host metadata:
 

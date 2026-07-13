@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import socket
 
 from llm_refinery.utils import system
@@ -89,6 +91,7 @@ def test_linux_system_profile_projects_proc_nvidia_and_dgx_metadata(monkeypatch)
     monkeypatch.setattr(system.socket, "gethostname", lambda: "spark")
     monkeypatch.setattr(system, "_linux_profile", lambda: linux)
     monkeypatch.setattr(system, "_machine_identifier", lambda _system_name: "machine-id")
+    monkeypatch.setattr(system, "_linux_hardware_uuid", lambda: None)
     monkeypatch.setattr(
         system,
         "_nvidia_profile",
@@ -105,6 +108,8 @@ def test_linux_system_profile_projects_proc_nvidia_and_dgx_metadata(monkeypatch)
     profile = system.get_system_profile()
 
     assert profile["host_fingerprint"].startswith("host-")
+    assert profile["host_fingerprint_source"] == "machine_id"
+    assert profile["host_fingerprint_strength"] == "installation"
     assert profile["linux"]["os_release"]["name"] == "Ubuntu"
     assert profile["hardware"]["model"] == "DGX Spark"
     assert profile["hardware"]["chip"] == "NVIDIA Grace"
@@ -112,6 +117,46 @@ def test_linux_system_profile_projects_proc_nvidia_and_dgx_metadata(monkeypatch)
     assert profile["nvidia"]["cuda_runtime_version"] == "13.0"
     assert profile["nvidia"]["cuda_driver_supported_version"] == "13.0"
     assert profile["dgx"]["model"] == "DGX Spark"
+
+
+def test_local_linux_fingerprint_preserves_established_machine_identifier_contract(
+    monkeypatch,
+):
+    machine_id = "0123456789abcdef0123456789abcdef"
+    identity = {
+        "version": 1,
+        "system": "Linux",
+        "machine_identifier": machine_id,
+    }
+    payload = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    expected = "host-" + hashlib.sha256(payload.encode()).hexdigest()[:16]
+    monkeypatch.setattr(system, "_machine_identifier", lambda _system_name: machine_id)
+    monkeypatch.setattr(
+        system,
+        "_linux_hardware_uuid",
+        lambda: "12345678-1234-5678-9abc-def012345678",
+    )
+
+    fingerprint, source, strength, hardware_fingerprint, aliases = system._current_host_identity(
+        system_name="Linux",
+        hostname="spark",
+        hardware={"machine": "aarch64", "model": "DGX Spark"},
+    )
+
+    assert fingerprint == expected
+    assert source == "machine_id"
+    assert strength == "installation"
+    assert hardware_fingerprint is not None
+    assert {alias["fingerprint"] for alias in aliases} >= {hardware_fingerprint}
+
+
+def test_linux_hardware_uuid_is_exact_and_canonical():
+    canonical = "12345678-1234-5678-9abc-def012345678"
+
+    assert system._canonical_hardware_uuid(canonical.upper()) == canonical
+    assert system._canonical_hardware_uuid(canonical.replace("-", "")) == canonical
+    assert system._canonical_hardware_uuid("1234567890abcdef") is None
+    assert system._canonical_hardware_uuid("0" * 32) is None
 
 
 def test_nvidia_profile_captures_driver_cuda_and_gpu_details(monkeypatch):

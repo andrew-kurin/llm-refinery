@@ -208,7 +208,7 @@ def pinned_route_trust_env(
     """
     if not trust_env:
         return False
-    scheme, hostname, port = http_origin(url)
+    scheme, hostname, _ = http_origin(url)
     if _is_explicit_client_loopback_host(hostname):
         return False
     if not route_is_pinned:
@@ -216,17 +216,32 @@ def pinned_route_trust_env(
     proxies = getproxies()
     if not (proxies.get(scheme) or proxies.get("all")):
         return True
-    if not _httpx_no_proxy_bypass(
-        scheme=scheme,
-        hostname=hostname,
-        port=port,
-        no_proxy=str(proxies.get("no") or ""),
-    ):
+    if environment_proxy_applies(url, proxies=proxies):
         raise ConfigError(
             "IP-pinned target endpoints cannot use an environment proxy; "
             "configure a direct connection with transport.trust_env=false"
         )
     return False
+
+
+def environment_proxy_applies(
+    url: str,
+    *,
+    proxies: dict[str, str] | None = None,
+) -> bool:
+    """Return whether HTTPX would proxy the logical origin from the environment."""
+    scheme, hostname, port = http_origin(url)
+    if _is_explicit_client_loopback_host(hostname):
+        return False
+    environment = getproxies() if proxies is None else proxies
+    if not (environment.get(scheme) or environment.get("all")):
+        return False
+    return not _httpx_no_proxy_bypass(
+        scheme=scheme,
+        hostname=hostname,
+        port=port,
+        no_proxy=str(environment.get("no") or ""),
+    )
 
 
 def _httpx_no_proxy_bypass(
@@ -263,9 +278,8 @@ def _httpx_no_proxy_bypass(
                 continue
             if pattern_hostname is None:
                 continue
-            if (
-                raw_scheme in {"http", "https"}
-                and pattern_port == {"http": 80, "https": 443}.get(pattern_scheme)
+            if raw_scheme in {"http", "https"} and pattern_port == {"http": 80, "https": 443}.get(
+                pattern_scheme
             ):
                 # HTTPX normalizes an explicitly written default port out of a
                 # URLPattern, making the pattern port-agnostic.
@@ -393,6 +407,7 @@ def _is_explicit_client_loopback_host(hostname: str) -> bool:
 
 
 __all__ = [
+    "environment_proxy_applies",
     "HttpOrigin",
     "PinnedHttpRoute",
     "http_origin",

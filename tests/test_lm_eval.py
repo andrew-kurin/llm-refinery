@@ -1,3 +1,4 @@
+import http.client
 import json
 import os
 import subprocess
@@ -7,6 +8,7 @@ import time
 from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -222,6 +224,87 @@ def test_lm_eval_relay_enforces_absolute_upstream_deadline(tmp_path, monkeypatch
         upstream.shutdown()
         upstream.server_close()
         thread.join(timeout=2)
+
+
+def test_lm_eval_relay_teardown_cancels_and_joins_active_requests(tmp_path, monkeypatch):
+    upstream_started = threading.Event()
+    upstream_closed = threading.Event()
+    downstream_statuses: list[int] = []
+
+    class BlockingResponse:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def iter_bytes(self):
+            upstream_started.set()
+            assert upstream_closed.wait(timeout=2)
+            raise httpx.ReadError("closed during relay teardown")
+
+    class BlockingClient:
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def stream(self, *args, **kwargs):
+            del args, kwargs
+            return BlockingResponse()
+
+        def close(self):
+            upstream_closed.set()
+
+    logical_base = "http://spark.local:8000/v1"
+    target = Endpoint(
+        name="spark",
+        protocol=OPENAI_CHAT,
+        model="served-model",
+        base_url=logical_base,
+    )
+    config = LmEvalConfig(
+        target="spark",
+        output_root=tmp_path,
+        targets={"spark": target},
+        pinned_route=PinnedHttpRoute(
+            origin=("http", "spark.local", 8000),
+            connect_host="192.168.1.41",
+            authority="spark.local:8000",
+            sni_hostname="spark.local",
+        ),
+    )
+    monkeypatch.setattr("llm_refinery.core.http_safety.getproxies", lambda: {})
+    monkeypatch.setattr(lm_eval_runner.httpx, "Client", BlockingClient)
+
+    def request_relay(port: int) -> None:
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        try:
+            connection.request(
+                "POST",
+                "/v1/chat/completions",
+                body=b"{}",
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            downstream_statuses.append(response.status)
+            response.read()
+        finally:
+            connection.close()
+
+    with lm_eval_runner._lm_eval_target(target, config, dry_run=False) as relay_target:
+        parsed_relay = urlsplit(relay_target.base_url)
+        assert parsed_relay.port is not None
+        request_thread = threading.Thread(target=request_relay, args=(parsed_relay.port,))
+        request_thread.start()
+        assert upstream_started.wait(timeout=1)
+
+    request_thread.join(timeout=1)
+
+    assert upstream_closed.is_set()
+    assert not request_thread.is_alive()
+    assert downstream_statuses == [502]
 
 
 @pytest.mark.parametrize(

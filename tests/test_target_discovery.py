@@ -35,6 +35,7 @@ from llm_refinery.core.targets import (
 from llm_refinery.probes import linux_dgx_probe
 from llm_refinery.providers import openai_discovery as openai_discovery_module
 from llm_refinery.providers.openai_discovery import OpenAIDiscoveryClient
+from llm_refinery.utils import system as system_module
 
 _REAL_GETADDRINFO = socket.getaddrinfo
 
@@ -393,7 +394,7 @@ def test_target_spec_rejects_all_client_local_urls_for_ssh_targets(base_url: str
     raw = _target_mapping()
     raw["endpoint"]["base_url"] = base_url
 
-    with pytest.raises(ConfigError, match="loopback or wildcard"):
+    with pytest.raises(ConfigError, match="loopback or wildcard|wildcard address"):
         TargetSpec.from_mapping(raw)
 
 
@@ -410,6 +411,39 @@ def test_target_spec_rejects_url_credentials_queries_and_fragments(base_url: str
     raw["endpoint"]["base_url"] = base_url
 
     with pytest.raises(ConfigError, match="user information|query or fragment"):
+        TargetSpec.from_mapping(raw)
+
+
+@pytest.mark.parametrize(
+    ("base_url", "error"),
+    [
+        ("http://spark.local:0/v1", "valid hostname and port"),
+        ("http://spark.local:/v1", "valid hostname and port"),
+        ("http://spark.local:99999/v1", "valid hostname and port"),
+        ("http://spark.local:8000/v1\\chat", "backslashes"),
+        ("http://spark.local:8000/v1 chat", "without whitespace"),
+        ("http://spark.local:8000/v1\nother", "without whitespace"),
+    ],
+)
+def test_target_spec_rejects_ambiguous_endpoint_urls_during_manifest_loading(
+    base_url: str,
+    error: str,
+):
+    raw = _target_mapping()
+    raw["host"] = {"access": "local"}
+    raw["endpoint"]["base_url"] = base_url
+
+    with pytest.raises(ConfigError, match=error):
+        TargetSpec.from_mapping(raw)
+
+
+@pytest.mark.parametrize("base_url", ["http://0.0.0.0:8000/v1", "http://[::]:8000/v1"])
+def test_local_target_spec_rejects_wildcard_endpoint_urls(base_url: str):
+    raw = _target_mapping()
+    raw["host"] = {"access": "local"}
+    raw["endpoint"]["base_url"] = base_url
+
+    with pytest.raises(ConfigError, match="wildcard address"):
         TargetSpec.from_mapping(raw)
 
 
@@ -504,7 +538,13 @@ def test_ssh_adapter_uses_fixed_argv_probe_stdin_and_never_requests_a_shell():
         "schema_version": 1,
         "hostname": "spark",
         "machine_id": "must-not-leak",
-        "nested": {"cmdline": "must-not-leak", "safe": True},
+        "hardware-uuid": "must-not-leak",
+        "nested": {
+            "cmdline": "must-not-leak",
+            "Product_UUID": "must-not-leak",
+            "machine identifier": "must-not-leak",
+            "safe": True,
+        },
     }
 
     def runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -548,6 +588,19 @@ def test_ssh_adapter_uses_fixed_argv_probe_stdin_and_never_requests_a_shell():
         "hostname": "spark",
         "nested": {"safe": True},
     }
+
+
+@pytest.mark.parametrize("schema_version", [True, 1.0, "1", None])
+def test_ssh_adapter_requires_strict_integer_probe_schema_version(schema_version: Any):
+    def runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        profile = {"schema_version": schema_version, "hostname": "spark"}
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(profile), stderr="")
+
+    with pytest.raises(RuntimeError, match="unsupported schema_version"):
+        OpenSSHClient(runner=runner).collect_host_profile(
+            HostAccess(access="ssh", destination="dgx")
+        )
 
 
 def test_ssh_adapter_reports_timeout_and_rejects_oversized_output():
@@ -689,7 +742,7 @@ def test_remote_probe_normalizes_dgx_spark_unified_memory(monkeypatch: pytest.Mo
     assert machine_id not in json.dumps(profile)
 
 
-def test_remote_probe_prefers_hashed_hardware_uuid_and_never_records_raw_id(
+def test_remote_probe_records_hashed_hardware_identity_without_changing_installation_identity(
     monkeypatch: pytest.MonkeyPatch,
 ):
     hardware_uuid = "12345678-1234-5678-9abc-def012345678"
@@ -708,11 +761,100 @@ def test_remote_probe_prefers_hashed_hardware_uuid_and_never_records_raw_id(
     profile = linux_dgx_probe.collect()
 
     assert profile["host_fingerprint"].startswith("host-")
-    assert profile["host_fingerprint_source"] == "dmi_product_uuid"
-    assert profile["host_fingerprint_strength"] == "hardware"
+    assert profile["host_fingerprint_source"] == "machine_id"
+    assert profile["host_fingerprint_strength"] == "installation"
+    assert profile["host_hardware_fingerprint"].startswith("host-")
     serialized = json.dumps(profile)
     assert hardware_uuid not in serialized
     assert machine_id not in serialized
+
+
+@pytest.mark.parametrize(
+    "hardware_uuid",
+    [
+        "1234567890abcdef",
+        "0" * 32,
+        "f" * 32,
+        "12345678-1234-5678-9abc-def01234567z",
+    ],
+)
+def test_remote_probe_rejects_malformed_hardware_uuid(hardware_uuid: str):
+    assert linux_dgx_probe._usable_hardware_uuid(hardware_uuid) is None
+
+
+def test_remote_probe_canonicalizes_hardware_uuid_format():
+    canonical = "12345678-1234-5678-9abc-def012345678"
+
+    assert linux_dgx_probe._usable_hardware_uuid(canonical.upper()) == canonical
+    assert linux_dgx_probe._usable_hardware_uuid(canonical.replace("-", "")) == canonical
+
+
+def test_remote_probe_uses_hardware_identity_when_machine_id_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    hardware_uuid = "12345678-1234-5678-9abc-def012345678"
+    monkeypatch.setattr(
+        linux_dgx_probe,
+        "_read_text",
+        lambda path, limit=100_000: (
+            hardware_uuid if path == linux_dgx_probe.HARDWARE_UUID_PATHS[0] else None
+        ),
+    )
+
+    fingerprint, source, strength, hardware_fingerprint, aliases = (
+        linux_dgx_probe._machine_fingerprint("Linux", "spark", {})
+    )
+
+    assert fingerprint == hardware_fingerprint
+    assert source == "dmi_product_uuid"
+    assert strength == "hardware"
+    assert aliases == []
+
+
+def test_remote_and_local_linux_inventory_share_fingerprint_contract(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    machine_id = "0123456789abcdef0123456789abcdef"
+    hardware_uuid = "12345678-1234-5678-9abc-def012345678"
+    files = {
+        linux_dgx_probe.HARDWARE_UUID_PATHS[0]: hardware_uuid,
+        linux_dgx_probe.MACHINE_ID_PATHS[0]: machine_id,
+    }
+    monkeypatch.setattr(
+        linux_dgx_probe,
+        "_read_text",
+        lambda path, limit=100_000: files.get(path),
+    )
+    remote_fingerprint, remote_source, remote_strength, remote_hardware, remote_aliases = (
+        linux_dgx_probe._machine_fingerprint(
+            "Linux",
+            "spark",
+            {"machine": "aarch64", "model": "DGX Spark"},
+        )
+    )
+    monkeypatch.setattr(system_module, "_machine_identifier", lambda _name: machine_id)
+    monkeypatch.setattr(system_module, "_linux_hardware_uuid", lambda: hardware_uuid)
+    local_fingerprint, local_source, local_strength, local_hardware, local_aliases = (
+        system_module._current_host_identity(
+            system_name="Linux",
+            hostname="spark",
+            hardware={"machine": "aarch64", "model": "DGX Spark"},
+        )
+    )
+
+    assert (
+        remote_fingerprint,
+        remote_source,
+        remote_strength,
+        remote_hardware,
+        remote_aliases,
+    ) == (
+        local_fingerprint,
+        local_source,
+        local_strength,
+        local_hardware,
+        local_aliases,
+    )
 
 
 def test_remote_probe_source_is_compatible_with_python_3_10():
@@ -820,6 +962,41 @@ def test_resolver_verifies_pinned_host_fingerprint_independent_of_ssh_alias():
     }
 
 
+def test_resolver_accepts_pre_unification_strong_hardware_pin():
+    raw = _target_mapping()
+    raw["host"]["expected_fingerprint"] = "host-prior-hardware"
+    profile = dict(_host().profile)
+    profile.update(
+        {
+            "host_fingerprint": "host-canonical-installation",
+            "host_fingerprint_source": "machine_id",
+            "host_fingerprint_strength": "installation",
+            "host_hardware_fingerprint": "host-prior-hardware",
+            "host_fingerprint_aliases": [
+                {
+                    "fingerprint": "host-prior-hardware",
+                    "source": "dmi_product_uuid",
+                    "strength": "hardware",
+                }
+            ],
+        }
+    )
+    resolver = TargetResolver(
+        ssh_client=_FakeSSH(HostDiscovery(transport="ssh", destination="dgx", profile=profile)),  # type: ignore[arg-type]
+        service_client=_FakeService(_service("served-model")),  # type: ignore[arg-type]
+    )
+
+    inspection = resolver.inspect(TargetSpec.from_mapping(raw))
+
+    assert inspection.available is True
+    assert inspection.safe_json()["host_identity_binding"] == {
+        "expected_fingerprint": "host-prior-hardware",
+        "actual_fingerprint": "host-prior-hardware",
+        "actual_strength": "hardware",
+        "verified": True,
+    }
+
+
 def test_resolver_rejects_weak_hostname_fingerprint_as_identity_pin():
     raw = _target_mapping()
     raw["host"]["expected_fingerprint"] = "host-example"
@@ -827,9 +1004,7 @@ def test_resolver_rejects_weak_hostname_fingerprint_as_identity_pin():
     profile["host_fingerprint_source"] = "hostname"
     profile["host_fingerprint_strength"] = "weak"
     resolver = TargetResolver(
-        ssh_client=_FakeSSH(
-            HostDiscovery(transport="ssh", destination="dgx", profile=profile)
-        ),  # type: ignore[arg-type]
+        ssh_client=_FakeSSH(HostDiscovery(transport="ssh", destination="dgx", profile=profile)),  # type: ignore[arg-type]
         service_client=_FakeService(_service("served-model")),  # type: ignore[arg-type]
     )
 
@@ -1109,9 +1284,7 @@ def test_openai_discovery_bounds_streams_before_buffering(monkeypatch: pytest.Mo
         return httpx.Response(404)
 
     with pytest.raises(ConfigError, match="model discovery.*response is too large"):
-        _discovery_client(handler).discover(
-            _spec().endpoint, DiscoveryPolicy(server_info="off")
-        )
+        _discovery_client(handler).discover(_spec().endpoint, DiscoveryPolicy(server_info="off"))
 
     assert model_chunks_read == 2
 
@@ -1321,6 +1494,7 @@ def test_openai_discovery_bounds_and_closes_factory_client(monkeypatch):
 
 def test_openai_discovery_requires_configured_api_key(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_API_KEY", raising=False)
+
     def handler(request: httpx.Request) -> httpx.Response:
         pytest.fail(f"must not send request: {request.url}")
 
@@ -1462,9 +1636,7 @@ def test_discovery_rejects_cross_origin_redirect_before_following_it(
         )
 
     with pytest.raises(ConfigError, match="remain on the configured.*origin"):
-        _discovery_client(handler).discover(
-            _spec().endpoint, DiscoveryPolicy(server_info="off")
-        )
+        _discovery_client(handler).discover(_spec().endpoint, DiscoveryPolicy(server_info="off"))
 
     assert len(requests) == 1
 
@@ -1476,6 +1648,7 @@ def test_discovery_rejects_dns_name_that_resolves_to_client_loopback(
         "llm_refinery.core.http_safety.socket.getaddrinfo",
         lambda host, port, **kwargs: [(2, 1, 6, "", ("127.0.0.1", port))],
     )
+
     def handler(request: httpx.Request) -> httpx.Response:
         pytest.fail(f"must not send request: {request.url}")
 

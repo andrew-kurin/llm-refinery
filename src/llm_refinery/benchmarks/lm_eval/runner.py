@@ -11,6 +11,7 @@ from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -42,11 +43,105 @@ class LmEvalFailed(RuntimeError):
 
 _MAX_RELAY_BODY_BYTES = 64_000_000
 _PROCESS_TERMINATION_GRACE_S = 0.5
+_RELAY_SHUTDOWN_GRACE_S = 2.0
 _RELAY_RESPONSE_HEADERS = {
     "content-type": "Content-Type",
     "retry-after": "Retry-After",
     "retry-after-ms": "retry-after-ms",
 }
+
+
+class _RelayState:
+    """Own relay handler threads and their cancellable upstream clients."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._handler_threads: set[threading.Thread] = set()
+        self._clients: set[httpx.Client] = set()
+        self._closing = False
+
+    def add_handler(self, thread: threading.Thread) -> None:
+        with self._condition:
+            self._handler_threads.add(thread)
+
+    def remove_handler(self, thread: threading.Thread) -> None:
+        with self._condition:
+            self._handler_threads.discard(thread)
+            self._condition.notify_all()
+
+    def add_client(self, client: httpx.Client) -> bool:
+        with self._condition:
+            if self._closing:
+                return False
+            self._clients.add(client)
+            return True
+
+    def remove_client(self, client: httpx.Client) -> None:
+        with self._condition:
+            self._clients.discard(client)
+            self._condition.notify_all()
+
+    def begin_shutdown(self) -> None:
+        with self._condition:
+            self._closing = True
+            clients = tuple(self._clients)
+        for client in clients:
+            with suppress(Exception):
+                client.close()
+
+    def join_handlers(self, timeout_s: float) -> None:
+        deadline = time.monotonic() + timeout_s
+        current = threading.current_thread()
+        while True:
+            with self._condition:
+                threads = tuple(
+                    thread
+                    for thread in self._handler_threads
+                    if thread is not current and thread.is_alive()
+                )
+            if not threads:
+                return
+            for thread in threads:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                thread.join(timeout=remaining)
+
+
+class _RelayServer(ThreadingHTTPServer):
+    """Threaded relay whose request threads can be cancelled and joined."""
+
+    daemon_threads = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        handler: type[BaseHTTPRequestHandler],
+        state: _RelayState,
+    ) -> None:
+        self.relay_state = state
+        super().__init__(server_address, handler)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        thread = threading.Thread(
+            target=self._tracked_process_request,
+            args=(request, client_address),
+            name="llm-refinery-lm-eval-relay-request",
+            daemon=self.daemon_threads,
+        )
+        self.relay_state.add_handler(thread)
+        try:
+            thread.start()
+        except BaseException:
+            self.relay_state.remove_handler(thread)
+            self.shutdown_request(request)
+            raise
+
+    def _tracked_process_request(self, request: Any, client_address: Any) -> None:
+        try:
+            self.process_request_thread(request, client_address)
+        finally:
+            self.relay_state.remove_handler(threading.current_thread())
 
 
 def run_lm_eval(
@@ -371,6 +466,7 @@ def _lm_eval_target(
         urlsplit(target.chat_completions_url).path,
         urlsplit(target.completions_url).path,
     }
+    relay_state = _RelayState()
 
     class RelayHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
@@ -406,12 +502,18 @@ def _lm_eval_target(
                 trust_env=client_trust_env,
                 verify=verify,
             )
+            if not relay_state.add_client(client):
+                with suppress(Exception):
+                    client.close()
+                self.send_error(503, "relay is shutting down")
+                return
             deadline = time.monotonic() + config.request_timeout_s
             expired = threading.Event()
 
             def expire() -> None:
                 expired.set()
-                client.close()
+                with suppress(Exception):
+                    client.close()
 
             timer = threading.Timer(config.request_timeout_s, expire)
             timer.daemon = True
@@ -447,13 +549,14 @@ def _lm_eval_target(
                 self.send_error(502, "upstream request failed")
             finally:
                 timer.cancel()
-                client.close()
+                with suppress(Exception):
+                    client.close()
+                relay_state.remove_client(client)
 
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002
             return
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), RelayHandler)
-    server.daemon_threads = True
+    server = _RelayServer(("127.0.0.1", 0), RelayHandler, relay_state)
     thread = threading.Thread(
         target=server.serve_forever,
         name="llm-refinery-lm-eval-relay",
@@ -465,8 +568,10 @@ def _lm_eval_target(
     try:
         yield replace(target, base_url=relay_base_url)
     finally:
+        relay_state.begin_shutdown()
         server.shutdown()
         server.server_close()
+        relay_state.join_handlers(_RELAY_SHUTDOWN_GRACE_S)
         thread.join(timeout=2)
 
 

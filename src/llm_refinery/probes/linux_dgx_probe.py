@@ -220,14 +220,12 @@ def _usable_hardware_uuid(value):
         return None
     normalized = value.strip().lower()
     compact = normalized.replace("-", "")
-    if (
-        len(compact) < 16
-        or re.fullmatch(r"[0-9a-f]+", compact) is None
-        or set(compact) in ({"0"}, {"f"})
-        or normalized in {"none", "unknown", "not specified"}
-    ):
+    if re.fullmatch(r"[0-9a-f]{32}", compact) is None or set(compact) in ({"0"}, {"f"}):
         return None
-    return normalized
+    # DMI normally exposes the UUID in this representation. Canonicalizing
+    # compact input to it keeps fingerprints independent of source formatting
+    # while preserving hashes generated from ordinary DMI values.
+    return "-".join((compact[:8], compact[8:12], compact[12:16], compact[16:20], compact[20:]))
 
 
 def _usable_machine_id(value):
@@ -242,7 +240,7 @@ def _usable_machine_id(value):
     return normalized
 
 
-def _machine_fingerprint(system_name, hostname):
+def _machine_fingerprint(system_name, hostname, hardware):
     hardware_uuid = None
     for path in HARDWARE_UUID_PATHS:
         hardware_uuid = _usable_hardware_uuid(_read_text(path, 1024))
@@ -253,29 +251,85 @@ def _machine_fingerprint(system_name, hostname):
         machine_id = _usable_machine_id(_read_text(path, 1024))
         if machine_id:
             break
+    hardware_fingerprint = None
     if hardware_uuid:
-        identity = {"version": 2, "system": system_name, "hardware_uuid": hardware_uuid}
-        source = "dmi_product_uuid"
-        strength = "hardware"
-    elif machine_id:
-        # Keep the original machine-id hash stable for already pinned targets.
-        identity = {"version": 1, "system": system_name, "machine_id": machine_id}
+        hardware_identity = {
+            "version": 2,
+            "system": system_name,
+            "hardware_uuid": hardware_uuid,
+        }
+        hardware_payload = json.dumps(hardware_identity, sort_keys=True, separators=(",", ":"))
+        hardware_fingerprint = (
+            "host-" + hashlib.sha256(hardware_payload.encode("utf-8")).hexdigest()[:16]
+        )
+    aliases = []
+    if machine_id:
+        # This is the established local Linux fingerprint contract. Keeping
+        # the exact payload makes local and SSH inspection interchangeable and
+        # preserves existing executor/resume identities.
+        identity = {
+            "version": 1,
+            "system": system_name,
+            "machine_identifier": machine_id,
+        }
         source = "machine_id"
         strength = "installation"
+    elif hardware_uuid:
+        identity = {
+            "version": 2,
+            "system": system_name,
+            "hardware_uuid": hardware_uuid,
+        }
+        source = "dmi_product_uuid"
+        strength = "hardware"
     else:
         identity = {
             "version": 1,
             "system": system_name,
             "hostname": hostname,
-            "machine": platform.machine(),
+            "machine": hardware.get("machine"),
+            "model": hardware.get("model"),
+            "chip": hardware.get("chip"),
+            "memory_bytes": hardware.get("memory_bytes"),
         }
         source = "hostname"
         strength = "weak"
     payload = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    primary_fingerprint = "host-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    if hardware_fingerprint and hardware_fingerprint != primary_fingerprint:
+        aliases.append(
+            {
+                "fingerprint": hardware_fingerprint,
+                "source": "dmi_product_uuid",
+                "strength": "hardware",
+            }
+        )
+    if machine_id:
+        # Earlier SSH probes used a different payload key from local inventory.
+        # Retain that hash as a finite compatibility alias for existing pins.
+        legacy_identity = {
+            "version": 1,
+            "system": system_name,
+            "machine_id": machine_id,
+        }
+        legacy_payload = json.dumps(legacy_identity, sort_keys=True, separators=(",", ":"))
+        legacy_fingerprint = (
+            "host-" + hashlib.sha256(legacy_payload.encode("utf-8")).hexdigest()[:16]
+        )
+        if legacy_fingerprint != primary_fingerprint:
+            aliases.append(
+                {
+                    "fingerprint": legacy_fingerprint,
+                    "source": "legacy_machine_id",
+                    "strength": "installation",
+                }
+            )
     return (
-        "host-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16],
+        primary_fingerprint,
         source,
         strength,
+        hardware_fingerprint,
+        aliases,
     )
 
 
@@ -331,10 +385,6 @@ def collect():
     mem_total_kb = meminfo.get("memtotal_kb")
     memory_bytes = mem_total_kb * 1024 if mem_total_kb is not None else None
     cpu = _cpu_profile(cpu_text)
-    host_fingerprint, fingerprint_source, fingerprint_strength = _machine_fingerprint(
-        system_name,
-        hostname,
-    )
     hardware = _drop_none(
         {
             "model": dmi.get("product_name") or device_tree_model,
@@ -348,6 +398,13 @@ def collect():
             "memory_gb": round(memory_bytes / 1024**3, 1) if memory_bytes else None,
         }
     )
+    (
+        host_fingerprint,
+        fingerprint_source,
+        fingerprint_strength,
+        hardware_fingerprint,
+        fingerprint_aliases,
+    ) = _machine_fingerprint(system_name, hostname, hardware)
     profile = {
         "schema_version": SCHEMA_VERSION,
         # Keep this probe executable by the remote host's Python 3.10 runtime.
@@ -356,6 +413,8 @@ def collect():
         "host_fingerprint": host_fingerprint,
         "host_fingerprint_source": fingerprint_source,
         "host_fingerprint_strength": fingerprint_strength,
+        "host_hardware_fingerprint": hardware_fingerprint,
+        "host_fingerprint_aliases": fingerprint_aliases,
         "platform": {
             "system": system_name,
             "release": platform.release(),

@@ -23,6 +23,7 @@ from llm_refinery.core.endpoints import OLLAMA_CHAT, OPENAI_CHAT, Endpoint
 from llm_refinery.core.http_safety import (
     HttpOrigin,
     PinnedHttpRoute,
+    environment_proxy_applies,
     http_origin,
     pinned_route_trust_env,
     resolve_request_route,
@@ -45,6 +46,7 @@ class _DeadlineWatchdog:
         self._condition = threading.Condition()
         self._deadlines: list[tuple[float, int]] = []
         self._callbacks: dict[int, Callable[[], None]] = {}
+        self._running: set[int] = set()
         self._next_token = 0
         self._thread: threading.Thread | None = None
 
@@ -66,7 +68,11 @@ class _DeadlineWatchdog:
 
     def cancel(self, token: int) -> None:
         with self._condition:
-            self._callbacks.pop(token, None)
+            if self._callbacks.pop(token, None) is not None:
+                self._condition.notify()
+                return
+            while token in self._running:
+                self._condition.wait()
             self._condition.notify()
 
     def _run(self) -> None:
@@ -86,9 +92,16 @@ class _DeadlineWatchdog:
                         continue
                     heapq.heappop(self._deadlines)
                     callback = self._callbacks.pop(token, None)
+                    if callback is not None:
+                        self._running.add(token)
             if callback is not None:
-                with suppress(Exception):  # deadline cleanup is best effort
-                    callback()
+                try:
+                    with suppress(Exception):  # deadline cleanup is best effort
+                        callback()
+                finally:
+                    with self._condition:
+                        self._running.discard(token)
+                        self._condition.notify_all()
 
 
 _DEADLINE_WATCHDOG = _DeadlineWatchdog()
@@ -228,10 +241,15 @@ def _owned_http_client(trial: HttpLoadTrial) -> Iterator[httpx.Client]:
 
 
 def _trial_route(trial: HttpLoadTrial) -> PinnedHttpRoute | None:
-    return trial.transport.pinned_route or resolve_request_route(
-        trial.target.base_url,
-        require_resolution=True,
-    )
+    if trial.transport.pinned_route is not None:
+        return trial.transport.pinned_route
+    if trial.transport.trust_env and environment_proxy_applies(trial.target.base_url):
+        # A proxy connects to the logical origin itself, so an IP rewrite would
+        # both bypass that proxy and break its hostname routing. Explicit DGX
+        # routes still take the fail-closed branch above.
+        validate_request_url(trial.target.base_url, resolve_addresses=False)
+        return None
+    return resolve_request_route(trial.target.base_url, require_resolution=True)
 
 
 def _new_http_client(

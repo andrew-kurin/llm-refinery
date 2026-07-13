@@ -153,6 +153,50 @@ def test_compare_separates_executor_target_and_measurement_topology():
     assert all(column in header for column in ("host", "executor_host", "target_host", "topology"))
 
 
+def test_compare_does_not_label_failed_remote_target_as_executor():
+    shared = {
+        "trial_name": "suite/model",
+        "status": "failed",
+        "duration_s": 1.0,
+        "config_json": {"model": "served-model", "params": {}},
+        "metrics": {},
+        "system_json": {"hostname": "mac", "host_fingerprint": "host-mac"},
+    }
+
+    named = build_compare_rows(
+        [
+            {
+                **shared,
+                "run_id": "named-remote",
+                "target_json": {
+                    "status": "unavailable",
+                    "name": "spark",
+                    "host": None,
+                },
+            }
+        ],
+        metrics=("score",),
+    )[0]
+    unknown = build_compare_rows(
+        [
+            {
+                **shared,
+                "run_id": "unknown-remote",
+                "target_json": {"status": "unavailable"},
+            }
+        ],
+        metrics=("score",),
+    )[0]
+    legacy_local = build_compare_rows(
+        [{**shared, "run_id": "legacy-local", "target_json": {}}],
+        metrics=("score",),
+    )[0]
+
+    assert named["target_host"] == "spark"
+    assert unknown["target_host"] == "unknown"
+    assert legacy_local["target_host"] == "mac"
+
+
 def test_compare_keeps_same_remote_run_from_distinct_executors():
     target = {
         "host": {"profile": {"hostname": "spark", "host_fingerprint": "host-spark"}},

@@ -105,7 +105,12 @@ def _build_compare_row(
     prompt_tokens = config.get("prompt_tokens")
     gen_tokens = config.get("gen_tokens")
     executor_host = _host_label(system_profile)
-    target_host = _target_host_label(target_profile) or executor_host
+    target_host = _target_host_label(target_profile)
+    if not target_host:
+        # Historical rows without target metadata represent local execution. A
+        # non-empty target payload, however, represents a distinct target even
+        # when discovery failed before its host could be inventoried.
+        target_host = "unknown" if target_profile else executor_host
     topology = _topology_label(target_profile)
 
     row: dict[str, Any] = {
@@ -133,13 +138,9 @@ def _build_compare_row(
         if key.startswith("system."):
             row[key] = _lookup_dotted(run.get("system_json") or {}, key.removeprefix("system."))
         elif key.startswith("executor."):
-            row[key] = _lookup_dotted(
-                run.get("system_json") or {}, key.removeprefix("executor.")
-            )
+            row[key] = _lookup_dotted(run.get("system_json") or {}, key.removeprefix("executor."))
         elif key.startswith("target."):
-            row[key] = _lookup_dotted(
-                run.get("target_json") or {}, key.removeprefix("target.")
-            )
+            row[key] = _lookup_dotted(run.get("target_json") or {}, key.removeprefix("target."))
         else:
             row[key] = trial_params.get(key, config.get(key, ""))
     for key in metric_keys:
@@ -176,7 +177,27 @@ def _target_host_label(target_json: dict[str, Any]) -> str:
 
     service = target_json.get("service") or {}
     if isinstance(service, dict) and service.get("base_url"):
-        return urlparse(str(service["base_url"])).hostname or ""
+        hostname = urlparse(str(service["base_url"])).hostname
+        if hostname:
+            return hostname
+
+    requested = target_json.get("requested_target") or {}
+    if isinstance(requested, dict):
+        requested_host = requested.get("host") or {}
+        if isinstance(requested_host, dict):
+            for key in ("hostname", "destination", "name"):
+                if requested_host.get(key):
+                    return str(requested_host[key])
+        requested_endpoint = requested.get("endpoint") or {}
+        if isinstance(requested_endpoint, dict) and requested_endpoint.get("base_url"):
+            hostname = urlparse(str(requested_endpoint["base_url"])).hostname
+            if hostname:
+                return hostname
+        if requested.get("name"):
+            return str(requested["name"])
+
+    if target_json.get("name"):
+        return str(target_json["name"])
     return ""
 
 
@@ -191,9 +212,7 @@ def _target_host_profile(target_json: dict[str, Any]) -> dict[str, Any]:
     return host
 
 
-def _target_identity(
-    target_json: dict[str, Any], *, executor_profile: dict[str, Any]
-) -> str:
+def _target_identity(target_json: dict[str, Any], *, executor_profile: dict[str, Any]) -> str:
     # Historical rows did not separate executor and target; they represent local runs.
     if not target_json:
         return host_identity(executor_profile)

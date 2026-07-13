@@ -9,7 +9,12 @@ from typing import Any
 from urllib.parse import urlparse
 
 from llm_refinery.core.config import ConfigError, load_yaml_mapping, reject_unknown_keys
-from llm_refinery.core.endpoints import CHAT_PROTOCOLS, OPENAI_CHAT, Endpoint
+from llm_refinery.core.endpoints import (
+    CHAT_PROTOCOLS,
+    OPENAI_CHAT,
+    Endpoint,
+    normalize_base_url,
+)
 from llm_refinery.core.http_safety import PinnedHttpRoute
 from llm_refinery.core.runs import stable_hash
 
@@ -79,7 +84,10 @@ class EndpointSpec:
     def __post_init__(self) -> None:
         name = self.name.strip()
         protocol = self.protocol.strip().lower()
-        base_url = self.base_url.strip().rstrip("/")
+        base_url = normalize_base_url(
+            self.base_url,
+            context="endpoint spec base_url",
+        )
         model = self.model.strip() if self.model else None
         if not name:
             raise ConfigError("endpoint spec name cannot be empty")
@@ -87,20 +95,6 @@ class EndpointSpec:
             raise ConfigError(
                 f"endpoint spec protocol must be one of {sorted(CHAT_PROTOCOLS)}, got {protocol!r}"
             )
-        parsed = urlparse(base_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ConfigError("endpoint spec base_url must be an HTTP(S) URL")
-        try:
-            hostname = parsed.hostname
-            _port = parsed.port
-        except ValueError as exc:
-            raise ConfigError("endpoint spec base_url must be a valid HTTP(S) URL") from exc
-        if hostname is None:
-            raise ConfigError("endpoint spec base_url must include a hostname")
-        if parsed.username is not None or parsed.password is not None:
-            raise ConfigError("endpoint spec base_url cannot include user information")
-        if parsed.query or parsed.fragment or "?" in base_url or "#" in base_url:
-            raise ConfigError("endpoint spec base_url cannot include a query or fragment")
         if (
             protocol == OPENAI_CHAT
             and not base_url.endswith("/v1")
@@ -756,8 +750,10 @@ def _host_identity_binding(
 ) -> dict[str, Any] | None:
     if expected_fingerprint is None:
         return None
-    actual = host.profile.get("host_fingerprint") if host is not None else None
-    strength = host.profile.get("host_fingerprint_strength") if host is not None else None
+    candidates = host_fingerprint_candidates(host.profile) if host is not None else {}
+    primary = host.profile.get("host_fingerprint") if host is not None else None
+    actual = expected_fingerprint if expected_fingerprint in candidates else primary
+    strength = candidates.get(str(actual)) if actual is not None else None
     strength_is_verifiable = host is not None and (
         host.transport != HOST_ACCESS_SSH or strength in {"hardware", "installation"}
     )
@@ -767,6 +763,31 @@ def _host_identity_binding(
         "actual_strength": strength,
         "verified": actual == expected_fingerprint and strength_is_verifiable,
     }
+
+
+def host_fingerprint_candidates(profile: dict[str, Any]) -> dict[str, str | None]:
+    """Return the primary and explicitly retained hashed identity aliases."""
+    candidates: dict[str, str | None] = {}
+    primary = profile.get("host_fingerprint")
+    if isinstance(primary, str) and primary:
+        candidates[primary] = (
+            str(profile["host_fingerprint_strength"])
+            if profile.get("host_fingerprint_strength") is not None
+            else None
+        )
+    hardware = profile.get("host_hardware_fingerprint")
+    if isinstance(hardware, str) and hardware:
+        candidates[hardware] = "hardware"
+    aliases = profile.get("host_fingerprint_aliases")
+    if isinstance(aliases, list):
+        for alias in aliases:
+            if not isinstance(alias, dict):
+                continue
+            fingerprint = alias.get("fingerprint")
+            strength = alias.get("strength")
+            if isinstance(fingerprint, str) and fingerprint:
+                candidates[fingerprint] = str(strength) if strength is not None else None
+    return candidates
 
 
 def _measurement_scope(host_access: str, base_url: str) -> str:
@@ -817,6 +838,7 @@ __all__ = [
     "EndpointSpec",
     "HostAccess",
     "HostDiscovery",
+    "host_fingerprint_candidates",
     "ModelDescriptor",
     "ModelSelection",
     "ResolvedTarget",

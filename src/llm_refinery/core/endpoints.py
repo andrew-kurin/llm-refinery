@@ -25,7 +25,7 @@ class Endpoint:
     def __post_init__(self) -> None:
         name = self.name.strip()
         protocol = self.protocol.strip().lower()
-        base_url = _normalize_base_url(self.base_url, context="endpoint base_url")
+        base_url = normalize_base_url(self.base_url, context="endpoint base_url")
         model = self.model.strip()
         if not name or not protocol or not model:
             raise ConfigError("endpoint name, protocol, and model cannot be empty")
@@ -64,7 +64,7 @@ class Endpoint:
         base_url = str(raw.get("base_url") or "").strip()
         if not base_url:
             raise ConfigError(f"{context} {name!r} requires 'base_url'")
-        base_url = _normalize_base_url(
+        base_url = normalize_base_url(
             base_url,
             context=f"{context} {name!r} base_url",
         )
@@ -113,7 +113,7 @@ class Endpoint:
         }
 
 
-def _normalize_base_url(value: str, *, context: str) -> str:
+def normalize_base_url(value: str, *, context: str) -> str:
     """Validate and normalize a credential-free HTTP endpoint base URL."""
     base_url = value.strip().rstrip("/")
     if not base_url or any(character.isspace() or ord(character) < 32 for character in base_url):
