@@ -36,6 +36,12 @@ uv pip install -e .
 llm-refinery --help
 ```
 
+The repository-relative `targets/`, `sweeps/`, and `evals/` paths used in this
+guide are example assets from the source checkout; they are not installed by the
+Python wheel. Clone the repository (or copy the needed manifests into your own
+project) before running those example commands. The installed CLI accepts those
+manifests from any user-managed path.
+
 ## Quick start
 
 Plan the commands without running anything:

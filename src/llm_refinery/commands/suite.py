@@ -15,7 +15,11 @@ from llm_refinery.workflows.suite_config import load_suite_config
 @click.argument("config", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--limit", "limit_text", help="lm-eval limit, or 'all'.")
 @click.option("--tasks", help="Comma-separated tasks for lm-eval.")
-@click.option("--max-length", type=int, help="Maximum lm-eval context length.")
+@click.option(
+    "--max-length",
+    type=click.IntRange(min=1),
+    help="Maximum lm-eval context length.",
+)
 @click.option("--eos-string", help="EOS string for lm-eval.")
 @click.option("--tokenizer", help="Tokenizer id/path for token-aware lm-eval tasks.")
 @click.option("--metadata", help="lm-eval metadata JSON.")
@@ -130,7 +134,7 @@ def suite_command(
         enabled=suite.quality.enabled if run_lm_eval is None else run_lm_eval,
         limit=(parse_lm_eval_limit(limit_text) if limit_text is not None else suite.quality.limit),
         tasks=tasks or suite.quality.tasks,
-        max_length=max_length or suite.quality.max_length,
+        max_length=max_length if max_length is not None else suite.quality.max_length,
         eos_string=eos_string or suite.quality.eos_string,
         tokenizer=tokenizer or suite.quality.tokenizer,
         metadata=metadata or suite.quality.metadata,

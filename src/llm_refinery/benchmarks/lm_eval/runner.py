@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import os
 import shlex
+import signal
 import ssl
 import subprocess
 import threading
 import time
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -40,6 +41,12 @@ class LmEvalFailed(RuntimeError):
 
 
 _MAX_RELAY_BODY_BYTES = 64_000_000
+_PROCESS_TERMINATION_GRACE_S = 0.5
+_RELAY_RESPONSE_HEADERS = {
+    "content-type": "Content-Type",
+    "retry-after": "Retry-After",
+    "retry-after-ms": "retry-after-ms",
+}
 
 
 def run_lm_eval(
@@ -83,6 +90,7 @@ def run_lm_eval(
             print(f"    output_path={output_path}")
             if dry_run:
                 print(command_text)
+                relay_stack.pop_all().close()
                 continue
 
             recorded_command_text = command_text.replace(
@@ -113,12 +121,10 @@ def run_lm_eval(
                 api_key = lm_eval_api_key(target, environ=os.environ)
                 if api_key is not None:
                     target_env["OPENAI_API_KEY"] = api_key
-                completed = subprocess.run(
+                completed, process_timed_out = _run_lm_eval_process(
                     cmd,
                     env=target_env,
-                    check=False,
-                    capture_output=True,
-                    text=True,
+                    timeout_s=config.process_timeout_s,
                 )
                 stdout_path.write_text(
                     _redact_subprocess_output(completed.stdout or "", api_key),
@@ -177,7 +183,9 @@ def run_lm_eval(
                     and not missing_samples
                 )
                 status = "ok" if success else "failed"
-                if completed.returncode != 0:
+                if process_timed_out:
+                    error = f"lm-eval process timed out after {config.process_timeout_s:g}s"
+                elif completed.returncode != 0:
                     error = f"exit code {completed.returncode}"
                 elif source_result is None:
                     error = "lm-eval produced no result artifact"
@@ -191,7 +199,9 @@ def run_lm_eval(
                 outcomes.append(outcome)
 
             if status != "ok":
+                relay_stack.pop_all().close()
                 raise LmEvalFailed(f"lm-eval failed for {target.name}: {error}")
+            relay_stack.pop_all().close()
     return outcomes
 
 
@@ -224,6 +234,8 @@ def _run_spec(
         "limit": config.limit,
         "num_concurrent": config.num_concurrent,
         "max_retries": config.max_retries,
+        "request_timeout_s": config.request_timeout_s,
+        "process_timeout_s": config.process_timeout_s,
         "max_length": config.max_length,
         "eos_string": config.eos_string,
         "tokenizer": config.tokenizer,
@@ -265,6 +277,69 @@ def _redact_subprocess_output(value: str, api_key: str | None) -> str:
     )
 
 
+def _run_lm_eval_process(
+    command: list[str],
+    *,
+    env: dict[str, str],
+    timeout_s: float,
+) -> tuple[subprocess.CompletedProcess[str], bool]:
+    """Run lm-eval with an absolute deadline and no orphaned descendants."""
+    process = subprocess.Popen(  # noqa: S603 - command is built from validated config
+        command,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    timed_out = False
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _terminate_process_group(process)
+        stdout, stderr = process.communicate()
+        stderr = (stderr or "") + f"\nlm-eval process timed out after {timeout_s:g}s\n"
+    except BaseException:
+        _terminate_process_group(process)
+        process.communicate()
+        raise
+    return (
+        subprocess.CompletedProcess(
+            args=command,
+            returncode=124 if timed_out else process.returncode,
+            stdout=stdout or "",
+            stderr=stderr or "",
+        ),
+        timed_out,
+    )
+
+
+def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+    """Terminate the dedicated uvx/lm-eval process group, escalating if needed."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        if process.poll() is None:
+            process.terminate()
+    with suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=_PROCESS_TERMINATION_GRACE_S)
+
+    # The uvx leader may exit before lm-eval. Address the group again so a
+    # descendant cannot keep issuing requests after the run is marked failed.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        if process.poll() is None:
+            process.kill()
+    if process.poll() is None:
+        process.wait()
+
+
 @contextmanager
 def _lm_eval_target(
     target: Endpoint,
@@ -282,6 +357,7 @@ def _lm_eval_target(
     client_trust_env = pinned_route_trust_env(
         target.base_url,
         trust_env=config.trust_env,
+        route_is_pinned=True,
     )
     try:
         verify = httpx.create_ssl_context(
@@ -290,11 +366,6 @@ def _lm_eval_target(
         )
     except (OSError, ssl.SSLError) as exc:
         raise ConfigError(f"could not load lm-eval CA bundle: {config.ca_bundle}") from exc
-    client = httpx.Client(
-        follow_redirects=False,
-        trust_env=client_trust_env,
-        verify=verify,
-    )
     logical = urlsplit(target.base_url)
     allowed_paths = {
         urlsplit(target.chat_completions_url).path,
@@ -330,6 +401,21 @@ def _lm_eval_target(
                     "transfer-encoding",
                 }
             }
+            client = httpx.Client(
+                follow_redirects=False,
+                trust_env=client_trust_env,
+                verify=verify,
+            )
+            deadline = time.monotonic() + config.request_timeout_s
+            expired = threading.Event()
+
+            def expire() -> None:
+                expired.set()
+                client.close()
+
+            timer = threading.Timer(config.request_timeout_s, expire)
+            timer.daemon = True
+            timer.start()
             try:
                 with client.stream(
                     "POST",
@@ -337,24 +423,31 @@ def _lm_eval_target(
                     content=body,
                     headers=pinned_route.request_headers(headers),
                     extensions={"sni_hostname": pinned_route.sni_hostname},
-                    timeout=300.0,
+                    timeout=config.request_timeout_s,
                 ) as response:
                     if 300 <= response.status_code < 400:
                         raise RuntimeError("upstream redirect refused")
                     response_body = bytearray()
                     for chunk in response.iter_bytes():
+                        if expired.is_set() or time.monotonic() > deadline:
+                            raise TimeoutError("upstream request exceeded its total timeout")
                         if len(response_body) + len(chunk) > _MAX_RELAY_BODY_BYTES:
                             raise RuntimeError("upstream response is too large")
                         response_body.extend(chunk)
                     self.send_response(response.status_code)
-                    content_type = response.headers.get("content-type")
-                    if content_type:
-                        self.send_header("Content-Type", content_type)
+                    for source_name, output_name in _RELAY_RESPONSE_HEADERS.items():
+                        header_value = response.headers.get(source_name)
+                        if _safe_relay_response_header(header_value):
+                            assert header_value is not None
+                            self.send_header(output_name, header_value)
                     self.send_header("Content-Length", str(len(response_body)))
                     self.end_headers()
                     self.wfile.write(response_body)
             except Exception:  # noqa: BLE001 - return a fixed, credential-free relay error
                 self.send_error(502, "upstream request failed")
+            finally:
+                timer.cancel()
+                client.close()
 
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002
             return
@@ -375,4 +468,13 @@ def _lm_eval_target(
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
-        client.close()
+
+
+def _safe_relay_response_header(value: str | None) -> bool:
+    if value is None or not value or len(value) > 1024 or value != value.strip(" \t"):
+        return False
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    return not any(ord(character) < 32 or ord(character) == 127 for character in value)

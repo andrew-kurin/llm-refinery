@@ -14,7 +14,7 @@ Copy `targets/dgx-spark-vllm.yaml` and set:
 
 - `host.destination` to an OpenSSH destination such as `dgx`.
 - `host.expected_fingerprint` after the first trusted inspection when the SSH
-  alias should be pinned to one physical machine.
+  alias should be pinned to the discovered hardware or OS installation.
 - `endpoint.base_url` to the client-visible URL, including `/v1`.
 - `model.id` with `selection: explicit` when the server exposes multiple IDs.
 - `transport.trust_env` to `false` for a direct LAN connection. Certificate
@@ -26,9 +26,15 @@ example, SSH can use `dgx` while requests use
 `http://aitopatom-41de.local:8000/v1`.
 
 For an identity-pinned setup, first inspect the intended machine over a trusted
-SSH connection and copy `host.profile.host_fingerprint` into
-`host.expected_fingerprint`. Future inspections fail closed if the SSH alias
-resolves to a different machine or inventory cannot provide that fingerprint.
+SSH connection. Copy `host.profile.host_fingerprint` into
+`host.expected_fingerprint` only when `host_fingerprint_strength` is `hardware`
+or `installation`. A hardware fingerprint hashes the system's DMI product UUID;
+an installation fingerprint hashes Linux's machine-id. Neither raw identifier
+is recorded. The hostname fallback is marked `weak` and cannot satisfy a pin.
+Future inspections fail closed if the SSH alias resolves to a different identity
+or inventory cannot provide a verifiable fingerprint. Reinstalling the OS can
+change an installation fingerprint, while replacing hardware changes a hardware
+fingerprint.
 This binding works across SSH alias and username overrides and does not require
 the SSH control-plane name to equal the HTTP data-plane hostname. vLLM does not
 expose the probe fingerprint over its HTTP API, so the target configuration is
@@ -55,6 +61,9 @@ uv run llm-refinery target inspect targets/dgx-spark-vllm.yaml \
 The fixed probe is streamed to `python3 -I -` over SSH. It makes no writes and
 does not require llm-refinery to be installed on the Spark. Missing optional
 tools produce partial inventory rather than triggering installation.
+The command timeout includes SSH connection establishment and all inventory
+queries; the supplied target uses a 5-second connection timeout and a 30-second
+overall budget so best-effort NVIDIA queries retain a safety margin.
 
 ## Model discovery
 

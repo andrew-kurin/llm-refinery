@@ -191,20 +191,28 @@ def resolve_request_route(
     )
 
 
-def pinned_route_trust_env(url: str, *, trust_env: bool) -> bool:
+def pinned_route_trust_env(
+    url: str,
+    *,
+    trust_env: bool,
+    route_is_pinned: bool = True,
+) -> bool:
     """Return safe HTTPX ``trust_env`` behavior for a validated target.
 
     Explicit client-local targets are always direct so credentials cannot leave
     the machine through an environment proxy. HTTPX applies proxy and NO_PROXY
     matching to a rewritten pinned IP rather than the logical hostname, so
     active proxying is also rejected for pinned targets. If the logical origin
-    is bypassed, environment mounts are disabled for the client.
+    is bypassed, environment mounts are disabled for the client. Route-less
+    non-local targets retain normal HTTPX proxy behavior.
     """
     if not trust_env:
         return False
     scheme, hostname, port = http_origin(url)
     if _is_explicit_client_loopback_host(hostname):
         return False
+    if not route_is_pinned:
+        return True
     proxies = getproxies()
     if not (proxies.get(scheme) or proxies.get("all")):
         return True

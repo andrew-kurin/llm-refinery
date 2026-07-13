@@ -148,6 +148,37 @@ def test_post_json_body_forces_explicit_loopback_target_direct(monkeypatch):
     assert captured["trust_env"] is False
 
 
+def test_post_json_body_preserves_proxy_support_for_route_less_remote_target(monkeypatch):
+    captured = {}
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"{}", request=request)
+        )
+    )
+
+    def client_factory(**kwargs):
+        captured.update(kwargs)
+        return client
+
+    monkeypatch.setattr(openai_chat_module.httpx, "Client", client_factory)
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.getproxies",
+        lambda: {"http": "http://proxy.test:3128"},
+    )
+
+    body = post_json_body(
+        "http://remote.test:8000/v1/chat/completions",
+        {"model": "test"},
+        headers={"Authorization": "Bearer remote-secret"},
+        timeout_s=1,
+        trust_env=True,
+        route=None,
+    )
+
+    assert body == "{}"
+    assert captured["trust_env"] is True
+
+
 def test_post_json_body_does_not_persist_untrusted_error_body():
     class ErrorServer(BaseHTTPRequestHandler):
         def do_POST(self):

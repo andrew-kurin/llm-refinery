@@ -1,7 +1,10 @@
 import json
 import os
 import subprocess
+import sys
 import threading
+import time
+from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -65,6 +68,22 @@ def test_lm_eval_command_supports_long_context_metadata(tmp_path):
     assert cmd[scorer_index - 1] == "--with"
 
 
+def test_lm_eval_command_rounds_subsecond_timeout_up_for_pinned_adapter():
+    config = LmEvalConfig(request_timeout_s=0.05)
+    cmd = build_lm_eval_command(
+        config,
+        Endpoint(
+            name="local",
+            protocol=OPENAI_CHAT,
+            model="local-model",
+            base_url="http://localhost/v1/chat/completions",
+        ),
+    )
+
+    model_args = cmd[cmd.index("--model_args") + 1]
+    assert "timeout=1" in model_args.split(",")
+
+
 def test_lm_eval_chat_backend_rejects_ignored_tokenizer():
     with pytest.raises(ConfigError, match="ignores client-side tokenization"):
         LmEvalConfig(tokenizer="org/model-tokenizer")
@@ -91,6 +110,8 @@ def test_lm_eval_relay_preserves_host_and_refuses_upstream_redirects(tmp_path, m
             body = b'{"choices":[]}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Retry-After", "2")
+            self.send_header("retry-after-ms", "50")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -132,6 +153,8 @@ def test_lm_eval_relay_preserves_host_and_refuses_upstream_redirects(tmp_path, m
             response = httpx.post(relay_target.chat_completions_url, json={"model": "x"})
             assert response.status_code == 200
             assert response.json() == {"choices": []}
+            assert response.headers["retry-after"] == "2"
+            assert response.headers["retry-after-ms"] == "50"
 
             redirect = True
             response = httpx.post(relay_target.chat_completions_url, json={"model": "x"})
@@ -145,6 +168,147 @@ def test_lm_eval_relay_preserves_host_and_refuses_upstream_redirects(tmp_path, m
         ("/v1/chat/completions", f"spark.local:{upstream.server_port}"),
         ("/v1/chat/completions", f"spark.local:{upstream.server_port}"),
     ]
+
+
+def test_lm_eval_relay_enforces_absolute_upstream_deadline(tmp_path, monkeypatch):
+    class TricklingUpstream(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{")
+            self.wfile.flush()
+            threading.Event().wait(0.5)
+            with suppress(BrokenPipeError):
+                self.wfile.write(b"}")
+
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), TricklingUpstream)
+    thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    thread.start()
+    logical_base = f"http://spark.local:{upstream.server_port}/v1"
+    route = PinnedHttpRoute(
+        origin=("http", "spark.local", upstream.server_port),
+        connect_host="127.0.0.1",
+        authority=f"spark.local:{upstream.server_port}",
+        sni_hostname="spark.local",
+    )
+    target = Endpoint(
+        name="spark",
+        protocol=OPENAI_CHAT,
+        model="served-model",
+        base_url=logical_base,
+    )
+    config = LmEvalConfig(
+        target="spark",
+        output_root=tmp_path,
+        targets={"spark": target},
+        pinned_route=route,
+        request_timeout_s=0.05,
+    )
+    monkeypatch.setattr("llm_refinery.core.http_safety.getproxies", lambda: {})
+    try:
+        with lm_eval_runner._lm_eval_target(target, config, dry_run=False) as relay_target:
+            started = time.monotonic()
+            response = httpx.post(relay_target.chat_completions_url, json={"model": "x"})
+            elapsed = time.monotonic() - started
+        assert response.status_code == 502
+        assert elapsed < 0.3
+    finally:
+        upstream.shutdown()
+        upstream.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("request_timeout_s", float("inf")),
+        ("request_timeout_s", True),
+        ("process_timeout_s", float("nan")),
+        ("process_timeout_s", 0),
+    ],
+)
+def test_lm_eval_rejects_unbounded_timeout_configuration(field, value):
+    with pytest.raises(ConfigError, match=field):
+        LmEvalConfig(**{field: value})
+
+
+def test_lm_eval_process_has_absolute_timeout(tmp_path, monkeypatch):
+    database = tmp_path / "runs.duckdb"
+
+    def timeout_process(command, *, env, timeout_s):
+        assert timeout_s == 0.05
+        return (
+            subprocess.CompletedProcess(
+                command,
+                124,
+                stdout="partial output",
+                stderr="partial error",
+            ),
+            True,
+        )
+
+    monkeypatch.setattr(lm_eval_runner, "_run_lm_eval_process", timeout_process)
+    config = LmEvalConfig(
+        target="local",
+        limit=1,
+        process_timeout_s=0.05,
+        output_root=tmp_path / "output",
+        database=database,
+        targets={
+            "local": Endpoint(
+                name="local",
+                protocol=OPENAI_CHAT,
+                model="local-model",
+                base_url="http://127.0.0.1:8080/v1",
+            )
+        },
+    )
+
+    with pytest.raises(lm_eval_runner.LmEvalFailed, match="timed out after 0.05s"):
+        lm_eval_runner.run_lm_eval(config)
+
+    with ResultStore(database) as store:
+        run = store.comparison_runs(include_failed=True)[0]
+    assert run["status"] == "failed"
+    assert run["error"] == "lm-eval process timed out after 0.05s"
+    assert "partial output" in Path(run["artifacts"]["stdout"]["path"]).read_text()
+    assert "partial error" in Path(run["artifacts"]["stderr"]["path"]).read_text()
+
+
+def test_lm_eval_timeout_terminates_descendant_processes(tmp_path):
+    ready = tmp_path / "child-ready"
+    survived = tmp_path / "child-survived"
+    child_source = (
+        "import signal,time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"Path({str(ready)!r}).write_text('ready'); "
+        "time.sleep(1); "
+        f"Path({str(survived)!r}).write_text('survived'); "
+        "time.sleep(60)"
+    )
+    parent_source = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {child_source!r}]); "
+        "time.sleep(60)"
+    )
+
+    completed, timed_out = lm_eval_runner._run_lm_eval_process(
+        [sys.executable, "-c", parent_source],
+        env=os.environ.copy(),
+        timeout_s=0.3,
+    )
+
+    assert timed_out is True
+    assert completed.returncode == 124
+    assert ready.is_file()
+    threading.Event().wait(1)
+    assert not survived.exists()
 
 
 def test_lm_eval_completions_backend_uses_completions_url_and_tokenizer():
@@ -383,16 +547,12 @@ def test_ifbench_normalized_correctness_uses_its_primary_loose_metric(tmp_path):
 def test_lm_eval_runner_persists_logged_samples(monkeypatch, tmp_path):
     output_root = tmp_path / "lm-eval-output"
     database = tmp_path / "runs.duckdb"
-    real_run = subprocess.run
     child_env: dict[str, str] = {}
     executed_command: list[str] = []
 
-    def fake_run(*args, **kwargs):
-        command = args[0] if args else kwargs.get("args")
-        if not isinstance(command, list) or not command or command[0] != "uvx":
-            return real_run(*args, **kwargs)
+    def fake_process(command, *, env, timeout_s):
         executed_command.extend(command)
-        child_env.update(kwargs["env"])
+        child_env.update(env)
         output_dir = output_root / "local" / "model"
         output_dir.mkdir(parents=True, exist_ok=True)
         stamp = "2026-07-10T12-00-00"
@@ -412,14 +572,17 @@ def test_lm_eval_runner_persists_logged_samples(monkeypatch, tmp_path):
             + "\n",
             encoding="utf-8",
         )
-        return subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout="ok top-secret-token Bearer top-secret-token",
-            stderr="request failed with top-secret-token",
+        return (
+            subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout="ok top-secret-token Bearer top-secret-token",
+                stderr="request failed with top-secret-token",
+            ),
+            False,
         )
 
-    monkeypatch.setattr(lm_eval_runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(lm_eval_runner, "_run_lm_eval_process", fake_process)
     monkeypatch.setenv("TEST_LM_EVAL_API_KEY", "top-secret-token")
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
     monkeypatch.setenv("SSL_CERT_DIR", "/ambient/certificates")

@@ -89,29 +89,20 @@ class BenchmarkSuiteWorkflow:
         )
         children: list[CompletedRun] = []
         with ResultStore(self.config.database) as store, RunSession(store, spec) as run:
-            before_path = run.artifact("system_before", "system-before.txt", "text/plain")
-            after_path = run.artifact("system_after", "system-after.txt", "text/plain")
-            discovery_path = None
-            server_before_path = None
-            server_after_path = None
             metrics_before_path = None
-            metrics_after_path = None
             target_spec = self.config.target
-            if target_spec is not None:
-                discovery_path = run.artifact(
-                    "target_discovery", "target-discovery.json", "application/json"
-                )
-                server_before_path = run.artifact(
-                    "server_before", "server-before.json", "application/json"
-                )
-                server_after_path = run.artifact(
-                    "server_after", "server-after.json", "application/json"
-                )
+            discovery_attempted = False
+            child_failure: Exception | None = None
             try:
                 before_snapshot = self.system_snapshot()
+                before_path = run.artifact(
+                    "system_before",
+                    "system-before.txt",
+                    "text/plain",
+                )
                 before_path.write_text(before_snapshot, encoding="utf-8")
                 if target_spec is not None:
-                    assert discovery_path is not None and server_before_path is not None
+                    discovery_attempted = True
                     try:
                         inspection = self.target_resolver.inspect(
                             target_spec,
@@ -137,6 +128,16 @@ class BenchmarkSuiteWorkflow:
                         failure = inspection.safe_json()
                         failure["failure_stage"] = "target_discovery"
                         failure["requested_target"] = target_spec.safe_json()
+                        discovery_path = run.artifact(
+                            "target_discovery",
+                            "target-discovery.json",
+                            "application/json",
+                        )
+                        server_before_path = run.artifact(
+                            "server_before",
+                            "server-before.json",
+                            "application/json",
+                        )
                         _write_json(discovery_path, failure)
                         _write_json(
                             server_before_path,
@@ -146,6 +147,16 @@ class BenchmarkSuiteWorkflow:
                         )
                         run.set_target_json(failure)
                         raise
+                    discovery_path = run.artifact(
+                        "target_discovery",
+                        "target-discovery.json",
+                        "application/json",
+                    )
+                    server_before_path = run.artifact(
+                        "server_before",
+                        "server-before.json",
+                        "application/json",
+                    )
                     _write_json(discovery_path, inspection.safe_json())
                     _write_json(
                         server_before_path,
@@ -169,11 +180,6 @@ class BenchmarkSuiteWorkflow:
                             "vllm-metrics-before.prom",
                             "text/plain",
                         )
-                        metrics_after_path = run.artifact(
-                            "vllm_metrics_after",
-                            "vllm-metrics-after.prom",
-                            "text/plain",
-                        )
                         _write_text_observation(
                             metrics_before_path,
                             lambda: self.target_resolver.metrics(target_spec),
@@ -185,20 +191,33 @@ class BenchmarkSuiteWorkflow:
                     json.dumps(preflight_result, indent=2, sort_keys=True) + "\n",
                     encoding="utf-8",
                 )
-                children.extend(self.run_quality(store, parent_run_id=run.run_id))
-                children.extend(self.run_load(store, parent_run_id=run.run_id))
+                try:
+                    children.extend(self.run_quality(store, parent_run_id=run.run_id))
+                    children.extend(self.run_load(store, parent_run_id=run.run_id))
+                except Exception as exc:  # noqa: BLE001 - summarize persisted children first
+                    child_failure = exc
             finally:
-                if target_spec is not None and server_after_path is not None:
+                if target_spec is not None and discovery_attempted:
                     try:
                         after_profile = self.target_resolver.snapshot_host(target_spec).profile
                     except Exception as exc:  # noqa: BLE001 - retain best-effort telemetry
                         after_profile = {"capture_error": f"{type(exc).__name__}: {exc}"}
+                    server_after_path = run.artifact(
+                        "server_after",
+                        "server-after.json",
+                        "application/json",
+                    )
                     _write_json(server_after_path, after_profile)
                 if (
                     target_spec is not None
-                    and metrics_after_path is not None
+                    and metrics_before_path is not None
                     and self._resolved_target is not None
                 ):
+                    metrics_after_path = run.artifact(
+                        "vllm_metrics_after",
+                        "vllm-metrics-after.prom",
+                        "text/plain",
+                    )
                     _write_text_observation(
                         metrics_after_path,
                         lambda: self.target_resolver.metrics(target_spec),
@@ -207,11 +226,27 @@ class BenchmarkSuiteWorkflow:
                     after_snapshot = self.system_snapshot()
                 except Exception as exc:  # noqa: BLE001 - retain the primary suite outcome
                     after_snapshot = f"capture_error: {type(exc).__name__}: {exc}"
+                after_path = run.artifact(
+                    "system_after",
+                    "system-after.txt",
+                    "text/plain",
+                )
                 after_path.write_text(after_snapshot, encoding="utf-8")
                 self._log("Memory/process snapshot after")
                 self.console.print(after_snapshot)
 
+            children = _merge_linked_children(store, run.run_id, children)
             failed_children = sum(child.status != "ok" for child in children)
+            if child_failure is not None:
+                run.complete(
+                    status="failed",
+                    metrics={
+                        "child_run_count": float(len(children)),
+                        "failed_child_count": float(failed_children),
+                    },
+                    error=f"{type(child_failure).__name__}: {child_failure}",
+                )
+                raise child_failure
             outcome = run.complete(
                 status="ok" if failed_children == 0 else "failed",
                 metrics={
@@ -521,6 +556,28 @@ def _write_text_observation(path: Path, capture: Callable[[], str]) -> None:
     except Exception as exc:  # noqa: BLE001 - telemetry must not fail a benchmark
         value = f"# capture_error: {type(exc).__name__}: {exc}\n"
     path.write_text(value, encoding="utf-8")
+
+
+def _merge_linked_children(
+    store: ResultStore,
+    parent_run_id: str,
+    returned: list[CompletedRun],
+) -> list[CompletedRun]:
+    """Return child outcomes with persisted rows as the source of truth."""
+    by_run_id = {child.run_id: child for child in returned}
+    for row in store.comparison_runs(include_failed=True, latest_per_trial=False):
+        if row["parent_run_id"] != parent_run_id:
+            continue
+        by_run_id[row["run_id"]] = CompletedRun(
+            run_id=row["run_id"],
+            benchmark_kind=row["benchmark_kind"],
+            spec_hash=row["spec_hash"],
+            status=row["status"],
+            duration_s=float(row["duration_s"]),
+            metrics=row["metrics"],
+            error=row["error"],
+        )
+    return list(by_run_id.values())
 
 
 def _target_error_summary(exc: Exception, target: TargetSpec) -> str:

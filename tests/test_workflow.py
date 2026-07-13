@@ -2,8 +2,10 @@ from pathlib import Path
 
 import pytest
 
+from llm_refinery.application.run_session import RunSession
 from llm_refinery.core.config import ConfigError
 from llm_refinery.core.http_safety import PinnedHttpRoute
+from llm_refinery.core.runs import RunSpec
 from llm_refinery.core.targets import (
     HostDiscovery,
     ModelDescriptor,
@@ -70,6 +72,22 @@ preflight:
     assert config.http_load.targets == ("local",)
 
 
+@pytest.mark.parametrize("value", [True, 1.9, "8081", None, {}])
+def test_suite_config_rejects_non_integer_forbidden_ports(value: object):
+    raw = {
+        "endpoint": {
+            "name": "local",
+            "protocol": "openai_chat",
+            "base_url": "http://127.0.0.1:8080/v1",
+            "model": "model",
+        },
+        "preflight": {"forbidden_ports": [value]},
+    }
+
+    with pytest.raises(ConfigError, match="forbidden_ports entries must be"):
+        SuiteConfig.from_mapping(raw)
+
+
 def test_local_quality_core_is_pinned_and_release_sized():
     config = load_suite_config(Path("sweeps/local-quality-core-suite.yaml"))
 
@@ -126,6 +144,68 @@ def test_suite_calls_services_directly_and_links_child_runs(tmp_path: Path):
     assert len(runs) == 1
     assert runs[0]["benchmark_kind"] == "suite"
     assert set(runs[0]["artifacts"]) == {"system_before", "system_after", "preflight"}
+
+
+@pytest.mark.parametrize("failed_step", ["quality", "http_load"])
+def test_suite_summarizes_persisted_child_before_reraising(
+    tmp_path: Path,
+    failed_step: str,
+):
+    http_config = _write_http_load_config(tmp_path)
+    config = SuiteConfig.from_mapping(
+        {
+            "name": "failed-child-suite",
+            "database": str(tmp_path / "runs.duckdb"),
+            "endpoint": {
+                "name": "local",
+                "protocol": "openai_chat",
+                "base_url": "http://127.0.0.1:8080/v1",
+                "model": "local-model",
+            },
+            "quality": {"enabled": failed_step == "quality", "tasks": "ifeval"},
+            "http_load": {
+                "enabled": failed_step == "http_load",
+                "config": str(http_config),
+                "targets": ["local"],
+            },
+            "preflight": {"enabled": False},
+        }
+    )
+
+    def failing_runner(_config, **kwargs):
+        child_spec = RunSpec.create(
+            benchmark_kind=failed_step,
+            suite=config.name,
+            label=f"{config.name}/failed-child",
+            command="fake child",
+            config_json={},
+            database=config.database,
+            parent_run_id=kwargs["parent_run_id"],
+        )
+        with RunSession(kwargs["store"], child_spec) as child:
+            child.complete(status="failed", error="persisted child failure")
+        raise RuntimeError("runner failed after persistence")
+
+    with pytest.raises(RuntimeError, match="runner failed after persistence"):
+        BenchmarkSuiteWorkflow(
+            config,
+            lm_eval_runner=failing_runner,
+            http_load_runner=failing_runner,
+            system_snapshot=lambda: "snapshot",
+        ).execute()
+
+    with ResultStore(config.database) as store:
+        runs = store.comparison_runs(include_failed=True, latest_per_trial=False)
+    parent = next(run for run in runs if run["benchmark_kind"] == "suite")
+    child = next(run for run in runs if run["parent_run_id"] == parent["run_id"])
+    assert parent["status"] == "failed"
+    assert parent["metrics"] == {
+        "child_run_count": 1.0,
+        "failed_child_count": 1.0,
+    }
+    assert "runner failed after persistence" in parent["error"]
+    assert child["status"] == "failed"
+    assert child["error"] == "persisted child failure"
 
 
 def test_legacy_suite_preserves_http_manifest_targets(tmp_path: Path):
@@ -506,6 +586,44 @@ preflight:
     assert config.target.model.selection == "single"
 
 
+def test_suite_config_expands_home_in_reusable_target_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    home = tmp_path / "home"
+    target_path = home / ".config" / "llm-refinery" / "spark.yaml"
+    target_path.parent.mkdir(parents=True)
+    target_path.write_text(
+        """
+schema_version: 1
+target:
+  name: spark
+  host:
+    access: ssh
+    destination: dgx
+  endpoint:
+    protocol: openai_chat
+    base_url: http://spark.local:8000/v1
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    config = SuiteConfig.from_mapping(
+        {
+            "schema_version": 2,
+            "target": "~/.config/llm-refinery/spark.yaml",
+            "quality": {"enabled": False},
+            "http_load": {"enabled": False},
+            "preflight": {"enabled": False},
+        },
+        source_path=tmp_path / "manifests" / "suite.yaml",
+    )
+
+    assert config.target is not None
+    assert config.target.host.destination == "dgx"
+
+
 def test_suite_config_resolves_inline_target_ca_relative_to_manifest(tmp_path: Path):
     ca_bundle = tmp_path / "private-ca.pem"
     ca_bundle.write_text("test CA", encoding="utf-8")
@@ -751,6 +869,45 @@ def test_remote_suite_persists_unavailable_discovery_and_starts_no_children(tmp_
     assert "connection refused" in run["error"]
     assert "local telemetry failed" not in run["error"]
     assert "preflight" not in run["artifacts"]
+
+
+def test_remote_suite_does_not_register_empty_artifacts_before_discovery(tmp_path: Path):
+    spec, inspection = _resolved_dgx_target()
+    resolver = _FakeTargetResolver(inspection)
+    snapshot_calls = 0
+
+    def failing_first_snapshot():
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        if snapshot_calls == 1:
+            raise RuntimeError("local snapshot failed")
+        return "after snapshot"
+
+    config = SuiteConfig.from_mapping(
+        {
+            "schema_version": 2,
+            "name": "snapshot-failure",
+            "database": str(tmp_path / "runs.duckdb"),
+            "target": _target_config_mapping(spec),
+            "quality": {"enabled": False},
+            "http_load": {"enabled": False},
+            "preflight": {"enabled": False},
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="local snapshot failed"):
+        BenchmarkSuiteWorkflow(
+            config,
+            target_resolver=resolver,
+            system_snapshot=failing_first_snapshot,
+        ).execute()
+
+    with ResultStore(config.database) as store:
+        run = store.comparison_runs(include_failed=True)[0]
+    assert resolver.calls == 0
+    assert resolver.snapshot_calls == 0
+    assert set(run["artifacts"]) == {"system_after"}
+    assert Path(run["artifacts"]["system_after"]["path"]).read_text() == "after snapshot"
 
 
 def test_remote_suite_persists_discovery_exception_before_failing(tmp_path: Path):

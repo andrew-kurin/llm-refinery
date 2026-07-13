@@ -23,6 +23,7 @@ SERVER_INFO_OFF = "off"
 SERVER_INFO_OPTIONAL = "optional"
 SERVER_INFO_REQUIRED = "required"
 SERVER_INFO_MODES = frozenset({SERVER_INFO_OFF, SERVER_INFO_OPTIONAL, SERVER_INFO_REQUIRED})
+MAX_HOST_TIMEOUT_S = 86_400.0
 
 
 def _positive_float(value: Any, *, context: str) -> float:
@@ -34,6 +35,13 @@ def _positive_float(value: Any, *, context: str) -> float:
         raise ConfigError(f"{context} must be a positive finite number") from exc
     if not math.isfinite(parsed) or parsed <= 0:
         raise ConfigError(f"{context} must be a positive finite number")
+    return parsed
+
+
+def _host_timeout(value: Any, *, context: str) -> float:
+    parsed = _positive_float(value, context=context)
+    if parsed > MAX_HOST_TIMEOUT_S:
+        raise ConfigError(f"{context} must be at most {MAX_HOST_TIMEOUT_S:g} seconds")
     return parsed
 
 
@@ -205,7 +213,7 @@ class HostAccess:
     access: str = HOST_ACCESS_LOCAL
     destination: str | None = None
     connect_timeout_s: float = 5.0
-    command_timeout_s: float = 20.0
+    command_timeout_s: float = 30.0
     required: bool = True
     expected_fingerprint: str | None = None
 
@@ -245,12 +253,12 @@ class HostAccess:
         object.__setattr__(
             self,
             "connect_timeout_s",
-            _positive_float(self.connect_timeout_s, context="host.connect_timeout_s"),
+            _host_timeout(self.connect_timeout_s, context="host.connect_timeout_s"),
         )
         object.__setattr__(
             self,
             "command_timeout_s",
-            _positive_float(self.command_timeout_s, context="host.command_timeout_s"),
+            _host_timeout(self.command_timeout_s, context="host.command_timeout_s"),
         )
 
     def safe_json(self) -> dict[str, Any]:
@@ -296,7 +304,7 @@ class HostAccess:
             access=access_value,
             destination=destination,
             connect_timeout_s=raw.get("connect_timeout_s", 5.0),
-            command_timeout_s=raw.get("command_timeout_s", 20.0),
+            command_timeout_s=raw.get("command_timeout_s", 30.0),
             required=_strict_bool(raw.get("required", True), context=f"{context}.required"),
             expected_fingerprint=expected_fingerprint,
         )
@@ -749,10 +757,15 @@ def _host_identity_binding(
     if expected_fingerprint is None:
         return None
     actual = host.profile.get("host_fingerprint") if host is not None else None
+    strength = host.profile.get("host_fingerprint_strength") if host is not None else None
+    strength_is_verifiable = host is not None and (
+        host.transport != HOST_ACCESS_SSH or strength in {"hardware", "installation"}
+    )
     return {
         "expected_fingerprint": expected_fingerprint,
         "actual_fingerprint": actual,
-        "verified": actual == expected_fingerprint,
+        "actual_strength": strength,
+        "verified": actual == expected_fingerprint and strength_is_verifiable,
     }
 
 
@@ -782,7 +795,11 @@ def load_target_spec(path: str | Path) -> tuple[Path, TargetSpec]:
     if "target" in raw:
         reject_unknown_keys(raw, {"schema_version", "target"}, context=str(config_path))
         schema_version = raw.get("schema_version", 1)
-        if isinstance(schema_version, bool) or schema_version != 1:
+        if (
+            isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+            or schema_version != 1
+        ):
             raise ConfigError(f"{config_path} schema_version must be 1, got {schema_version!r}")
         target_raw = raw["target"]
         if not isinstance(target_raw, dict):

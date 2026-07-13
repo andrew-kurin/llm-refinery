@@ -4,6 +4,7 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
+from llm_refinery.application.run_context import RunContext
 from llm_refinery.core.runs import stable_hash
 from llm_refinery.utils.system import host_identity
 
@@ -196,42 +197,8 @@ def _target_identity(
     # Historical rows did not separate executor and target; they represent local runs.
     if not target_json:
         return host_identity(executor_profile)
-
-    target_host = target_json.get("host") or {}
-    profile = _target_host_profile(target_json)
-    host_fingerprint = host_identity(profile)
-    if isinstance(target_host, dict):
-        explicit = target_host.get("host_fingerprint") or target_host.get("fingerprint")
-        if explicit and host_fingerprint == "unknown-host":
-            host_fingerprint = str(explicit)
-
-    if host_fingerprint == "unknown-host":
-        host_fingerprint = ""
-    host_fallback = {
-        key: target_host.get(key)
-        for key in ("hostname", "destination", "name")
-        if isinstance(target_host, dict) and target_host.get(key)
-    }
-    service = target_json.get("service") or {}
-    service = service if isinstance(service, dict) else {}
-    server_info = service.get("server_info")
-
-    identity_fields = {
-        "name": target_json.get("name"),
-        "host": host_fingerprint or host_fallback,
-        "service": {
-            "implementation": service.get("implementation"),
-            "base_url": service.get("base_url"),
-            "version": service.get("version"),
-            "server_info_hash": stable_hash(server_info) if server_info else None,
-        },
-        "model": target_json.get("model"),
-    }
-    if any(identity_fields.values()):
-        return f"target-{stable_hash(identity_fields)}"
-
-    label = _target_host_label(target_json)
-    return f"target-{stable_hash({'host': label})}" if label else "unknown-target"
+    identity = RunContext(target_json=target_json).target_identity_json()
+    return f"target-{stable_hash(identity)}"
 
 
 def _topology_label(target_json: dict[str, Any]) -> str:

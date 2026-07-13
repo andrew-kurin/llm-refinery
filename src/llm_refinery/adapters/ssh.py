@@ -4,10 +4,12 @@ import json
 import math
 import os
 import selectors
+import signal
 import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from importlib.resources import files
 from typing import Any
 
@@ -20,6 +22,7 @@ from llm_refinery.utils.system import get_system_profile
 
 ProcessRunner = Callable[..., subprocess.CompletedProcess[str]]
 MAX_PROBE_OUTPUT_CHARS = 2_000_000
+PROCESS_TERMINATION_GRACE_S = 0.5
 
 
 class OpenSSHClient:
@@ -128,6 +131,7 @@ def _run_bounded_process(
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        start_new_session=True,
     )
     assert process.stdin is not None
     assert process.stdout is not None
@@ -138,6 +142,7 @@ def _run_bounded_process(
     output = bytearray()
     error = bytearray()
     deadline = time.monotonic() + timeout_s
+    completed = False
     try:
         for pipe in (process.stdin, process.stdout, process.stderr):
             os.set_blocking(pipe.fileno(), False)
@@ -186,6 +191,7 @@ def _run_bounded_process(
             returncode = process.wait(timeout=remaining)
         except subprocess.TimeoutExpired as exc:
             raise subprocess.TimeoutExpired(argv, timeout_s) from exc
+        completed = True
         return subprocess.CompletedProcess(
             argv,
             returncode,
@@ -196,9 +202,33 @@ def _run_bounded_process(
         selector.close()
         for pipe in (process.stdin, process.stdout, process.stderr):
             pipe.close()
+        if not completed:
+            _terminate_process_group(process)
+
+
+def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Stop SSH and any ProxyCommand/ProxyJump helpers started in its session."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        if process.poll() is None:
+            process.terminate()
+    with suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=PROCESS_TERMINATION_GRACE_S)
+
+    # The SSH leader can exit before a helper. Kill any remaining members of
+    # the dedicated group even when wait() above has already reaped the leader.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
         if process.poll() is None:
             process.kill()
-            process.wait()
+    if process.poll() is None:
+        process.wait()
 
 
 def _encoded_size(value: str) -> int:

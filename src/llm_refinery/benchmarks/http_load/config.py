@@ -190,12 +190,19 @@ class HttpTransportConfig:
         trust_env = raw.get("trust_env", True)
         if not isinstance(trust_env, bool):
             raise ConfigError("HTTP-load transport.trust_env must be a boolean")
-        ca_bundle_raw = raw.get("ca_bundle")
-        ca_bundle = Path(str(ca_bundle_raw)) if ca_bundle_raw else None
-        if ca_bundle is not None and not ca_bundle.is_absolute():
-            ca_bundle = base_dir / ca_bundle
-        if ca_bundle is not None and not ca_bundle.is_file():
-            raise ConfigError(f"HTTP-load transport.ca_bundle is not a file: {ca_bundle}")
+        ca_bundle: Path | None = None
+        if "ca_bundle" in raw:
+            ca_bundle_raw = raw["ca_bundle"]
+            if not isinstance(ca_bundle_raw, str) or not ca_bundle_raw.strip():
+                raise ConfigError(
+                    "HTTP-load transport.ca_bundle must be a non-empty path string"
+                )
+            ca_bundle = Path(ca_bundle_raw).expanduser()
+            if not ca_bundle.is_absolute():
+                ca_bundle = base_dir / ca_bundle
+            ca_bundle = ca_bundle.resolve()
+            if not ca_bundle.is_file():
+                raise ConfigError(f"HTTP-load transport.ca_bundle is not a file: {ca_bundle}")
         return cls(trust_env=trust_env, ca_bundle=ca_bundle)
 
     def safe_json(self) -> dict[str, Any]:

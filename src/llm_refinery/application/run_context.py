@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from llm_refinery.core.runs import stable_hash
+from llm_refinery.utils.system import host_identity as system_host_identity
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,8 +54,17 @@ class RunContext:
         if not target:
             return {}
         host = target.get("host") or {}
-        profile = host.get("profile") if isinstance(host, dict) else {}
-        profile = profile if isinstance(profile, dict) else {}
+        profile: dict[str, Any] = {}
+        if isinstance(host, dict):
+            for key in ("profile", "inventory", "system_json"):
+                candidate = host.get(key)
+                if isinstance(candidate, dict):
+                    profile = candidate
+                    break
+            if not profile:
+                # Historical target rows stored inventory fields directly under
+                # host. Preserve their identity when comparing old and new runs.
+                profile = host
         service = target.get("service") or {}
         service = service if isinstance(service, dict) else {}
         route = target.get("route") or {}
@@ -62,10 +72,14 @@ class RunContext:
         logical_origin = route.get("logical_origin") or {}
         logical_origin = logical_origin if isinstance(logical_origin, dict) else {}
         server_info = service.get("server_info")
-        host_fingerprint = profile.get("host_fingerprint")
+        host_fingerprint = system_host_identity(profile)
+        if host_fingerprint == "unknown-host" and isinstance(host, dict):
+            explicit_fingerprint = host.get("host_fingerprint") or host.get("fingerprint")
+            if explicit_fingerprint:
+                host_fingerprint = str(explicit_fingerprint)
         host_identity = (
             {"fingerprint": host_fingerprint}
-            if host_fingerprint
+            if host_fingerprint != "unknown-host"
             else {
                 "hostname": profile.get("hostname"),
                 "destination": host.get("destination") if isinstance(host, dict) else None,

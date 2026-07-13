@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping
 
@@ -40,6 +41,10 @@ def build_lm_eval_command(config: LmEvalConfig, target: Endpoint) -> list[str]:
         f"base_url={base_url}",
         f"num_concurrent={config.num_concurrent}",
         f"max_retries={config.max_retries}",
+        # lm-eval 0.4.12 casts this model argument to int. Round up so a
+        # supported sub-second relay deadline never becomes its special
+        # zero/no-timeout value in the child client.
+        f"timeout={max(1, math.ceil(config.request_timeout_s))}",
         f"max_length={config.max_length}",
     ]
     if config.eos_string:

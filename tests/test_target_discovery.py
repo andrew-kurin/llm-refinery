@@ -15,6 +15,7 @@ import httpx
 import pytest
 from click.testing import CliRunner
 
+from llm_refinery.adapters import ssh as ssh_module
 from llm_refinery.adapters.ssh import MAX_PROBE_OUTPUT_CHARS, OpenSSHClient
 from llm_refinery.application.target_discovery import TargetResolver
 from llm_refinery.cli import main
@@ -141,6 +142,8 @@ def _host(*, transport: str = "ssh") -> HostDiscovery:
             "schema_version": 1,
             "hostname": "spark-host",
             "host_fingerprint": "host-example",
+            "host_fingerprint_source": "machine_id",
+            "host_fingerprint_strength": "installation",
             "hardware": {"model": "NVIDIA DGX Spark", "memory_gb": 128.0},
         },
     )
@@ -242,6 +245,29 @@ target:
     assert spec.model.model_id is None
     assert spec.safe_json()["endpoint"]["header_names"] == []
     assert spec.transport == TargetTransport()
+
+
+@pytest.mark.parametrize("schema_version", [1.0, "1", True])
+def test_target_spec_rejects_non_integer_schema_version(
+    tmp_path: Path,
+    schema_version: Any,
+):
+    config = tmp_path / "target.yaml"
+    config.write_text(
+        "schema_version: "
+        + json.dumps(schema_version)
+        + "\ntarget:\n"
+        + "  name: dgx\n"
+        + "  host:\n    access: local\n"
+        + "  endpoint:\n"
+        + "    protocol: openai_chat\n"
+        + "    base_url: http://127.0.0.1:8000/v1\n"
+        + "  model:\n    selection: single\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="schema_version must be 1"):
+        load_target_spec(config)
 
 
 def test_target_transport_resolves_ca_bundle_relative_to_target_file(tmp_path: Path):
@@ -455,6 +481,15 @@ def test_target_spec_rejects_non_finite_or_boolean_timeouts(timeout: Any):
         TargetSpec.from_mapping(raw)
 
 
+@pytest.mark.parametrize("field", ["connect_timeout_s", "command_timeout_s"])
+def test_target_spec_rejects_timeout_above_platform_safe_bound(field: str):
+    raw = _target_mapping()
+    raw["host"][field] = 1e100
+
+    with pytest.raises(ConfigError, match="must be at most 86400 seconds"):
+        TargetSpec.from_mapping(raw)
+
+
 def test_target_spec_rejects_falsey_non_mapping_headers():
     raw = _target_mapping()
     raw["endpoint"]["headers"] = []
@@ -560,6 +595,42 @@ while remaining:
         OpenSSHClient(ssh_executable=str(fake_ssh)).collect_host_profile(access)
 
 
+def test_ssh_adapter_starts_and_terminates_a_dedicated_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fake_ssh = tmp_path / "fake-ssh"
+    fake_ssh.write_text(
+        f"#!{sys.executable}\nimport time\ntime.sleep(60)\n",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+    real_popen = ssh_module.subprocess.Popen
+    real_killpg = ssh_module.os.killpg
+    popen_kwargs: dict[str, Any] = {}
+    signals: list[int] = []
+
+    def recording_popen(*args: Any, **kwargs: Any):
+        popen_kwargs.update(kwargs)
+        return real_popen(*args, **kwargs)
+
+    def recording_killpg(process_group: int, sent_signal: int):
+        signals.append(sent_signal)
+        return real_killpg(process_group, sent_signal)
+
+    monkeypatch.setattr(ssh_module.subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(ssh_module.os, "killpg", recording_killpg)
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        OpenSSHClient(ssh_executable=str(fake_ssh)).collect_host_profile(
+            HostAccess(access="ssh", destination="dgx", command_timeout_s=0.1)
+        )
+
+    assert popen_kwargs["start_new_session"] is True
+    assert ssh_module.signal.SIGTERM in signals
+    assert ssh_module.signal.SIGKILL in signals
+
+
 def test_ssh_adapter_local_inventory_does_not_execute_probe(monkeypatch: pytest.MonkeyPatch):
     def runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         raise AssertionError("local inventory must not execute the SSH probe")
@@ -576,8 +647,9 @@ def test_ssh_adapter_local_inventory_does_not_execute_probe(monkeypatch: pytest.
 
 
 def test_remote_probe_normalizes_dgx_spark_unified_memory(monkeypatch: pytest.MonkeyPatch):
+    machine_id = "0123456789abcdef0123456789abcdef"
     files = {
-        "/etc/machine-id": "raw-machine-id",
+        "/etc/machine-id": machine_id,
         "/proc/cpuinfo": "processor: 0\nmodel name: NVIDIA Grace\n",
         "/proc/meminfo": "MemTotal: 134217728 kB\nMemAvailable: 120000000 kB\n",
         "/etc/os-release": 'NAME="DGX OS"\nVERSION_ID="24.04"\n',
@@ -612,7 +684,42 @@ def test_remote_probe_normalizes_dgx_spark_unified_memory(monkeypatch: pytest.Mo
     assert profile["linux"]["proc"]["meminfo"]["memavailable_kb"] == 120000000
     assert profile["dgx"]["is_spark"] is True
     assert profile["dgx"]["unified_memory"] is True
-    assert "raw-machine-id" not in json.dumps(profile)
+    assert profile["host_fingerprint_source"] == "machine_id"
+    assert profile["host_fingerprint_strength"] == "installation"
+    assert machine_id not in json.dumps(profile)
+
+
+def test_remote_probe_prefers_hashed_hardware_uuid_and_never_records_raw_id(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    hardware_uuid = "12345678-1234-5678-9abc-def012345678"
+    machine_id = "0123456789abcdef0123456789abcdef"
+    files = {
+        linux_dgx_probe.HARDWARE_UUID_PATHS[0]: hardware_uuid,
+        "/etc/machine-id": machine_id,
+    }
+    monkeypatch.setattr(
+        linux_dgx_probe,
+        "_read_text",
+        lambda path, limit=100_000: files.get(path),
+    )
+    monkeypatch.setattr(linux_dgx_probe, "_nvidia_profile", lambda: None)
+
+    profile = linux_dgx_probe.collect()
+
+    assert profile["host_fingerprint"].startswith("host-")
+    assert profile["host_fingerprint_source"] == "dmi_product_uuid"
+    assert profile["host_fingerprint_strength"] == "hardware"
+    serialized = json.dumps(profile)
+    assert hardware_uuid not in serialized
+    assert machine_id not in serialized
+
+
+def test_remote_probe_source_is_compatible_with_python_3_10():
+    source = ssh_module.linux_dgx_probe_source()
+
+    assert "from datetime import UTC" not in source
+    assert "datetime.now(timezone.utc)" in source
 
 
 def test_remote_probe_keeps_gpu_identity_when_memory_queries_are_unsupported(
@@ -708,8 +815,26 @@ def test_resolver_verifies_pinned_host_fingerprint_independent_of_ssh_alias():
     assert inspection.safe_json()["host_identity_binding"] == {
         "expected_fingerprint": "host-example",
         "actual_fingerprint": "host-example",
+        "actual_strength": "installation",
         "verified": True,
     }
+
+
+def test_resolver_rejects_weak_hostname_fingerprint_as_identity_pin():
+    raw = _target_mapping()
+    raw["host"]["expected_fingerprint"] = "host-example"
+    profile = dict(_host().profile)
+    profile["host_fingerprint_source"] = "hostname"
+    profile["host_fingerprint_strength"] = "weak"
+    resolver = TargetResolver(
+        ssh_client=_FakeSSH(
+            HostDiscovery(transport="ssh", destination="dgx", profile=profile)
+        ),  # type: ignore[arg-type]
+        service_client=_FakeService(_service("served-model")),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(RuntimeError, match="not strong enough"):
+        resolver.inspect(TargetSpec.from_mapping(raw))
 
 
 @pytest.mark.parametrize("actual", ["host-other", None])

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -17,6 +19,8 @@ class LmEvalConfig:
     tasks: str = "ifeval,gsm8k"
     num_concurrent: int = 1
     max_retries: int = 3
+    request_timeout_s: float = 300.0
+    process_timeout_s: float = 86400.0
     max_length: int = 16384
     eos_string: str | None = None
     tokenizer: str | None = None
@@ -47,6 +51,21 @@ class LmEvalConfig:
             raise ConfigError("lm-eval num_concurrent must be positive")
         if self.max_retries < 0:
             raise ConfigError("lm-eval max_retries cannot be negative")
+        for name, value in (
+            ("request_timeout_s", self.request_timeout_s),
+            ("process_timeout_s", self.process_timeout_s),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+                or value > threading.TIMEOUT_MAX
+            ):
+                raise ConfigError(
+                    f"lm-eval {name} must be positive and no greater than "
+                    f"{threading.TIMEOUT_MAX:g} seconds"
+                )
         if self.max_length <= 0:
             raise ConfigError("lm-eval max_length must be positive")
         if not isinstance(self.trust_env, bool):

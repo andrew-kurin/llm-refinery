@@ -116,6 +116,51 @@ def test_http_transport_config_rejects_string_boolean():
         )
 
 
+@pytest.mark.parametrize("value", [None, False, 0, ""])
+def test_http_transport_config_rejects_invalid_ca_bundle(value):
+    with pytest.raises(ConfigError, match="ca_bundle must be a non-empty path string"):
+        HttpLoadConfig.from_mapping(
+            {
+                "transport": {"ca_bundle": value},
+                "targets": [
+                    {
+                        "name": "local",
+                        "protocol": "openai_chat",
+                        "base_url": "http://127.0.0.1:8080/v1",
+                        "model": "local",
+                    }
+                ],
+                "scenarios": [{"name": "chat", "prompt": "hello"}],
+            }
+        )
+
+
+def test_http_transport_config_expands_home_in_ca_bundle(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    ca_bundle = home / ".config" / "private-ca.pem"
+    ca_bundle.parent.mkdir(parents=True)
+    ca_bundle.write_text("test certificate bundle", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+
+    config = HttpLoadConfig.from_mapping(
+        {
+            "transport": {"ca_bundle": "~/.config/private-ca.pem"},
+            "targets": [
+                {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "model": "local",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello"}],
+        },
+        source_path=tmp_path / "manifests" / "http-load.yaml",
+    )
+
+    assert config.transport.ca_bundle == ca_bundle.resolve()
+
+
 def test_http_client_applies_transport_proxy_and_ca_settings(tmp_path, monkeypatch):
     ca_bundle = tmp_path / "private-ca.pem"
     ca_bundle.write_text("test certificate bundle", encoding="utf-8")

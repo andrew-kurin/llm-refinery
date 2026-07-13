@@ -248,6 +248,7 @@ def _new_http_client(
     client_trust_env = pinned_route_trust_env(
         trial.target.base_url,
         trust_env=trial.transport.trust_env,
+        route_is_pinned=route is not None,
     )
     verify: bool | ssl.SSLContext = True
     if trial.transport.ca_bundle is not None:

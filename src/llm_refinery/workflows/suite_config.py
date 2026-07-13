@@ -263,7 +263,12 @@ class PreflightStep:
             context="suite preflight step",
         )
         forbidden_ports = tuple(
-            int(value) for value in coerce_list(raw.get("forbidden_ports", [8081, 8082, 8083]))
+            _strict_integer(
+                value,
+                context="suite preflight.forbidden_ports entries",
+                minimum=1,
+            )
+            for value in coerce_list(raw.get("forbidden_ports", [8081, 8082, 8083]))
         )
         if any(port <= 0 or port > 65535 for port in forbidden_ports):
             raise ConfigError("suite preflight.forbidden_ports must be valid TCP ports")
@@ -343,9 +348,10 @@ class SuiteConfig:
                     base_dir=source_path.parent if source_path else Path.cwd(),
                 )
             elif isinstance(target_value, str):
-                target_path = Path(target_value)
+                target_path = Path(target_value).expanduser()
                 if source_path is not None and not target_path.is_absolute():
                     target_path = source_path.parent / target_path
+                target_path = target_path.resolve()
                 _resolved_path, target = load_target_spec(target_path)
             else:
                 raise ConfigError("suite target must be a mapping or target YAML path")

@@ -17,6 +17,20 @@ from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
 @click.option("--tasks", default="ifeval,gsm8k", show_default=True, help="Comma-separated tasks.")
 @click.option("--num-concurrent", type=int, default=1, show_default=True)
 @click.option("--max-retries", type=int, default=3, show_default=True)
+@click.option(
+    "--request-timeout-s",
+    type=float,
+    default=300.0,
+    show_default=True,
+    help="Absolute timeout for each request to the model server.",
+)
+@click.option(
+    "--process-timeout-s",
+    type=float,
+    default=86400.0,
+    show_default=True,
+    help="Absolute timeout for one lm-eval target process.",
+)
 @click.option("--max-length", type=int, default=16384, show_default=True)
 @click.option(
     "--eos-string",
@@ -112,6 +126,8 @@ def lm_eval_command(
     tasks: str,
     num_concurrent: int,
     max_retries: int,
+    request_timeout_s: float,
+    process_timeout_s: float,
     max_length: int,
     eos_string: str | None,
     tokenizer: str | None,
@@ -172,6 +188,8 @@ def lm_eval_command(
             tasks=tasks,
             num_concurrent=num_concurrent,
             max_retries=max_retries,
+            request_timeout_s=request_timeout_s,
+            process_timeout_s=process_timeout_s,
             max_length=max_length,
             eos_string=eos_string,
             tokenizer=tokenizer,

@@ -171,14 +171,24 @@ class TargetResolver:
         else:
             host = self._ssh_client.collect_host_profile(spec.host)
         expected_fingerprint = spec.host.expected_fingerprint
-        if (
-            expected_fingerprint is not None
-            and host.profile.get("host_fingerprint") != expected_fingerprint
+        if expected_fingerprint is not None and (
+            host.profile.get("host_fingerprint") != expected_fingerprint
         ):
             raise RuntimeError(
                 "target host inventory fingerprint does not match "
                 f"host.expected_fingerprint ({host.profile.get('host_fingerprint')!r} != "
                 f"{expected_fingerprint!r})"
+            )
+        if (
+            expected_fingerprint is not None
+            and spec.host.access == HOST_ACCESS_SSH
+            and host.profile.get("host_fingerprint_strength")
+            not in {"hardware", "installation"}
+        ):
+            raise RuntimeError(
+                "target host inventory fingerprint is not strong enough for "
+                "host.expected_fingerprint verification "
+                f"(strength={host.profile.get('host_fingerprint_strength')!r})"
             )
         return host
 

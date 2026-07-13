@@ -89,6 +89,7 @@ class OpenAIDiscoveryClient:
         client_trust_env = pinned_route_trust_env(
             endpoint.base_url,
             trust_env=effective_transport.trust_env,
+            route_is_pinned=route is not None,
         )
         client = self._new_client(
             effective_transport,
@@ -195,6 +196,7 @@ class OpenAIDiscoveryClient:
         client_trust_env = pinned_route_trust_env(
             endpoint.base_url,
             trust_env=effective_transport.trust_env,
+            route_is_pinned=route is not None,
         )
         client = self._new_client(
             effective_transport,

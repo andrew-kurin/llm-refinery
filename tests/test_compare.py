@@ -223,6 +223,83 @@ def test_compare_keeps_parent_runs_with_different_discovered_models():
     assert {row["run_id"] for row in rows} == {"model-a", "model-b"}
 
 
+def test_compare_keeps_same_target_routed_to_distinct_addresses():
+    shared = {
+        "trial_name": "suite",
+        "status": "ok",
+        "duration_s": 1.0,
+        "spec_hash": "declarative-suite-spec",
+        "config_json": {"params": {}},
+        "system_json": {"host_fingerprint": "mac"},
+        "metrics": {"score": 1.0},
+    }
+
+    def target(selected_address: str):
+        return {
+            "schema_version": 1,
+            "name": "spark",
+            "host": {"profile": {"hostname": "spark"}},
+            "service": {
+                "implementation": "vllm",
+                "base_url": "http://spark.local:8000/v1",
+                "version": "0.10.0",
+            },
+            "route": {
+                "logical_origin": {
+                    "scheme": "http",
+                    "hostname": "spark.local",
+                    "port": 8000,
+                },
+                "selected_address": selected_address,
+                "authority": "spark.local:8000",
+            },
+            "model": {"id": "served"},
+        }
+
+    rows = build_compare_rows(
+        [
+            {**shared, "run_id": "route-a", "target_json": target("192.168.1.41")},
+            {**shared, "run_id": "route-b", "target_json": target("192.168.1.42")},
+        ],
+        metrics=("score",),
+        limit=10,
+    )
+
+    assert {row["run_id"] for row in rows} == {"route-a", "route-b"}
+
+
+def test_compare_keeps_historical_inventory_fingerprints_distinct():
+    shared = {
+        "trial_name": "suite",
+        "status": "ok",
+        "duration_s": 1.0,
+        "spec_hash": "declarative-suite-spec",
+        "config_json": {"params": {}},
+        "system_json": {"host_fingerprint": "mac"},
+        "metrics": {"score": 1.0},
+    }
+
+    def target(host_fingerprint: str):
+        return {
+            "schema_version": 1,
+            "name": "spark",
+            "host": {"inventory": {"host_fingerprint": host_fingerprint}},
+            "service": {"base_url": "http://spark.local:8000/v1"},
+            "model": {"id": "served"},
+        }
+
+    rows = build_compare_rows(
+        [
+            {**shared, "run_id": "host-a", "target_json": target("host-a")},
+            {**shared, "run_id": "host-b", "target_json": target("host-b")},
+        ],
+        metrics=("score",),
+        limit=10,
+    )
+
+    assert {row["run_id"] for row in rows} == {"host-a", "host-b"}
+
+
 def test_compare_supports_target_and_executor_dotted_params():
     rows = build_compare_rows(
         [

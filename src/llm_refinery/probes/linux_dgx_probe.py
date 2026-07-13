@@ -16,11 +16,12 @@ import shutil
 import socket
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 SCHEMA_VERSION = 1
 MAX_SMALL_FILE_BYTES = 100_000
 MACHINE_ID_PATHS = ("/etc/machine-id", "/var/lib/dbus/machine-id")
+HARDWARE_UUID_PATHS = ("/sys/devices/virtual/dmi/id/product_uuid",)
 DMI_PATHS = {
     "sys_vendor": "/sys/devices/virtual/dmi/id/sys_vendor",
     "product_name": "/sys/devices/virtual/dmi/id/product_name",
@@ -214,14 +215,53 @@ def _add_optional_gpu_fields(executable, gpus):
             by_index[row[0].strip()][output_key] = value
 
 
+def _usable_hardware_uuid(value):
+    if not value:
+        return None
+    normalized = value.strip().lower()
+    compact = normalized.replace("-", "")
+    if (
+        len(compact) < 16
+        or re.fullmatch(r"[0-9a-f]+", compact) is None
+        or set(compact) in ({"0"}, {"f"})
+        or normalized in {"none", "unknown", "not specified"}
+    ):
+        return None
+    return normalized
+
+
+def _usable_machine_id(value):
+    if not value:
+        return None
+    normalized = value.strip().lower()
+    if re.fullmatch(r"[0-9a-f]{32}", normalized) is None or set(normalized) in (
+        {"0"},
+        {"f"},
+    ):
+        return None
+    return normalized
+
+
 def _machine_fingerprint(system_name, hostname):
+    hardware_uuid = None
+    for path in HARDWARE_UUID_PATHS:
+        hardware_uuid = _usable_hardware_uuid(_read_text(path, 1024))
+        if hardware_uuid:
+            break
     machine_id = None
     for path in MACHINE_ID_PATHS:
-        machine_id = _read_text(path, 1024)
+        machine_id = _usable_machine_id(_read_text(path, 1024))
         if machine_id:
             break
-    if machine_id:
+    if hardware_uuid:
+        identity = {"version": 2, "system": system_name, "hardware_uuid": hardware_uuid}
+        source = "dmi_product_uuid"
+        strength = "hardware"
+    elif machine_id:
+        # Keep the original machine-id hash stable for already pinned targets.
         identity = {"version": 1, "system": system_name, "machine_id": machine_id}
+        source = "machine_id"
+        strength = "installation"
     else:
         identity = {
             "version": 1,
@@ -229,8 +269,14 @@ def _machine_fingerprint(system_name, hostname):
             "hostname": hostname,
             "machine": platform.machine(),
         }
+        source = "hostname"
+        strength = "weak"
     payload = json.dumps(identity, sort_keys=True, separators=(",", ":"))
-    return "host-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    return (
+        "host-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16],
+        source,
+        strength,
+    )
 
 
 def _dgx_profile(dmi, device_tree_model, releases, nvidia):
@@ -285,6 +331,10 @@ def collect():
     mem_total_kb = meminfo.get("memtotal_kb")
     memory_bytes = mem_total_kb * 1024 if mem_total_kb is not None else None
     cpu = _cpu_profile(cpu_text)
+    host_fingerprint, fingerprint_source, fingerprint_strength = _machine_fingerprint(
+        system_name,
+        hostname,
+    )
     hardware = _drop_none(
         {
             "model": dmi.get("product_name") or device_tree_model,
@@ -300,9 +350,12 @@ def collect():
     )
     profile = {
         "schema_version": SCHEMA_VERSION,
-        "captured_at": datetime.now(UTC).isoformat(),
+        # Keep this probe executable by the remote host's Python 3.10 runtime.
+        "captured_at": datetime.now(timezone.utc).isoformat(),  # noqa: UP017
         "hostname": hostname,
-        "host_fingerprint": _machine_fingerprint(system_name, hostname),
+        "host_fingerprint": host_fingerprint,
+        "host_fingerprint_source": fingerprint_source,
+        "host_fingerprint_strength": fingerprint_strength,
         "platform": {
             "system": system_name,
             "release": platform.release(),

@@ -129,6 +129,16 @@ preflight:
     assert run["metrics"]["child_run_count"] == 0.0
 
 
+def test_suite_command_rejects_zero_max_length(tmp_path):
+    manifest = tmp_path / "suite.yaml"
+    manifest.write_text("name: unused\n", encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["suite", str(manifest), "--max-length", "0"])
+
+    assert result.exit_code == 2
+    assert "0 is not in the range x>=1" in result.output
+
+
 def test_suite_discovery_overrides_keep_ssh_and_http_planes_separate(
     tmp_path,
     monkeypatch,

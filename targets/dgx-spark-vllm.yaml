@@ -9,10 +9,12 @@ target:
     access: ssh
     destination: dgx
     connect_timeout_s: 5
-    command_timeout_s: 20
+    # Includes connection establishment and the complete inventory probe.
+    command_timeout_s: 30
     required: true
-    # After a trusted first inspection, pin host.profile.host_fingerprint here.
-    # This remains valid when --ssh-destination selects a different SSH alias.
+    # After a trusted first inspection, pin host.profile.host_fingerprint only
+    # when host_fingerprint_strength is "hardware" or "installation". This
+    # remains valid when --ssh-destination selects a different SSH alias.
     # expected_fingerprint: host-0123456789abcdef
 
   # This is the data-plane address used by the benchmark client. It need not
