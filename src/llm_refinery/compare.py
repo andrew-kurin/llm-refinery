@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from urllib.parse import urlparse
 
+from llm_refinery.application.run_context import RunContext
+from llm_refinery.core.runs import stable_hash
 from llm_refinery.utils.system import host_identity
 
 DEFAULT_METRICS = ("pp_tps", "tg_tps")
@@ -47,6 +50,9 @@ def build_compare_table_rows(rows: list[dict[str, Any]]) -> list[tuple[object, .
         *metric_keys,
         "model",
         "host",
+        "executor_host",
+        "target_host",
+        "topology",
         *ALWAYS_PARAMS,
         *param_keys,
         "duration_s",
@@ -62,6 +68,9 @@ def build_compare_table_rows(rows: list[dict[str, Any]]) -> list[tuple[object, .
                     *[_format_metric(row.get(key)) for key in metric_keys],
                     row.get("model", ""),
                     row.get("host", ""),
+                    row.get("executor_host", ""),
+                    row.get("target_host", ""),
+                    row.get("topology", ""),
                     *[row.get(key, "") for key in ALWAYS_PARAMS],
                     *[row.get(key, "") for key in param_keys],
                     f"{row['duration_s']:.1f}",
@@ -92,8 +101,17 @@ def _build_compare_row(
     trial_params = config.get("params") or {}
     metrics = run.get("metrics") or {}
     system_profile = run.get("system_json") or {}
+    target_profile = run.get("target_json") or {}
     prompt_tokens = config.get("prompt_tokens")
     gen_tokens = config.get("gen_tokens")
+    executor_host = _host_label(system_profile)
+    target_host = _target_host_label(target_profile)
+    if not target_host:
+        # Historical rows without target metadata represent local execution. A
+        # non-empty target payload, however, represents a distinct target even
+        # when discovery failed before its host could be inventoried.
+        target_host = "unknown" if target_profile else executor_host
+    topology = _topology_label(target_profile)
 
     row: dict[str, Any] = {
         "run_id": run["run_id"],
@@ -101,11 +119,17 @@ def _build_compare_row(
         "trial_name": run["trial_name"],
         "status": run["status"],
         "duration_s": run["duration_s"],
-        "model": _model_name(config.get("model")),
-        "host": _host_label(system_profile),
+        "model": _model_name(config.get("model")) or _target_model_name(target_profile),
+        # ``host`` is the measured target when known and the executor for legacy/local runs.
+        "host": target_host,
+        "executor_host": executor_host,
+        "target_host": target_host,
+        "topology": topology,
         "prompt_tokens": prompt_tokens if prompt_tokens is not None else "",
         "gen_tokens": gen_tokens if gen_tokens is not None else "",
-        "_host_identity": host_identity(system_profile),
+        "_executor_identity": host_identity(system_profile),
+        "_target_identity": _target_identity(target_profile, executor_profile=system_profile),
+        "_topology_identity": _topology_identity(target_profile),
         "_metric_keys": metric_keys,
         "_param_keys": param_keys,
     }
@@ -113,6 +137,10 @@ def _build_compare_row(
     for key in param_keys:
         if key.startswith("system."):
             row[key] = _lookup_dotted(run.get("system_json") or {}, key.removeprefix("system."))
+        elif key.startswith("executor."):
+            row[key] = _lookup_dotted(run.get("system_json") or {}, key.removeprefix("executor."))
+        elif key.startswith("target."):
+            row[key] = _lookup_dotted(run.get("target_json") or {}, key.removeprefix("target."))
         else:
             row[key] = trial_params.get(key, config.get(key, ""))
     for key in metric_keys:
@@ -133,6 +161,88 @@ def _host_label(system_profile: dict[str, Any]) -> str:
 
     identity = host_identity(system_profile)
     return "" if identity == "unknown-host" else identity
+
+
+def _target_host_label(target_json: dict[str, Any]) -> str:
+    profile = _target_host_profile(target_json)
+    label = _host_label(profile)
+    if label:
+        return label
+
+    host = target_json.get("host") or {}
+    if isinstance(host, dict):
+        for key in ("hostname", "destination", "name"):
+            if host.get(key):
+                return str(host[key])
+
+    service = target_json.get("service") or {}
+    if isinstance(service, dict) and service.get("base_url"):
+        hostname = urlparse(str(service["base_url"])).hostname
+        if hostname:
+            return hostname
+
+    requested = target_json.get("requested_target") or {}
+    if isinstance(requested, dict):
+        requested_host = requested.get("host") or {}
+        if isinstance(requested_host, dict):
+            for key in ("hostname", "destination", "name"):
+                if requested_host.get(key):
+                    return str(requested_host[key])
+        requested_endpoint = requested.get("endpoint") or {}
+        if isinstance(requested_endpoint, dict) and requested_endpoint.get("base_url"):
+            hostname = urlparse(str(requested_endpoint["base_url"])).hostname
+            if hostname:
+                return hostname
+        if requested.get("name"):
+            return str(requested["name"])
+
+    if target_json.get("name"):
+        return str(target_json["name"])
+    return ""
+
+
+def _target_host_profile(target_json: dict[str, Any]) -> dict[str, Any]:
+    host = target_json.get("host") or {}
+    if not isinstance(host, dict):
+        return {}
+    for key in ("profile", "inventory", "system_json"):
+        profile = host.get(key)
+        if isinstance(profile, dict):
+            return profile
+    return host
+
+
+def _target_identity(target_json: dict[str, Any], *, executor_profile: dict[str, Any]) -> str:
+    # Historical rows did not separate executor and target; they represent local runs.
+    if not target_json:
+        return host_identity(executor_profile)
+    identity = RunContext(target_json=target_json).target_identity_json()
+    return f"target-{stable_hash(identity)}"
+
+
+def _topology_label(target_json: dict[str, Any]) -> str:
+    topology = target_json.get("topology")
+    if isinstance(topology, str):
+        return topology
+    if isinstance(topology, dict):
+        for key in ("measurement_scope", "mode", "name"):
+            if topology.get(key):
+                return str(topology[key])
+    return "local" if not target_json else "unspecified"
+
+
+def _topology_identity(target_json: dict[str, Any]) -> str:
+    topology = target_json.get("topology")
+    if topology in (None, {}, ""):
+        return "legacy-local" if not target_json else "unspecified"
+    return f"topology-{stable_hash(topology)}"
+
+
+def _target_model_name(target_json: dict[str, Any]) -> str:
+    model = target_json.get("model") or {}
+    if not isinstance(model, dict):
+        return ""
+    return str(model.get("requested_id") or model.get("id") or model.get("root") or "")
 
 
 def _model_name(value: object) -> str:
@@ -159,10 +269,18 @@ def _dedupe_latest_configs(
     deduped: list[dict[str, Any]] = []
     for row in rows:
         signature = (
-            ("spec_hash", row["spec_hash"], row["_host_identity"])
+            (
+                "spec_hash",
+                row["spec_hash"],
+                row["_executor_identity"],
+                row["_target_identity"],
+                row["_topology_identity"],
+            )
             if row.get("spec_hash")
             else (
-                row["_host_identity"],
+                row["_executor_identity"],
+                row["_target_identity"],
+                row["_topology_identity"],
                 *tuple(row.get(key, "") for key in (*IDENTITY_COLUMNS, *param_keys)),
             )
         )

@@ -2,6 +2,11 @@ name: local-http-load-recommended
 
 database: results/llm_refinery.duckdb
 
+# Keep timing traffic direct and independent of the shell's proxy environment.
+# For a proxy or SSL_CERT_FILE/SSL_CERT_DIR, set trust_env: true instead.
+transport:
+  trust_env: false
+
 # Point this target at the OpenAI-compatible server under test. Run the same manifest unchanged
 # on each host. Every cell has enough observations for meaningful P95/P99 inspection; repeat a
 # full run at least three times when comparing close configurations.

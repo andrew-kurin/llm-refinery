@@ -1,0 +1,43 @@
+schema_version: 1
+
+target:
+  name: dgx-spark
+
+  # OpenSSH resolves this using ~/.ssh/config. Override it with
+  # --ssh-destination when another user calls the machine something else.
+  host:
+    access: ssh
+    destination: dgx
+    connect_timeout_s: 5
+    # Includes connection establishment and the complete inventory probe.
+    command_timeout_s: 30
+    required: true
+    # After a trusted first inspection, pin host.profile.host_fingerprint only
+    # when host_fingerprint_strength is "hardware" or "installation". This
+    # remains valid when --ssh-destination selects a different SSH alias.
+    # expected_fingerprint: host-0123456789abcdef
+
+  # This is the data-plane address used by the benchmark client. It need not
+  # match the SSH alias above.
+  endpoint:
+    name: dgx-spark-vllm
+    protocol: openai_chat
+    base_url: http://aitopatom-41de.local:8000/v1
+    # api_key_env: VLLM_API_KEY
+
+  model:
+    # Select automatically only when /v1/models returns exactly one model.
+    selection: single
+
+  # Discovery and metrics use the same HTTP environment/TLS policy. Disable
+  # proxy environment variables for a direct LAN connection. IP-pinned remote
+  # target routes reject active environment proxying.
+  transport:
+    trust_env: false
+    # Relative paths are resolved from this target file's directory.
+    # ca_bundle: certs/dgx-spark-ca.pem
+
+  discovery:
+    service_required: true
+    server_info: optional
+    metrics: true

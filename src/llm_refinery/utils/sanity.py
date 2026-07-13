@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
 
 from llm_refinery.core.endpoints import Endpoint
+from llm_refinery.core.http_safety import PinnedHttpRoute
 from llm_refinery.providers.openai_chat import OpenAICompatibleChatClient
 
 REASONING_TAG_RE = re.compile(r"</?(?:think|thinking)\b", re.IGNORECASE)
@@ -14,9 +16,16 @@ def run_api_sanity_check(
     timeout: int = 180,
     *,
     client: OpenAICompatibleChatClient | None = None,
+    trust_env: bool = True,
+    ca_bundle: Path | None = None,
+    route: PinnedHttpRoute | None = None,
 ) -> dict[str, Any]:
     """Perform a basic OpenAI-compatible chat-completions sanity check."""
-    chat_client = client or OpenAICompatibleChatClient()
+    chat_client = client or OpenAICompatibleChatClient(
+        trust_env=trust_env,
+        ca_bundle=ca_bundle,
+        route=route,
+    )
     try:
         response = chat_client.complete(
             endpoint,

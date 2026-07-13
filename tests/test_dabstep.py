@@ -313,7 +313,9 @@ dabstep:
     assert "split: dev" in Path(run["artifacts"]["upstream_configs"]["path"]).read_text()
 
 
-def test_dabstep_resume_keeps_the_run_id_and_only_runs_missing_tasks(tmp_path: Path) -> None:
+def test_dabstep_resume_keeps_the_run_id_and_only_runs_missing_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     tasks_path = tmp_path / "dev.jsonl"
     _write_tasks(tasks_path)
     workspace = tmp_path / "upstream"
@@ -378,6 +380,22 @@ dabstep:
         encoding="utf-8",
     )
 
+    profile_captures = 0
+
+    def capture_executor_profile():
+        nonlocal profile_captures
+        profile_captures += 1
+        return {
+            "hostname": "test-mac",
+            "host_fingerprint": "test-mac-id",
+            "captured_at": f"capture-{profile_captures}",
+        }
+
+    monkeypatch.setattr(
+        "llm_refinery.application.run_session.get_system_profile",
+        capture_executor_profile,
+    )
+
     first = CliRunner().invoke(main, ["dabstep", str(config)])
     assert first.exit_code == 0, first.output
     with ResultStore(database) as store:
@@ -397,6 +415,8 @@ dabstep:
     assert runs[0]["status"] == "ok"
     assert runs[0]["metrics"]["answer_count"] == 2.0
     assert runs[0]["metrics"]["success_rate"] == 0.5
+    assert runs[0]["system_json"]["captured_at"] == "capture-1"
+    assert profile_captures == 2
     assert all(sample["status"] == "ok" for sample in samples)
     calls = [json.loads(line) for line in (workspace / "calls.jsonl").read_text().splitlines()]
     assert calls == [[5, 49], [49]]

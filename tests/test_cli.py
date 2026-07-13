@@ -71,6 +71,15 @@ def test_lm_eval_command_accepts_arbitrary_openai_compatible_target():
     assert "https://example.test/v1" in result.output
 
 
+def test_lm_eval_help_does_not_restrict_trust_env_concurrency():
+    result = CliRunner().invoke(main, ["lm-eval", "--help"])
+
+    assert result.exit_code == 0
+    assert "Honor CA variables and retain proxy" in result.output
+    assert "must be direct or covered" in result.output
+    assert "supported only with --num-concurrent 1" not in result.output
+
+
 def test_lm_eval_command_dry_run_supports_include_path_and_suite_db(tmp_path):
     include_path = tmp_path / "tasks"
     include_path.mkdir()
@@ -127,6 +136,124 @@ preflight:
         run = store.comparison_runs()[0]
     assert run["benchmark_kind"] == "suite"
     assert run["metrics"]["child_run_count"] == 0.0
+
+
+def test_suite_command_rejects_zero_max_length(tmp_path):
+    manifest = tmp_path / "suite.yaml"
+    manifest.write_text("name: unused\n", encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["suite", str(manifest), "--max-length", "0"])
+
+    assert result.exit_code == 2
+    assert "0 is not in the range x>=1" in result.output
+
+
+def test_suite_discovery_overrides_keep_ssh_and_http_planes_separate(
+    tmp_path,
+    monkeypatch,
+):
+    manifest = tmp_path / "suite.yaml"
+    manifest.write_text(
+        f"""
+schema_version: 2
+name: spark-suite
+database: {tmp_path / "runs.duckdb"}
+target:
+  name: spark
+  host:
+    access: ssh
+    destination: dgx
+  endpoint:
+    protocol: openai_chat
+    base_url: http://old-spark.local:8000/v1
+  model:
+    selection: single
+quality:
+  enabled: false
+http_load:
+  enabled: false
+preflight:
+  enabled: false
+""",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    class FakeWorkflow:
+        def __init__(self, config):
+            captured["config"] = config
+
+        def execute(self):
+            return None
+
+    monkeypatch.setattr("llm_refinery.commands.suite.BenchmarkSuiteWorkflow", FakeWorkflow)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "suite",
+            str(manifest),
+            "--ssh-destination",
+            "another-spark",
+            "--base-url",
+            "http://new-spark.local:9000",
+            "--api-model",
+            "chosen-model",
+            "--target",
+            "scenario-target",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = captured["config"]
+    assert config.target.host.destination == "another-spark"
+    assert config.target.endpoint.base_url == "http://new-spark.local:9000/v1"
+    assert config.target.endpoint.model == "chosen-model"
+    assert config.target.model.selection == "explicit"
+    assert config.target.model.model_id == "chosen-model"
+    assert config.http_load.targets == ("scenario-target",)
+
+
+def test_suite_quality_backend_and_tokenizer_cli_overrides(tmp_path, monkeypatch):
+    manifest = tmp_path / "suite.yaml"
+    manifest.write_text(
+        """
+name: completions-suite
+quality:
+  enabled: false
+http_load:
+  enabled: false
+preflight:
+  enabled: false
+""",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    class FakeWorkflow:
+        def __init__(self, config):
+            captured["config"] = config
+
+        def execute(self):
+            return None
+
+    monkeypatch.setattr("llm_refinery.commands.suite.BenchmarkSuiteWorkflow", FakeWorkflow)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "suite",
+            str(manifest),
+            "--model-backend",
+            "local-completions",
+            "--tokenizer",
+            "org/model-tokenizer",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"].quality.model_backend == "local-completions"
+    assert captured["config"].quality.tokenizer == "org/model-tokenizer"
 
 
 def test_compare_command_shows_params_and_sorts_by_generation_tps(tmp_path):

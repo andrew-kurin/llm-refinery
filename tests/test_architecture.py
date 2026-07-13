@@ -9,6 +9,7 @@ def test_dependency_boundaries_do_not_point_toward_cli_or_workflows():
     violations: list[str] = []
     forbidden_by_layer = {
         "core": (
+            "llm_refinery.adapters",
             "llm_refinery.application",
             "llm_refinery.benchmarks",
             "llm_refinery.providers",
@@ -21,7 +22,14 @@ def test_dependency_boundaries_do_not_point_toward_cli_or_workflows():
             "llm_refinery.providers",
             *COMMANDS_AND_WORKFLOWS,
         ),
-        "benchmarks": COMMANDS_AND_WORKFLOWS,
+        "benchmarks": (*COMMANDS_AND_WORKFLOWS, "llm_refinery.adapters"),
+        "adapters": (
+            "llm_refinery.application",
+            "llm_refinery.benchmarks",
+            "llm_refinery.providers",
+            "llm_refinery.storage",
+            *COMMANDS_AND_WORKFLOWS,
+        ),
         "providers": COMMANDS_AND_WORKFLOWS,
         "application": COMMANDS_AND_WORKFLOWS,
     }

@@ -4,6 +4,7 @@ import json
 import time
 from contextlib import nullcontext
 
+from llm_refinery.application.run_context import RunContext
 from llm_refinery.application.run_session import RunSession
 from llm_refinery.benchmarks.agent.base import (
     UNSET,
@@ -86,6 +87,7 @@ def run_agent_eval(
     client: ChatClient | None = None,
     parent_run_id: str | None = None,
     store: ResultStore | None = None,
+    run_context: RunContext | None = None,
 ) -> list[CompletedRun]:
     benchmark = config.benchmark.with_overrides(
         limit=limit,
@@ -124,6 +126,7 @@ def run_agent_eval(
                         chat_client,
                         active_store,
                         parent_run_id=parent_run_id,
+                        run_context=run_context,
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - RunSession persisted the failure
@@ -147,6 +150,7 @@ def _run_target(
     store: ResultStore,
     *,
     parent_run_id: str | None,
+    run_context: RunContext | None,
 ) -> CompletedRun:
     command = (
         f"agent-eval benchmark={benchmark.kind} target={target.name} "
@@ -171,6 +175,8 @@ def _run_target(
         "prompt_tokens": None,
         "gen_tokens": config.request.max_tokens,
     }
+    if run_context is not None and run_context.target_json:
+        config_json["execution_target"] = run_context.target_identity_json()
     spec = RunSpec.create(
         benchmark_kind="agent_eval",
         suite=config.name,
@@ -182,7 +188,7 @@ def _run_target(
     )
 
     print(command)
-    with RunSession(store, spec) as run:
+    with RunSession(store, spec, run_context=run_context) as run:
         responses_path = run.artifact(
             "responses", f"{benchmark.kind}-responses.jsonl", "application/x-ndjson"
         )

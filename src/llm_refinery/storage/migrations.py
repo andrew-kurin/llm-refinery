@@ -9,7 +9,7 @@ import duckdb
 
 from llm_refinery.core.runs import stable_hash
 
-DATABASE_SCHEMA_VERSION = 2
+DATABASE_SCHEMA_VERSION = 3
 
 
 def initialize_schema(
@@ -35,6 +35,7 @@ def initialize_schema(
             config_json TEXT NOT NULL,
             metrics_json TEXT NOT NULL,
             system_json TEXT,
+            target_json TEXT,
             error TEXT
         )
         """
@@ -44,6 +45,7 @@ def initialize_schema(
     _ensure_column(connection, "runs", "parent_run_id", "TEXT")
     _ensure_column(connection, "runs", "schema_version", "INTEGER DEFAULT 1")
     _ensure_column(connection, "runs", "system_json", "TEXT")
+    _ensure_column(connection, "runs", "target_json", "TEXT")
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS metrics (
@@ -88,15 +90,21 @@ def initialize_schema(
         )
         """
     )
-    applied = connection.execute(
-        "SELECT 1 FROM schema_migrations WHERE version = ?",
-        [DATABASE_SCHEMA_VERSION],
-    ).fetchone()
-    if applied is None:
-        _migrate_legacy_runs(connection, database=database)
+    migrations = (
+        (2, lambda: _migrate_legacy_runs(connection, database=database)),
+        (3, lambda: _ensure_column(connection, "runs", "target_json", "TEXT")),
+    )
+    for version, migrate in migrations:
+        applied = connection.execute(
+            "SELECT 1 FROM schema_migrations WHERE version = ?",
+            [version],
+        ).fetchone()
+        if applied is not None:
+            continue
+        migrate()
         connection.execute(
             "INSERT INTO schema_migrations VALUES (?, ?)",
-            [DATABASE_SCHEMA_VERSION, datetime.now(UTC)],
+            [version, datetime.now(UTC)],
         )
 
 

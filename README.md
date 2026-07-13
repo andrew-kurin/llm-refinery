@@ -2,6 +2,10 @@
 
 Small, local-first experiment harness for refining local LLM serving choices across llama.cpp, Ollama, MLX, and other OpenAI-compatible endpoints.
 
+Remote OpenAI-compatible targets, including DGX Spark running vLLM, support
+read-only SSH system inventory, deterministic served-model discovery, and
+separate client/server attribution. See [`docs/dgx-spark.md`](docs/dgx-spark.md).
+
 It gives you a `llm-refinery` command that can:
 
 - expand YAML sweep files into concrete `llama bench` / `llama server` commands
@@ -31,6 +35,12 @@ Or install editable:
 uv pip install -e .
 llm-refinery --help
 ```
+
+The repository-relative `targets/`, `sweeps/`, and `evals/` paths used in this
+guide are example assets from the source checkout; they are not installed by the
+Python wheel. Clone the repository (or copy the needed manifests into your own
+project) before running those example commands. The installed CLI accepts those
+manifests from any user-managed path.
 
 ## Quick start
 
@@ -88,6 +98,15 @@ cache-busted prompt-pool cells in
 The runner warms every concurrency slot and warns when a cell is too small for useful
 tail inspection. It records all-request latency (including failures), visible and
 reasoning TTFT, TPOT, approximate streaming-event ITL, and explicit correctness failures.
+
+HTTP load honors the standard private-CA and proxy-bypass environment by default,
+including `NO_PROXY`, `SSL_CERT_FILE`, and `SSL_CERT_DIR`. Model traffic must be
+direct because a synchronous proxy lookup cannot be cancelled safely at the
+request deadline. If `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` is configured,
+cover the logical model host with `NO_PROXY` or set `transport.trust_env: false`.
+A manifest can also set `transport.ca_bundle` to a PEM bundle (relative to the
+manifest) without disabling certificate verification. The recommended local
+manifest uses direct mode explicitly.
 
 Compare HTTP load results by latency, TTFT, throughput, and optionally host metadata:
 
@@ -232,7 +251,7 @@ Important notes:
 - `bench.omit_params` / `server.omit_params` remove shared flags for one command type.
 - Snake-case keys become llama.cpp kebab-case flags. Example: `ctx_size` -> `--ctx-size`.
 - Boolean `true` values become flags. Boolean `false` values are omitted.
-- Bench, lm-eval, HTTP-load, agent-eval, DABStep, and suite runs record structured host metadata in `runs.system_json` for cross-machine history: macOS version, hardware model, chip/CPU fields when available, memory size, Python path/version, project version, and git head/dirty state. `llm-refinery compare --param system.hardware.model --param system.hardware.memory_gb` can display it.
+- Bench, lm-eval, HTTP-load, agent-eval, DABStep, and suite runs record structured executor metadata in `runs.system_json`: OS, hardware model, chip/CPU fields, memory, Python, project version, and git state. Remote suites record the serving host, service, model, and topology separately in `runs.target_json`. `llm-refinery compare --param executor.hardware.model --param target.host.profile.hardware.model` can display both.
 - Linux/DGX profiles also capture OS/DMI, NVIDIA GPU/driver, CUDA runtime/toolkit, and
   DGX release metadata best-effort. A hashed machine fingerprint keeps identical configs
   from a Mac and DGX Spark as distinct comparison rows while collapsing reruns only on
@@ -270,9 +289,14 @@ use `openai_chat` with `api_key_env` when needed.
 ### Suite configuration
 
 Suite manifests are separate from llama sweep manifests. See
-[`sweeps/gemma4-31b-suite.yaml`](sweeps/gemma4-31b-suite.yaml). They contain an
-`endpoint`, `quality`, optional `http_load`, and `preflight` section. Referenced
-HTTP-load paths resolve relative to the suite manifest.
+[`sweeps/gemma4-31b-suite.yaml`](sweeps/gemma4-31b-suite.yaml). Legacy schema-v1
+suites use an `endpoint`. A schema-v2 suite must define exactly one of `endpoint`
+or `target`; `target` may be an inline discovery mapping or a path to a target
+manifest such as [`targets/dgx-spark-vllm.yaml`](targets/dgx-spark-vllm.yaml).
+Referenced target manifests, quality include paths, and HTTP-load configurations
+resolve relative to the suite manifest. Paths inside a referenced target manifest
+resolve relative to that target file. The suite database and quality output root
+remain relative to the invoking working directory.
 
 Successful suite preflight responses are retained as `preflight.json`, including the
 model identifier returned by the endpoint. When an endpoint exposes a stable model id,
@@ -283,7 +307,7 @@ set `preflight.expected_response_model` to make an accidental model swap fail cl
 1. Start with `llm-refinery plan` to verify exact llama.cpp commands.
 2. Run a small `--limit` first for low-level benchmark sweeps.
 3. Launch candidates with `llm-refinery server` or an external Ollama/MLX server.
-4. Run `llm-refinery suite` with a suite manifest for recorded lm-eval + HTTP-load checks. Use `endpoint.model` in YAML or `--api-model` when the endpoint requires the real model id.
+4. Run `llm-refinery suite` with a suite manifest for recorded lm-eval + HTTP-load checks. Fixed endpoints use `endpoint.model`; schema-v2 targets discover the served model or select `target.model.id` explicitly. `--api-model` overrides either form for one invocation.
 5. Use `llm-refinery agent-eval` for direct chat benchmarks like GeoAnalystBench.
 6. Use `llm-refinery dabstep` for the external multi-step DABStep agent baseline.
 7. Compare parsed metrics with `llm-refinery compare`.

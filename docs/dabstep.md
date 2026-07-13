@@ -131,7 +131,21 @@ uv run llm-refinery dabstep benchmarks/dabstep-smoke.yaml \
 
 The manifest must still match the original run specification. Resume refuses a
 different config, a different benchmark kind, an unknown run ID, or an already
-successful run.
+successful run. It also verifies that the current executor host matches the stored
+host identity.
+
+Older run records whose system-profile capture failed have no executor identity to
+verify and therefore fail closed. After independently confirming that you are on the
+original executor, recover that run explicitly:
+
+```bash
+uv run llm-refinery dabstep benchmarks/dabstep-smoke.yaml \
+  --resume <legacy-run-id> --allow-unverified-executor
+```
+
+This escape hatch works only when the stored identity is absent; it cannot override a
+known host mismatch. A successful recovery stores the current host profile so later
+resumes use normal identity validation.
 
 ## Artifacts and metrics
 

@@ -25,6 +25,7 @@ class RunRecord:
     schema_version: int = RUN_SCHEMA_VERSION
     metrics: dict[str, float] = field(default_factory=dict)
     system_json: dict[str, Any] = field(default_factory=dict)
+    target_json: dict[str, Any] = field(default_factory=dict)
     artifacts: tuple[Artifact, ...] = ()
     llama_version: str | None = None
     error: str | None = None

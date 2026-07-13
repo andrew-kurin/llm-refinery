@@ -110,6 +110,322 @@ def test_compare_derives_distinct_host_identities_for_legacy_profiles():
     assert {row["run_id"] for row in rows} == {"mac", "spark"}
 
 
+def test_compare_separates_executor_target_and_measurement_topology():
+    shared = {
+        "trial_name": "suite/model",
+        "status": "ok",
+        "duration_s": 1.0,
+        "spec_hash": "shared-spec",
+        "config_json": {"model": "served-model", "params": {}},
+        "system_json": {"hostname": "mac", "host_fingerprint": "host-mac"},
+        "target_json": {
+            "host": {
+                "destination": "dgx",
+                "profile": {"hostname": "spark", "host_fingerprint": "host-spark"},
+            },
+            "topology": {"measurement_scope": "remote_lan_end_to_end"},
+        },
+    }
+    rows = build_compare_rows(
+        [
+            {**shared, "run_id": "remote-latest", "metrics": {"score": 3.0}},
+            {**shared, "run_id": "remote-older", "metrics": {"score": 2.0}},
+            {
+                **shared,
+                "run_id": "loopback",
+                "metrics": {"score": 1.0},
+                "target_json": {
+                    **shared["target_json"],
+                    "topology": {"measurement_scope": "local_loopback"},
+                },
+            },
+        ],
+        metrics=("score",),
+        limit=10,
+    )
+
+    assert [row["run_id"] for row in rows] == ["remote-latest", "loopback"]
+    assert rows[0]["host"] == "spark"
+    assert rows[0]["executor_host"] == "mac"
+    assert rows[0]["target_host"] == "spark"
+    assert rows[0]["topology"] == "remote_lan_end_to_end"
+    header = build_compare_table_rows(rows)[0]
+    assert all(column in header for column in ("host", "executor_host", "target_host", "topology"))
+
+
+def test_compare_does_not_label_failed_remote_target_as_executor():
+    shared = {
+        "trial_name": "suite/model",
+        "status": "failed",
+        "duration_s": 1.0,
+        "config_json": {"model": "served-model", "params": {}},
+        "metrics": {},
+        "system_json": {"hostname": "mac", "host_fingerprint": "host-mac"},
+    }
+
+    named = build_compare_rows(
+        [
+            {
+                **shared,
+                "run_id": "named-remote",
+                "target_json": {
+                    "status": "unavailable",
+                    "name": "spark",
+                    "host": None,
+                },
+            }
+        ],
+        metrics=("score",),
+    )[0]
+    unknown = build_compare_rows(
+        [
+            {
+                **shared,
+                "run_id": "unknown-remote",
+                "target_json": {"status": "unavailable"},
+            }
+        ],
+        metrics=("score",),
+    )[0]
+    legacy_local = build_compare_rows(
+        [{**shared, "run_id": "legacy-local", "target_json": {}}],
+        metrics=("score",),
+    )[0]
+
+    assert named["target_host"] == "spark"
+    assert unknown["target_host"] == "unknown"
+    assert legacy_local["target_host"] == "mac"
+
+
+def test_compare_keeps_same_remote_run_from_distinct_executors():
+    target = {
+        "host": {"profile": {"hostname": "spark", "host_fingerprint": "host-spark"}},
+        "topology": {"measurement_scope": "remote_lan_end_to_end"},
+    }
+    shared = {
+        "trial_name": "suite/model",
+        "status": "ok",
+        "duration_s": 1.0,
+        "spec_hash": "shared-spec",
+        "config_json": {"model": "same-model", "params": {}},
+        "metrics": {"score": 1.0},
+        "target_json": target,
+    }
+    rows = build_compare_rows(
+        [
+            {
+                **shared,
+                "run_id": "mac-a",
+                "system_json": {"hostname": "mac-a", "host_fingerprint": "mac-a"},
+            },
+            {
+                **shared,
+                "run_id": "mac-b",
+                "system_json": {"hostname": "mac-b", "host_fingerprint": "mac-b"},
+            },
+        ],
+        metrics=("score",),
+        limit=10,
+    )
+
+    assert {row["run_id"] for row in rows} == {"mac-a", "mac-b"}
+
+
+def test_compare_keeps_parent_runs_with_different_discovered_models():
+    shared = {
+        "trial_name": "suite",
+        "status": "ok",
+        "duration_s": 1.0,
+        "spec_hash": "declarative-suite-spec",
+        "config_json": {"params": {}},
+        "system_json": {"host_fingerprint": "mac"},
+        "metrics": {"score": 1.0},
+    }
+
+    def target(model_id: str):
+        return {
+            "name": "spark",
+            "host": {"profile": {"host_fingerprint": "spark"}},
+            "service": {
+                "implementation": "vllm",
+                "base_url": "http://spark.local:8000/v1",
+                "version": "0.10.0",
+            },
+            "model": {"id": model_id, "requested_id": model_id},
+            "topology": {"measurement_scope": "remote_client_to_server"},
+        }
+
+    rows = build_compare_rows(
+        [
+            {**shared, "run_id": "model-a", "target_json": target("model-a")},
+            {**shared, "run_id": "model-b", "target_json": target("model-b")},
+        ],
+        metrics=("score",),
+        limit=10,
+    )
+
+    assert {row["run_id"] for row in rows} == {"model-a", "model-b"}
+
+
+def test_compare_keeps_same_target_routed_to_distinct_addresses():
+    shared = {
+        "trial_name": "suite",
+        "status": "ok",
+        "duration_s": 1.0,
+        "spec_hash": "declarative-suite-spec",
+        "config_json": {"params": {}},
+        "system_json": {"host_fingerprint": "mac"},
+        "metrics": {"score": 1.0},
+    }
+
+    def target(selected_address: str):
+        return {
+            "schema_version": 1,
+            "name": "spark",
+            "host": {"profile": {"hostname": "spark"}},
+            "service": {
+                "implementation": "vllm",
+                "base_url": "http://spark.local:8000/v1",
+                "version": "0.10.0",
+            },
+            "route": {
+                "logical_origin": {
+                    "scheme": "http",
+                    "hostname": "spark.local",
+                    "port": 8000,
+                },
+                "selected_address": selected_address,
+                "authority": "spark.local:8000",
+            },
+            "model": {"id": "served"},
+        }
+
+    rows = build_compare_rows(
+        [
+            {**shared, "run_id": "route-a", "target_json": target("192.168.1.41")},
+            {**shared, "run_id": "route-b", "target_json": target("192.168.1.42")},
+        ],
+        metrics=("score",),
+        limit=10,
+    )
+
+    assert {row["run_id"] for row in rows} == {"route-a", "route-b"}
+
+
+def test_compare_keeps_historical_inventory_fingerprints_distinct():
+    shared = {
+        "trial_name": "suite",
+        "status": "ok",
+        "duration_s": 1.0,
+        "spec_hash": "declarative-suite-spec",
+        "config_json": {"params": {}},
+        "system_json": {"host_fingerprint": "mac"},
+        "metrics": {"score": 1.0},
+    }
+
+    def target(host_fingerprint: str):
+        return {
+            "schema_version": 1,
+            "name": "spark",
+            "host": {"inventory": {"host_fingerprint": host_fingerprint}},
+            "service": {"base_url": "http://spark.local:8000/v1"},
+            "model": {"id": "served"},
+        }
+
+    rows = build_compare_rows(
+        [
+            {**shared, "run_id": "host-a", "target_json": target("host-a")},
+            {**shared, "run_id": "host-b", "target_json": target("host-b")},
+        ],
+        metrics=("score",),
+        limit=10,
+    )
+
+    assert {row["run_id"] for row in rows} == {"host-a", "host-b"}
+
+
+def test_compare_groups_verified_cross_version_host_identity_alias():
+    shared = {
+        "trial_name": "suite",
+        "status": "ok",
+        "duration_s": 1.0,
+        "spec_hash": "declarative-suite-spec",
+        "config_json": {"params": {}},
+        "system_json": {"host_fingerprint": "mac"},
+        "metrics": {"score": 1.0},
+    }
+    target_shared = {
+        "schema_version": 1,
+        "name": "spark",
+        "service": {"base_url": "http://spark.local:8000/v1"},
+        "model": {"id": "served"},
+        "topology": {"measurement_scope": "remote_client_to_server"},
+    }
+    legacy = {
+        **target_shared,
+        "host": {
+            "profile": {
+                "hostname": "spark",
+                "host_fingerprint": "host-prior-hardware",
+                "host_fingerprint_strength": "hardware",
+            }
+        },
+    }
+    migrated = {
+        **target_shared,
+        "host": {
+            "profile": {
+                "hostname": "spark",
+                "host_fingerprint": "host-canonical-installation",
+                "host_fingerprint_strength": "installation",
+                "host_hardware_fingerprint": "host-prior-hardware",
+                "host_fingerprint_aliases": [
+                    {"fingerprint": "host-prior-hardware", "strength": "hardware"}
+                ],
+            }
+        },
+        "host_identity_binding": {
+            "expected_fingerprint": "host-prior-hardware",
+            "actual_fingerprint": "host-prior-hardware",
+            "actual_strength": "hardware",
+            "verified": True,
+        },
+    }
+
+    rows = build_compare_rows(
+        [
+            {**shared, "run_id": "migrated", "target_json": migrated},
+            {**shared, "run_id": "legacy", "target_json": legacy},
+        ],
+        metrics=("score",),
+        limit=10,
+    )
+
+    assert [row["run_id"] for row in rows] == ["migrated"]
+
+
+def test_compare_supports_target_and_executor_dotted_params():
+    rows = build_compare_rows(
+        [
+            {
+                "run_id": "remote",
+                "trial_name": "suite/model",
+                "status": "ok",
+                "duration_s": 1.0,
+                "config_json": {"params": {}},
+                "metrics": {"score": 1.0},
+                "system_json": {"hardware": {"model": "Mac"}},
+                "target_json": {"service": {"version": "0.10.2"}},
+            }
+        ],
+        metrics=("score",),
+        params=("executor.hardware.model", "target.service.version"),
+    )
+
+    assert rows[0]["executor.hardware.model"] == "Mac"
+    assert rows[0]["target.service.version"] == "0.10.2"
+
+
 def test_compare_sort_keeps_missing_metrics_last_when_ascending():
     runs = [
         {

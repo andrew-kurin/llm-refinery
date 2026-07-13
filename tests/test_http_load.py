@@ -1,5 +1,14 @@
+import json
+import socketserver
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import httpx
 import pytest
 
+from llm_refinery.application.run_context import RunContext
+from llm_refinery.benchmarks.http_load import transport as http_transport
 from llm_refinery.benchmarks.http_load.config import (
     HttpLoadConfig,
     HttpScenario,
@@ -10,8 +19,10 @@ from llm_refinery.benchmarks.http_load.models import RequestResult
 from llm_refinery.benchmarks.http_load.runner import HttpLoadFailed, run_http_load
 from llm_refinery.benchmarks.http_load.transport import (
     messages_for_scenario,
+    pooled_http_client,
     read_ollama_stream,
     read_openai_stream,
+    run_requests,
     with_check_result,
 )
 from llm_refinery.core.config import ConfigError
@@ -55,6 +66,359 @@ def test_expand_http_load_trials_crosses_targets_scenarios_concurrency_and_token
     assert {trial.concurrency for trial in trials} == {1, 2}
     assert {trial.max_tokens for trial in trials} == {32, 64}
     assert all("params" in trial.as_jsonable() for trial in trials)
+    assert all(trial.transport.trust_env is True for trial in trials)
+
+
+def test_http_load_plan_sanitizes_remote_model_output(tmp_path, capsys):
+    unsafe_model = (
+        "served\x1b]2;forged-title\x07\x1b[31m-red\u2028forged-line\u2029forged-paragraph"
+    )
+    config = HttpLoadConfig.from_mapping(
+        {
+            "database": str(tmp_path / "runs.duckdb"),
+            "targets": [
+                {
+                    "name": "remote",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8000/v1",
+                    "model": unsafe_model,
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello"}],
+        }
+    )
+
+    assert run_http_load(config, dry_run=True) == []
+
+    output = capsys.readouterr().out
+    assert "\x1b" not in output
+    assert "forged-title" not in output
+    assert "\u2028" not in output
+    assert "\u2029" not in output
+    assert "-red forged-line forged-paragraph" in output
+
+
+def test_http_load_runner_sanitizes_failure_output(tmp_path, monkeypatch, capsys):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "database": str(tmp_path / "runs.duckdb"),
+            "targets": [
+                {
+                    "name": "remote",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8000/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello"}],
+        }
+    )
+
+    def fail_trial(*_args, **_kwargs):
+        raise RuntimeError(
+            "failed\x1b]2;forged-title\x07\x1b[31m-red\u2028forged-line\u2029forged-paragraph"
+        )
+
+    monkeypatch.setattr(
+        "llm_refinery.benchmarks.http_load.runner._run_one_http_load",
+        fail_trial,
+    )
+
+    with pytest.raises(HttpLoadFailed, match="1 HTTP load trial"):
+        run_http_load(config, keep_going=True)
+
+    output = capsys.readouterr().out
+    assert "\x1b" not in output
+    assert "forged-title" not in output
+    assert "\u2028" not in output
+    assert "\u2029" not in output
+    assert "-red forged-line forged-paragraph" in output
+
+
+def test_http_transport_config_supports_direct_mode_and_relative_ca_bundle(tmp_path):
+    ca_bundle = tmp_path / "private-ca.pem"
+    ca_bundle.write_text("test certificate bundle", encoding="utf-8")
+    config = HttpLoadConfig.from_mapping(
+        {
+            "transport": {"trust_env": False, "ca_bundle": ca_bundle.name},
+            "targets": [
+                {
+                    "name": "remote",
+                    "protocol": "openai_chat",
+                    "base_url": "https://remote.test/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello"}],
+        },
+        source_path=tmp_path / "http-load.yaml",
+    )
+
+    trial = expand_http_load_trials(config)[0]
+
+    assert trial.transport.trust_env is False
+    assert trial.transport.ca_bundle == ca_bundle
+    assert trial.as_jsonable()["transport"] == {
+        "trust_env": False,
+        "ca_bundle": str(ca_bundle),
+    }
+
+
+def test_http_transport_config_rejects_string_boolean():
+    with pytest.raises(ConfigError, match="transport.trust_env must be a boolean"):
+        HttpLoadConfig.from_mapping(
+            {
+                "transport": {"trust_env": "false"},
+                "targets": [
+                    {
+                        "name": "local",
+                        "protocol": "openai_chat",
+                        "base_url": "http://127.0.0.1:8080/v1",
+                        "model": "local",
+                    }
+                ],
+                "scenarios": [{"name": "chat", "prompt": "hello"}],
+            }
+        )
+
+
+@pytest.mark.parametrize("value", [None, False, 0, ""])
+def test_http_transport_config_rejects_invalid_ca_bundle(value):
+    with pytest.raises(ConfigError, match="ca_bundle must be a non-empty path string"):
+        HttpLoadConfig.from_mapping(
+            {
+                "transport": {"ca_bundle": value},
+                "targets": [
+                    {
+                        "name": "local",
+                        "protocol": "openai_chat",
+                        "base_url": "http://127.0.0.1:8080/v1",
+                        "model": "local",
+                    }
+                ],
+                "scenarios": [{"name": "chat", "prompt": "hello"}],
+            }
+        )
+
+
+def test_http_transport_config_expands_home_in_ca_bundle(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    ca_bundle = home / ".config" / "private-ca.pem"
+    ca_bundle.parent.mkdir(parents=True)
+    ca_bundle.write_text("test certificate bundle", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+
+    config = HttpLoadConfig.from_mapping(
+        {
+            "transport": {"ca_bundle": "~/.config/private-ca.pem"},
+            "targets": [
+                {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "model": "local",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello"}],
+        },
+        source_path=tmp_path / "manifests" / "http-load.yaml",
+    )
+
+    assert config.transport.ca_bundle == ca_bundle.resolve()
+
+
+def test_http_client_applies_transport_proxy_and_ca_settings(tmp_path, monkeypatch):
+    ca_bundle = tmp_path / "private-ca.pem"
+    ca_bundle.write_text("test certificate bundle", encoding="utf-8")
+    config = HttpLoadConfig.from_mapping(
+        {
+            "transport": {"trust_env": False, "ca_bundle": str(ca_bundle)},
+            "targets": [
+                {
+                    "name": "remote",
+                    "protocol": "openai_chat",
+                    "base_url": "https://remote.test/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello"}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    ssl_context = object()
+    captured = {}
+
+    monkeypatch.setattr(
+        http_transport.ssl,
+        "create_default_context",
+        lambda *, cafile: ssl_context if cafile == str(ca_bundle) else None,
+    )
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        lambda host, port, **kwargs: [(2, 1, 6, "", ("192.168.1.41", port))],
+    )
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(http_transport.httpx, "Client", FakeClient)
+
+    http_transport._new_http_client(trial)
+
+    assert captured["trust_env"] is False
+    assert captured["verify"] is ssl_context
+
+
+def test_http_client_forces_explicit_loopback_target_direct(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "model": "local",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello"}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(http_transport.httpx, "Client", FakeClient)
+
+    http_transport._new_http_client(trial)
+
+    assert captured["trust_env"] is False
+
+
+def test_http_client_resolves_remote_origin_once_before_measured_requests(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "dgx",
+                    "protocol": "openai_chat",
+                    "base_url": "http://aitopatom-41de.local:8000/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [
+                {
+                    "name": "chat",
+                    "prompt": "hello",
+                    "stream": False,
+                    "requests": 2,
+                    "concurrency": 2,
+                }
+            ],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    resolutions = 0
+
+    def resolve(host, port, **kwargs):
+        nonlocal resolutions
+        resolutions += 1
+        return [(2, 1, 6, "", ("192.168.1.41", port))]
+
+    monkeypatch.setattr("llm_refinery.core.http_safety.socket.getaddrinfo", resolve)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "192.168.1.41"
+        assert request.headers["host"] == "aitopatom-41de.local:8000"
+        assert request.extensions["sni_hostname"] == "aitopatom-41de.local"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"completion_tokens": 1},
+            },
+            request=request,
+        )
+
+    with pooled_http_client(trial) as client:
+        for pooled_client in client._clients:  # type: ignore[attr-defined]
+            pooled_client._transport = httpx.MockTransport(handler)  # type: ignore[attr-defined]
+        assert all(result.ok for result in run_requests(trial, count=2, client=client))
+
+    assert resolutions == 1
+
+
+def test_http_client_route_resolution_uses_scenario_timeout(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "transport": {"trust_env": False},
+            "targets": [
+                {
+                    "name": "dgx",
+                    "protocol": "openai_chat",
+                    "base_url": "http://aitopatom-41de.local:8000/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [
+                {
+                    "name": "chat",
+                    "prompt": "hello",
+                    "timeout_s": 0.125,
+                }
+            ],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    captured: dict[str, object] = {}
+
+    def resolve_route(url: str, **kwargs):
+        captured.update(url=url, **kwargs)
+        return None
+
+    monkeypatch.setattr(http_transport, "resolve_request_route", resolve_route)
+
+    assert http_transport._trial_route(trial) is None
+    assert captured == {
+        "url": trial.target.base_url,
+        "require_resolution": True,
+        "resolution_timeout_s": 0.125,
+    }
+
+
+def test_http_client_rejects_active_proxy_before_dns_or_client_creation(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "remote",
+                    "protocol": "openai_chat",
+                    "base_url": "http://model.example:8000/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello"}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.getproxies",
+        lambda: {"http": "http://proxy.example:3128"},
+    )
+
+    def unexpected_resolution(*args, **kwargs):
+        raise AssertionError("proxy-routed origins must not be resolved or IP-pinned locally")
+
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        unexpected_resolution,
+    )
+
+    with pytest.raises(ConfigError, match="add the target host to NO_PROXY"):
+        http_transport._new_http_client(trial)
 
 
 def test_http_scenario_supports_prompt_pools_and_explicit_unique_cache_mode():
@@ -155,8 +519,11 @@ def test_http_load_runner_records_samples_and_typed_artifacts(tmp_path, monkeypa
     )
     calls = []
 
-    def fake_run_requests(_trial, *, count, index_offset=0):
+    clients: list[httpx.Client] = []
+
+    def fake_run_requests(_trial, *, count, index_offset=0, client=None):
         calls.append((count, index_offset))
+        clients.append(client)
         return [
             RequestResult(
                 **{
@@ -172,7 +539,15 @@ def test_http_load_runner_records_samples_and_typed_artifacts(tmp_path, monkeypa
         fake_run_requests,
     )
 
-    outcomes = run_http_load(config)
+    context = RunContext(
+        target_json={
+            "host": {"profile": {"host_fingerprint": "spark"}},
+            "service": {"implementation": "vllm", "version": "0.10.0"},
+            "model": {"id": "local"},
+            "topology": {"measurement_scope": "remote_client_to_server"},
+        }
+    )
+    outcomes = run_http_load(config, run_context=context)
 
     assert len(outcomes) == 1
     with ResultStore(config.database) as store:
@@ -180,8 +555,11 @@ def test_http_load_runner_records_samples_and_typed_artifacts(tmp_path, monkeypa
         samples = store.samples_for_run(run["run_id"])
     assert set(run["artifacts"]) == {"errors", "measurement", "responses"}
     assert calls == [(1, 0), (1, 0)]
+    assert clients[0] is clients[1]
+    assert clients[0].is_closed
     assert run["metrics"]["effective_warmup_requests"] == 1
     assert run["metrics"]["measured_request_count_recommendation_met"] == 0
+    assert run["config_json"]["execution_target"]["model"]["id"] == "local"
     assert len(samples) == 1
     assert samples[0]["metrics"] == {"latency_s": 1.0}
 
@@ -256,6 +634,7 @@ def test_summarize_request_results_calculates_latency_and_throughput_metrics():
 def test_read_openai_stream_extracts_content_text_and_reasoning_content():
     response = iter(
         [
+            b'data: {"choices":[{"delta":{"reasoning":"current "}}]}\n',
             b'data: {"choices":[{"delta":{"reasoning_content":"think "}}]}\n',
             b'data: {"choices":[{"delta":{"thinking":"more "}}]}\n',
             b'data: {"choices":[{"text":"hello "}]}\n',
@@ -267,11 +646,11 @@ def test_read_openai_stream_extracts_content_text_and_reasoning_content():
 
     result = read_openai_stream(0, response, 0.0, 200)
 
-    assert result.response_text == "think more hello world"
-    assert result.reasoning_response_text == "think more "
+    assert result.response_text == "current think more hello world"
+    assert result.reasoning_response_text == "current think more "
     assert result.visible_response_text == "hello world"
-    assert result.completion_chars == len("think more hello world")
-    assert result.reasoning_completion_chars == len("think more ")
+    assert result.completion_chars == len("current think more hello world")
+    assert result.reasoning_completion_chars == len("current think more ")
     assert result.visible_completion_chars == len("hello world")
     assert result.prompt_tokens == 3
     assert result.completion_tokens == 4
@@ -280,7 +659,630 @@ def test_read_openai_stream_extracts_content_text_and_reasoning_content():
     assert result.visible_ttft_s is not None
     assert result.reasoning_ttft_s <= result.visible_ttft_s
     assert result.tpot_s is not None
-    assert len(result.itl_s) == 3
+    assert len(result.itl_s) == 4
+
+
+def test_run_requests_shares_and_closes_one_connection_pool(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "model": "local",
+                }
+            ],
+            "scenarios": [
+                {
+                    "name": "pooled",
+                    "prompt": "hello",
+                    "requests": 4,
+                    "concurrency": 2,
+                }
+            ],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    clients: list[httpx.Client] = []
+
+    def fake_execute(_trial, index, *, request_nonce=None, client=None):
+        clients.append(client)
+        return RequestResult(
+            index=index,
+            ok=True,
+            status_code=200,
+            latency_s=0.1,
+            response_text="ok",
+            visible_response_text="ok",
+        )
+
+    monkeypatch.setattr(
+        "llm_refinery.benchmarks.http_load.transport.execute_http_request",
+        fake_execute,
+    )
+
+    results = run_requests(trial, count=4)
+
+    assert [result.index for result in results] == [0, 1, 2, 3]
+    assert len({id(client) for client in clients}) == trial.concurrency
+    assert all(client.is_closed for client in clients)
+
+
+def test_connection_pool_replaces_timed_out_clients_without_retaining_them():
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "model": "local",
+                }
+            ],
+            "scenarios": [
+                {
+                    "name": "pooled",
+                    "prompt": "hello",
+                    "requests": 2,
+                    "concurrency": 2,
+                }
+            ],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+
+    with pooled_http_client(trial) as pool:
+        for _ in range(5):
+            with pool.lease() as client:
+                client.close()
+            assert len(pool._clients) == trial.concurrency  # type: ignore[attr-defined]
+            assert all(not client.is_closed for client in pool._clients)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("timeout_s", [float("inf"), float("-inf"), float("nan"), 1e100])
+def test_http_scenario_rejects_unsupported_timeout(timeout_s):
+    with pytest.raises(ConfigError, match="timeout_s must be positive and no greater"):
+        HttpLoadConfig.from_mapping(
+            {
+                "targets": [
+                    {
+                        "name": "local",
+                        "protocol": "openai_chat",
+                        "base_url": "http://127.0.0.1:8080/v1",
+                        "model": "local",
+                    }
+                ],
+                "scenarios": [
+                    {
+                        "name": "invalid-timeout",
+                        "prompt": "hello",
+                        "timeout_s": timeout_s,
+                    }
+                ],
+            }
+        )
+
+
+def test_connection_pool_reuses_http11_connections_across_batches():
+    connections: set[tuple[str, int]] = set()
+    request_count = 0
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            nonlocal request_count
+            request_count += 1
+            connections.add(self.client_address)
+            content_length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(content_length)
+            body = json.dumps(
+                {
+                    "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *args):
+            del args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        config = HttpLoadConfig.from_mapping(
+            {
+                "targets": [
+                    {
+                        "name": "local",
+                        "protocol": "openai_chat",
+                        "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+                        "model": "local",
+                    }
+                ],
+                "scenarios": [
+                    {
+                        "name": "pooled",
+                        "prompt": "hello",
+                        "requests": 4,
+                        "concurrency": 2,
+                        "stream": False,
+                    }
+                ],
+            }
+        )
+        trial = expand_http_load_trials(config)[0]
+
+        with pooled_http_client(trial) as client:
+            assert all(result.ok for result in run_requests(trial, count=2, client=client))
+            assert all(result.ok for result in run_requests(trial, count=4, client=client))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert request_count == 6
+    assert 1 <= len(connections) <= trial.concurrency
+
+
+def test_http_client_pool_keeps_deadline_cancellation_request_local():
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8000/v1",
+                    "model": "local",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello", "requests": 2, "concurrency": 2}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+
+    with pooled_http_client(trial) as pool:
+        with pool.lease() as first, pool.lease() as second:
+            assert first is not second
+            first.close()
+            assert second.is_closed is False
+
+        assert len([client for client in pool._clients if not client.is_closed]) == 2
+
+
+def test_deadline_watchdog_cancel_waits_for_dequeued_callback():
+    watchdog = http_transport._DeadlineWatchdog()
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    cancellation_finished = threading.Event()
+
+    def callback() -> None:
+        callback_started.set()
+        assert release_callback.wait(timeout=2)
+
+    token = watchdog.schedule(time.perf_counter() - 1, callback)
+    assert callback_started.wait(timeout=1)
+
+    def cancel() -> None:
+        watchdog.cancel(token)
+        cancellation_finished.set()
+
+    thread = threading.Thread(target=cancel)
+    thread.start()
+    assert not cancellation_finished.wait(timeout=0.05)
+    release_callback.set()
+    thread.join(timeout=1)
+
+    assert cancellation_finished.is_set()
+
+
+def test_http_load_rejects_dns_name_resolving_to_client_loopback(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "remote-alias",
+                    "protocol": "openai_chat",
+                    "base_url": "http://local-alias.example:8000/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello"}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        lambda host, port, **kwargs: [(2, 1, 6, "", ("127.0.0.1", port))],
+    )
+
+    with pytest.raises(ConfigError, match="client-local"):
+        http_transport._new_http_client(trial)
+
+
+def test_http_load_rejects_cross_origin_redirect_before_following(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "dgx",
+                    "protocol": "openai_chat",
+                    "base_url": "http://aitopatom-41de.local:8000/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello", "stream": False, "requests": 1}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        lambda host, port, **kwargs: [(2, 1, 6, "", ("192.168.1.41", port))],
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            307,
+            headers={"location": "http://127.0.0.1:9000/v1/chat/completions"},
+            request=request,
+        )
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as client,
+        pytest.raises(ConfigError, match="remain on the configured.*origin"),
+    ):
+        http_transport.execute_http_request(trial, 0, client=client)
+
+    assert len(requests) == 1
+
+
+def test_http_load_redacts_credentials_echoed_by_error_response(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "authenticated",
+                    "protocol": "openai_chat",
+                    "base_url": "http://remote.test:8000/v1",
+                    "model": "served-model",
+                    "headers": {"Authorization": "Bearer top-secret-token"},
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello", "stream": False, "requests": 1}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        lambda host, port, **kwargs: [(2, 1, 6, "", ("192.168.1.41", port))],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            text="gateway echoed Bearer top-secret-token",
+            request=request,
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = http_transport.execute_http_request(trial, 0, client=client)
+
+    assert result.ok is False
+    assert "top-secret-token" not in (result.error or "")
+    assert "[REDACTED]" in (result.error or "")
+
+
+def test_http_load_bounds_nonstream_response_bodies(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "remote",
+                    "protocol": "openai_chat",
+                    "base_url": "http://remote.test:8000/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello", "stream": False, "requests": 1}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    monkeypatch.setattr(http_transport, "_MAX_SUCCESS_RESPONSE_BYTES", 10)
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        lambda host, port, **kwargs: [(2, 1, 6, "", ("192.168.1.41", port))],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"x" * 11, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = run_requests(trial, count=1, client=client)[0]
+
+    assert result.ok is False
+    assert "response exceeded 10 bytes" in (result.error or "")
+
+
+def test_http_load_bounds_unterminated_stream_without_line_buffering(monkeypatch):
+    response = httpx.Response(
+        200,
+        content=b"x" * 11,
+        request=httpx.Request("POST", "http://remote.test/v1/chat/completions"),
+    )
+
+    with pytest.raises(ValueError, match="response exceeded 10 bytes"):
+        list(
+            http_transport._iter_bounded_lines(
+                response,
+                deadline=time.perf_counter() + 1,
+                max_bytes=10,
+            )
+        )
+
+
+def test_http_load_worker_fallback_redacts_server_echoed_token(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "authenticated",
+                    "protocol": "ollama_chat",
+                    "base_url": "http://remote.test:8000",
+                    "model": "served-model",
+                    "api_key_env": "HTTP_LOAD_SECRET",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello", "requests": 1}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    monkeypatch.setenv("HTTP_LOAD_SECRET", "top-secret-token")
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        lambda host, port, **kwargs: [(2, 1, 6, "", ("192.168.1.41", port))],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b'{"error":"top-secret-token"}\n',
+            request=request,
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = run_requests(trial, count=1, client=client)[0]
+
+    assert result.ok is False
+    assert "top-secret-token" not in (result.error or "")
+    assert "[REDACTED]" in (result.error or "")
+
+
+def test_http_load_missing_api_key_fails_before_workers_or_network(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "authenticated",
+                    "protocol": "openai_chat",
+                    "base_url": "http://remote.test:8000/v1",
+                    "model": "served-model",
+                    "api_key_env": "MISSING_HTTP_LOAD_KEY",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello", "requests": 4}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    monkeypatch.delenv("MISSING_HTTP_LOAD_KEY", raising=False)
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(200, json={}, request=request)
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(handler)) as client,
+        pytest.raises(ConfigError, match="MISSING_HTTP_LOAD_KEY"),
+    ):
+        run_requests(trial, count=4, client=client)
+
+    assert request_count == 0
+
+
+def test_http_load_absolute_deadline_interrupts_blocking_stream(monkeypatch):
+    class BlockingStream(httpx.SyncByteStream):
+        def __init__(self) -> None:
+            self.closed = threading.Event()
+
+        def __iter__(self):
+            yield b'data: {"choices": []}\n\n'
+            self.closed.wait(timeout=2)
+
+        def close(self) -> None:
+            self.closed.set()
+
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "remote",
+                    "protocol": "openai_chat",
+                    "base_url": "http://remote.test:8000/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [
+                {
+                    "name": "chat",
+                    "prompt": "hello",
+                    "stream": True,
+                    "requests": 1,
+                    "timeout_s": 0.05,
+                }
+            ],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        lambda host, port, **kwargs: [(2, 1, 6, "", ("192.168.1.41", port))],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=BlockingStream(), request=request)
+
+    started = time.perf_counter()
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = http_transport.execute_http_request(trial, 0, client=client)
+
+    assert time.perf_counter() - started < 1
+    assert result.ok is False
+    assert "total timeout" in (result.error or "")
+
+
+def test_http_load_absolute_deadline_interrupts_trickled_response_headers():
+    class TrickleHandler(socketserver.BaseRequestHandler):
+        def handle(self):
+            self.request.recv(65536)
+            self.request.sendall(b"HTTP/1.1 200 OK\r\nX-Trickle: ")
+            for _ in range(100):
+                time.sleep(0.02)
+                try:
+                    self.request.sendall(b"x")
+                except OSError:
+                    return
+
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), TrickleHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": f"http://127.0.0.1:{server.server_address[1]}/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [
+                {
+                    "name": "chat",
+                    "prompt": "hello",
+                    "stream": False,
+                    "requests": 1,
+                    "timeout_s": 0.08,
+                }
+            ],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    started = time.perf_counter()
+    try:
+        with httpx.Client() as client:
+            result = http_transport.execute_http_request(trial, 0, client=client)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert time.perf_counter() - started < 1
+    assert result.ok is False
+    assert "total timeout" in (result.error or "")
+
+
+def test_http_load_stream_iteration_enforces_total_deadline(monkeypatch):
+    response = httpx.Response(
+        200,
+        content=b'data: {"choices": []}\n\ndata: [DONE]\n\n',
+        request=httpx.Request("POST", "http://remote.test/v1/chat/completions"),
+    )
+    observed_times = iter((1.0, 1.0, 3.0))
+    monkeypatch.setattr(
+        http_transport.time,
+        "perf_counter",
+        lambda: next(observed_times),
+    )
+
+    lines = http_transport._iter_bounded_lines(
+        response,
+        deadline=2.0,
+        max_bytes=1_000,
+    )
+
+    assert next(lines).startswith("data:")
+    with pytest.raises(TimeoutError, match="total timeout"):
+        next(lines)
+
+
+def test_http_load_follows_same_origin_method_preserving_redirect(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "dgx",
+                    "protocol": "openai_chat",
+                    "base_url": "http://aitopatom-41de.local:8000/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello", "stream": False, "requests": 1}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    resolutions = 0
+
+    def resolve(host, port, **kwargs):
+        nonlocal resolutions
+        resolutions += 1
+        return [(2, 1, 6, "", ("192.168.1.41", port))]
+
+    monkeypatch.setattr("llm_refinery.core.http_safety.socket.getaddrinfo", resolve)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/chat/completions"):
+            return httpx.Response(
+                307,
+                headers={"location": "/v1/redirected-chat"},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"completion_tokens": 1},
+            },
+            request=request,
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = http_transport.execute_http_request(trial, 0, client=client)
+
+    assert result.ok is True
+    assert [request.url.path for request in requests] == [
+        "/v1/chat/completions",
+        "/v1/redirected-chat",
+    ]
+    assert all(request.url.host == "192.168.1.41" for request in requests)
+    assert all(request.headers["host"] == "aitopatom-41de.local:8000" for request in requests)
+    assert all(request.extensions["sni_hostname"] == "aitopatom-41de.local" for request in requests)
+    assert resolutions == 1
 
 
 def test_read_ollama_stream_extracts_thinking_content():
@@ -390,7 +1392,7 @@ def test_failed_correctness_result_fails_the_http_trial(tmp_path, monkeypatch):
 
     calls = 0
 
-    def fake_run_requests(_trial, *, count, index_offset=0):
+    def fake_run_requests(_trial, *, count, index_offset=0, client=None):
         nonlocal calls
         calls += 1
         return [good] if calls == 1 else [failed]

@@ -17,6 +17,20 @@ from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
 @click.option("--tasks", default="ifeval,gsm8k", show_default=True, help="Comma-separated tasks.")
 @click.option("--num-concurrent", type=int, default=1, show_default=True)
 @click.option("--max-retries", type=int, default=3, show_default=True)
+@click.option(
+    "--request-timeout-s",
+    type=float,
+    default=300.0,
+    show_default=True,
+    help="Absolute timeout for each request to the model server.",
+)
+@click.option(
+    "--process-timeout-s",
+    type=float,
+    default=86400.0,
+    show_default=True,
+    help="Absolute timeout for one lm-eval target process.",
+)
 @click.option("--max-length", type=int, default=16384, show_default=True)
 @click.option(
     "--eos-string",
@@ -24,7 +38,10 @@ from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
 )
 @click.option(
     "--tokenizer",
-    help="Tokenizer id/path for token-aware tasks such as RULER.",
+    help=(
+        "Tokenizer id/path for a backend that supports client tokenization; "
+        "local-chat-completions rejects this option because it ignores it."
+    ),
 )
 @click.option(
     "--metadata",
@@ -58,7 +75,7 @@ from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
 )
 @click.option(
     "--include-path",
-    type=click.Path(file_okay=False, path_type=Path),
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
     help="Additional lm-eval task directory, e.g. evals/lm_eval_tasks.",
 )
 @click.option(
@@ -80,6 +97,20 @@ from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
 @click.option("--base-url", help="Override chat-completions URL for a single target.")
 @click.option("--api-key-env", help="Environment variable containing the endpoint API key.")
 @click.option(
+    "--trust-env/--no-trust-env",
+    default=False,
+    show_default=True,
+    help=(
+        "Honor CA variables and retain proxy variables for online child downloads; "
+        "the model host itself must be direct or covered by NO_PROXY."
+    ),
+)
+@click.option(
+    "--ca-bundle",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="PEM CA bundle for the relay's upstream model connection.",
+)
+@click.option(
     "--output-root",
     type=click.Path(file_okay=False, path_type=Path),
     default=Path("results/lm_eval"),
@@ -98,6 +129,8 @@ def lm_eval_command(
     tasks: str,
     num_concurrent: int,
     max_retries: int,
+    request_timeout_s: float,
+    process_timeout_s: float,
     max_length: int,
     eos_string: str | None,
     tokenizer: str | None,
@@ -115,6 +148,8 @@ def lm_eval_command(
     model: str | None,
     base_url: str | None,
     api_key_env: str | None,
+    trust_env: bool,
+    ca_bundle: Path | None,
     output_root: Path,
     offline: bool,
     dry_run: bool,
@@ -156,6 +191,8 @@ def lm_eval_command(
             tasks=tasks,
             num_concurrent=num_concurrent,
             max_retries=max_retries,
+            request_timeout_s=request_timeout_s,
+            process_timeout_s=process_timeout_s,
             max_length=max_length,
             eos_string=eos_string,
             tokenizer=tokenizer,
@@ -170,6 +207,8 @@ def lm_eval_command(
             extra_packages=extra_packages,
             apply_chat_template=apply_chat_template,
             include_path=include_path,
+            trust_env=trust_env,
+            ca_bundle=ca_bundle,
             suite_name=suite_name,
             database=db,
             targets=targets,

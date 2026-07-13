@@ -12,6 +12,10 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+      - name: Install Python 3.10 probe runtime
+        run: |
+          uv python install 3.10
+          echo "LLM_REFINERY_PYTHON_310=$(uv python find --no-project 3.10)" >> "$GITHUB_ENV"
       - name: Install
         run: uv sync --frozen
       - name: Lint

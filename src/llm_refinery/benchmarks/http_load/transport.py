@@ -1,18 +1,152 @@
 from __future__ import annotations
 
+import heapq
 import json
+import ssl
+import threading
 import time
-import urllib.error
-import urllib.request
 import uuid
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from dataclasses import replace
+from queue import LifoQueue
 from typing import Any
+from urllib.parse import urljoin
+
+import httpx
 
 from llm_refinery.benchmarks.http_load.config import HttpLoadTrial, HttpScenario
 from llm_refinery.benchmarks.http_load.models import RequestResult
+from llm_refinery.core.config import ConfigError
 from llm_refinery.core.endpoints import OLLAMA_CHAT, OPENAI_CHAT, Endpoint
+from llm_refinery.core.http_safety import (
+    HttpOrigin,
+    PinnedHttpRoute,
+    environment_proxy_applies,
+    http_origin,
+    pinned_route_trust_env,
+    resolve_request_route,
+    validate_request_url,
+)
 from llm_refinery.providers.openai_chat import json_headers
+
+_MAX_REDIRECTS = 5
+_MAX_ERROR_RESPONSE_BYTES = 1_000_000
+_MAX_SUCCESS_RESPONSE_BYTES = 64_000_000
+_REDACTED = "[REDACTED]"
+_ROUTE_LOCK = threading.Lock()
+_ROUTE_UNSET = object()
+
+
+class _DeadlineWatchdog:
+    """Interrupt all response-body deadlines from one shared daemon thread."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._deadlines: list[tuple[float, int]] = []
+        self._callbacks: dict[int, Callable[[], None]] = {}
+        self._running: set[int] = set()
+        self._next_token = 0
+        self._thread: threading.Thread | None = None
+
+    def schedule(self, deadline: float, callback: Callable[[], None]) -> int:
+        with self._condition:
+            self._next_token += 1
+            token = self._next_token
+            self._callbacks[token] = callback
+            heapq.heappush(self._deadlines, (deadline, token))
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name="llm-refinery-http-deadlines",
+                    daemon=True,
+                )
+                self._thread.start()
+            self._condition.notify()
+            return token
+
+    def cancel(self, token: int) -> None:
+        with self._condition:
+            if self._callbacks.pop(token, None) is not None:
+                self._condition.notify()
+                return
+            while token in self._running:
+                self._condition.wait()
+            self._condition.notify()
+
+    def _run(self) -> None:
+        while True:
+            callback: Callable[[], None] | None = None
+            with self._condition:
+                while callback is None:
+                    while self._deadlines and self._deadlines[0][1] not in self._callbacks:
+                        heapq.heappop(self._deadlines)
+                    if not self._deadlines:
+                        self._condition.wait()
+                        continue
+                    deadline, token = self._deadlines[0]
+                    remaining = deadline - time.perf_counter()
+                    if remaining > 0:
+                        self._condition.wait(timeout=min(remaining, threading.TIMEOUT_MAX))
+                        continue
+                    heapq.heappop(self._deadlines)
+                    callback = self._callbacks.pop(token, None)
+                    if callback is not None:
+                        self._running.add(token)
+            if callback is not None:
+                try:
+                    with suppress(Exception):  # deadline cleanup is best effort
+                        callback()
+                finally:
+                    with self._condition:
+                        self._running.discard(token)
+                        self._condition.notify_all()
+
+
+_DEADLINE_WATCHDOG = _DeadlineWatchdog()
+
+
+class HttpClientPool:
+    """Lease one persistent client per concurrency slot for request-local cancellation."""
+
+    def __init__(self, trial: HttpLoadTrial) -> None:
+        self._trial = trial
+        self._route = _trial_route(trial)
+        self._clients = [
+            _new_http_client(trial, route=self._route) for _ in range(trial.concurrency)
+        ]
+        self._available: LifoQueue[httpx.Client] = LifoQueue()
+        self._clients_lock = threading.Lock()
+        for client in self._clients:
+            self._available.put(client)
+        self.is_closed = False
+
+    @contextmanager
+    def lease(self) -> Iterator[httpx.Client]:
+        client = self._available.get()
+        try:
+            yield client
+        finally:
+            if client.is_closed and not self.is_closed:
+                replacement = _new_http_client(self._trial, route=self._route)
+                with self._clients_lock:
+                    for index, owned_client in enumerate(self._clients):
+                        if owned_client is client:
+                            self._clients[index] = replacement
+                            break
+                    else:  # pragma: no cover - invariant guard
+                        replacement.close()
+                        raise RuntimeError("leased HTTP client is not owned by its pool")
+                client = replacement
+            self._available.put(client)
+
+    def close(self) -> None:
+        if self.is_closed:
+            return
+        self.is_closed = True
+        for client in self._clients:
+            client.close()
 
 
 def run_requests(
@@ -21,23 +155,56 @@ def run_requests(
     count: int,
     index_offset: int = 0,
     request_nonce: str | None = None,
+    client: httpx.Client | HttpClientPool | None = None,
 ) -> list[RequestResult]:
     """Run one request batch.
 
     A fresh nonce makes ``cache_mode=unique`` cold across repeated benchmark runs. Index offsets
     keep warmup prompts separate from measured prompts without changing stored sample IDs.
     """
+    # Validate configured credentials once before creating workers. Otherwise a
+    # missing key becomes one identical failed result per warmup/measured request.
+    headers_for_target(trial.target)
+    sensitive_values = _sensitive_header_values(
+        trial.target,
+        headers_for_target(trial.target),
+    )
     results: list[RequestResult] = []
     nonce = request_nonce or uuid.uuid4().hex
-    with ThreadPoolExecutor(max_workers=trial.concurrency) as executor:
+    client_context: AbstractContextManager[httpx.Client | HttpClientPool]
+    client_context = nullcontext(client) if client is not None else pooled_http_client(trial)
+    if isinstance(client, httpx.Client):
+        _reject_active_target_proxy(trial)
+        _prepare_client_route(
+            client,
+            trial.target.base_url,
+            require_resolution=False,
+            resolution_timeout_s=trial.scenario.timeout_s,
+        )
+    with (
+        client_context as active_client,
+        ThreadPoolExecutor(max_workers=trial.concurrency) as executor,
+    ):
+        # Hold the first worker wave until every slot has leased a distinct
+        # persistent client. In particular, this guarantees the runner's
+        # concurrency-sized warmup actually warms every measured connection.
+        first_wave = (
+            threading.Barrier(trial.concurrency)
+            if isinstance(active_client, HttpClientPool)
+            and trial.concurrency > 1
+            and count >= trial.concurrency
+            else None
+        )
         futures: dict[Any, tuple[int, float]] = {}
-        for request_index in range(index_offset, index_offset + count):
+        for batch_index, request_index in enumerate(range(index_offset, index_offset + count)):
             submitted_at = time.perf_counter()
             future = executor.submit(
-                execute_http_request,
+                _execute_with_client,
                 trial,
                 request_index,
                 request_nonce=nonce,
+                client=active_client,
+                start_barrier=first_wave if batch_index < trial.concurrency else None,
             )
             futures[future] = (request_index, submitted_at)
         for future in as_completed(futures):
@@ -51,14 +218,120 @@ def run_requests(
                         ok=False,
                         status_code=None,
                         latency_s=time.perf_counter() - submitted_at,
-                        error=f"{type(exc).__name__}: {exc}",
+                        error=_redact_text(
+                            f"{type(exc).__name__}: {exc}",
+                            sensitive_values,
+                        ),
                     )
                 )
     return sorted(results, key=lambda result: result.index)
 
 
+@contextmanager
+def pooled_http_client(trial: HttpLoadTrial) -> Iterator[HttpClientPool]:
+    """Own one persistent, independently cancellable client per worker slot."""
+    client = HttpClientPool(trial)
+    try:
+        yield client
+    finally:
+        client.close()
+
+
+@contextmanager
+def _owned_http_client(trial: HttpLoadTrial) -> Iterator[httpx.Client]:
+    client = _new_http_client(trial)
+    try:
+        yield client
+    finally:
+        client.close()
+
+
+def _trial_route(trial: HttpLoadTrial) -> PinnedHttpRoute | None:
+    _reject_active_target_proxy(trial)
+    if trial.transport.pinned_route is not None:
+        return trial.transport.pinned_route
+    return resolve_request_route(
+        trial.target.base_url,
+        require_resolution=True,
+        resolution_timeout_s=trial.scenario.timeout_s,
+    )
+
+
+def _reject_active_target_proxy(trial: HttpLoadTrial) -> None:
+    if trial.transport.trust_env and environment_proxy_applies(trial.target.base_url):
+        raise ConfigError(
+            "HTTP-load target requests cannot use an environment proxy; add the target "
+            "host to NO_PROXY or set transport.trust_env=false"
+        )
+
+
+def _new_http_client(
+    trial: HttpLoadTrial,
+    *,
+    route: PinnedHttpRoute | None | object = _ROUTE_UNSET,
+) -> httpx.Client:
+    if route is _ROUTE_UNSET:
+        route = _trial_route(trial)
+    assert route is None or isinstance(route, PinnedHttpRoute)
+    if route is not None:
+        route.request_url(trial.target.base_url)
+    validated_origin = http_origin(trial.target.base_url)
+    client_trust_env = pinned_route_trust_env(
+        trial.target.base_url,
+        trust_env=trial.transport.trust_env,
+        route_is_pinned=route is not None,
+    )
+    verify: bool | ssl.SSLContext = True
+    if trial.transport.ca_bundle is not None:
+        verify = ssl.create_default_context(cafile=str(trial.transport.ca_bundle))
+    elif trial.transport.trust_env and not client_trust_env:
+        verify = httpx.create_ssl_context(verify=True, trust_env=True)
+    client = httpx.Client(
+        limits=httpx.Limits(
+            max_connections=1,
+            max_keepalive_connections=1,
+            keepalive_expiry=None,
+        ),
+        follow_redirects=False,
+        trust_env=client_trust_env,
+        verify=verify,
+    )
+    client._llm_refinery_routes = {validated_origin: route}  # type: ignore[attr-defined]
+    return client
+
+
+def _execute_with_client(
+    trial: HttpLoadTrial,
+    index: int,
+    *,
+    request_nonce: str,
+    client: httpx.Client | HttpClientPool,
+    start_barrier: threading.Barrier | None = None,
+) -> RequestResult:
+    if isinstance(client, HttpClientPool):
+        with client.lease() as leased_client:
+            if start_barrier is not None:
+                start_barrier.wait()
+            return execute_http_request(
+                trial,
+                index,
+                request_nonce=request_nonce,
+                client=leased_client,
+            )
+    return execute_http_request(
+        trial,
+        index,
+        request_nonce=request_nonce,
+        client=client,
+    )
+
+
 def execute_http_request(
-    trial: HttpLoadTrial, index: int, *, request_nonce: str | None = None
+    trial: HttpLoadTrial,
+    index: int,
+    *,
+    request_nonce: str | None = None,
+    client: httpx.Client | None = None,
 ) -> RequestResult:
     executors = {
         OPENAI_CHAT: execute_openai_request,
@@ -67,11 +340,15 @@ def execute_http_request(
     executor = executors.get(trial.target.protocol)
     if executor is None:
         raise ValueError(f"unsupported chat protocol: {trial.target.protocol}")
-    return executor(trial, index, request_nonce=request_nonce)
+    return executor(trial, index, request_nonce=request_nonce, client=client)
 
 
 def execute_openai_request(
-    trial: HttpLoadTrial, index: int, *, request_nonce: str | None = None
+    trial: HttpLoadTrial,
+    index: int,
+    *,
+    request_nonce: str | None = None,
+    client: httpx.Client | None = None,
 ) -> RequestResult:
     scenario = trial.scenario
     payload: dict[str, Any] = {
@@ -93,11 +370,16 @@ def execute_openai_request(
         payload=payload,
         stream_reader=read_openai_stream if scenario.stream else None,
         body_reader=read_openai_body,
+        client=client,
     )
 
 
 def execute_ollama_request(
-    trial: HttpLoadTrial, index: int, *, request_nonce: str | None = None
+    trial: HttpLoadTrial,
+    index: int,
+    *,
+    request_nonce: str | None = None,
+    client: httpx.Client | None = None,
 ) -> RequestResult:
     scenario = trial.scenario
     options: dict[str, Any] = {
@@ -120,6 +402,7 @@ def execute_ollama_request(
         payload=payload,
         stream_reader=read_ollama_stream if scenario.stream else None,
         body_reader=read_ollama_body,
+        client=client,
     )
 
 
@@ -131,43 +414,279 @@ def post_json(
     payload: dict[str, Any],
     stream_reader: Any,
     body_reader: Any,
+    client: httpx.Client | None = None,
 ) -> RequestResult:
     start = time.perf_counter()
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers=headers_for_target(trial.target),
-        method="POST",
-    )
+    deadline = start + trial.scenario.timeout_s
+    deadline_expired = threading.Event()
+    request_headers = headers_for_target(trial.target)
+    sensitive_values = _sensitive_header_values(trial.target, request_headers)
+    client_context: AbstractContextManager[httpx.Client]
+    client_context = nullcontext(client) if client is not None else _owned_http_client(trial)
     try:
-        with urllib.request.urlopen(  # noqa: S310 - user-configured local/server URL
-            request,
-            timeout=trial.scenario.timeout_s,
-        ) as response:
-            status_code = response.status
+        with (
+            client_context as active_client,
+            _safe_stream(
+                active_client,
+                "POST",
+                url,
+                content=json.dumps(payload).encode("utf-8"),
+                headers=request_headers,
+                deadline=deadline,
+            ) as response,
+            _response_deadline(response, deadline, deadline_expired),
+        ):
+            status_code = response.status_code
+            if status_code >= 400:
+                body = _read_bounded_text(
+                    response,
+                    deadline=deadline,
+                    max_bytes=_MAX_ERROR_RESPONSE_BYTES,
+                )
+                body = _redact_text(body, sensitive_values)[-1000:]
+                return RequestResult(
+                    index=index,
+                    ok=False,
+                    status_code=status_code,
+                    latency_s=time.perf_counter() - start,
+                    error=f"HTTP {status_code}: {body}",
+                )
             if stream_reader is not None:
-                result = stream_reader(index, response, start, status_code)
+                result = stream_reader(
+                    index,
+                    _iter_bounded_lines(
+                        response,
+                        deadline=deadline,
+                        max_bytes=_MAX_SUCCESS_RESPONSE_BYTES,
+                    ),
+                    start,
+                    status_code,
+                )
             else:
-                body = response.read().decode("utf-8", errors="replace")
+                body = _read_bounded_text(
+                    response,
+                    deadline=deadline,
+                    max_bytes=_MAX_SUCCESS_RESPONSE_BYTES,
+                )
                 result = body_reader(index, body, start, status_code)
             return with_check_result(result, trial.scenario)
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")[-1000:]
-        return RequestResult(
-            index=index,
-            ok=False,
-            status_code=exc.code,
-            latency_s=time.perf_counter() - start,
-            error=f"HTTP {exc.code}: {body}",
-        )
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (httpx.HTTPError, TimeoutError, OSError) as exc:
+        error: Exception = exc
+        if deadline_expired.is_set() or time.perf_counter() > deadline:
+            error = TimeoutError("HTTP request exceeded its total timeout")
         return RequestResult(
             index=index,
             ok=False,
             status_code=None,
             latency_s=time.perf_counter() - start,
-            error=f"{type(exc).__name__}: {exc}",
+            error=_redact_text(f"{type(error).__name__}: {error}", sensitive_values),
         )
+
+
+@contextmanager
+def _safe_stream(
+    client: httpx.Client,
+    method: str,
+    url: str,
+    *,
+    deadline: float | None = None,
+    **kwargs: Any,
+) -> Iterator[httpx.Response]:
+    """Stream a request while permitting only same-origin, method-preserving redirects."""
+    expected_origin = http_origin(url)
+    route = _prepare_client_route(
+        client,
+        url,
+        require_resolution=False,
+        resolution_timeout_s=_remaining_timeout(deadline) if deadline is not None else None,
+    )
+    current_url = url
+    for _redirect_count in range(_MAX_REDIRECTS + 1):
+        if deadline is not None:
+            kwargs["timeout"] = _request_timeout(deadline)
+        validate_request_url(
+            current_url,
+            expected_origin=expected_origin,
+            resolve_addresses=False,
+        )
+        request_url = route.request_url(current_url) if route is not None else current_url
+        request_kwargs = dict(kwargs)
+        if route is not None:
+            request_kwargs["headers"] = route.request_headers(
+                dict(request_kwargs.get("headers") or {})
+            )
+            request_kwargs["extensions"] = {
+                **dict(request_kwargs.get("extensions") or {}),
+                "sni_hostname": route.sni_hostname,
+            }
+        header_token: int | None = None
+        if deadline is not None:
+            header_token = _DEADLINE_WATCHDOG.schedule(deadline, client.close)
+        try:
+            with client.stream(
+                method,
+                request_url,
+                follow_redirects=False,
+                **request_kwargs,
+            ) as response:
+                if header_token is not None:
+                    _DEADLINE_WATCHDOG.cancel(header_token)
+                    header_token = None
+                if deadline is not None:
+                    _check_deadline(deadline)
+                if response.has_redirect_location:
+                    if response.status_code not in {307, 308}:
+                        raise ConfigError(
+                            "HTTP load refuses redirects that can change the request method"
+                        )
+                    redirect_url = urljoin(current_url, response.headers["location"])
+                    validate_request_url(
+                        redirect_url,
+                        expected_origin=expected_origin,
+                        resolve_addresses=False,
+                    )
+                    current_url = redirect_url
+                    continue
+                if 300 <= response.status_code < 400:
+                    raise ConfigError("HTTP load received a redirect without a usable location")
+                yield response
+                return
+        finally:
+            if header_token is not None:
+                _DEADLINE_WATCHDOG.cancel(header_token)
+    raise ConfigError("HTTP load exceeded the maximum same-origin redirects")
+
+
+def _prepare_client_route(
+    client: httpx.Client,
+    url: str,
+    *,
+    require_resolution: bool,
+    resolution_timeout_s: float | None = None,
+) -> PinnedHttpRoute | None:
+    origin = http_origin(url)
+    with _ROUTE_LOCK:
+        routes: dict[HttpOrigin, PinnedHttpRoute | None] = getattr(
+            client,
+            "_llm_refinery_routes",
+            {},
+        )
+        if origin not in routes:
+            # Injected clients are primarily a testing seam. Pin when DNS is
+            # available while preserving MockTransport's offline semantics.
+            routes[origin] = resolve_request_route(
+                url,
+                require_resolution=require_resolution,
+                resolution_timeout_s=resolution_timeout_s,
+            )
+            client._llm_refinery_routes = routes  # type: ignore[attr-defined]
+        return routes[origin]
+
+
+def _remaining_timeout(deadline: float) -> float:
+    remaining = deadline - time.perf_counter()
+    if remaining <= 0:
+        raise TimeoutError("HTTP request exceeded its total timeout")
+    return remaining
+
+
+def _request_timeout(deadline: float) -> httpx.Timeout:
+    remaining = _remaining_timeout(deadline)
+    short_phase = min(5.0, remaining / 10)
+    read_phase = max(0.001, remaining - 3 * short_phase)
+    return httpx.Timeout(
+        connect=short_phase,
+        write=short_phase,
+        pool=short_phase,
+        read=read_phase,
+    )
+
+
+@contextmanager
+def _response_deadline(
+    response: httpx.Response,
+    deadline: float,
+    expired: threading.Event,
+) -> Iterator[None]:
+    """Close the live stream at the absolute deadline to interrupt a blocking read."""
+
+    def expire() -> None:
+        expired.set()
+        response.close()
+
+    _remaining_timeout(deadline)
+    token = _DEADLINE_WATCHDOG.schedule(deadline, expire)
+    try:
+        yield
+    finally:
+        _DEADLINE_WATCHDOG.cancel(token)
+
+
+def _check_deadline(deadline: float) -> None:
+    if time.perf_counter() > deadline:
+        raise TimeoutError("HTTP request exceeded its total timeout")
+
+
+def _read_bounded_text(
+    response: httpx.Response,
+    *,
+    deadline: float,
+    max_bytes: int,
+) -> str:
+    content = bytearray()
+    for chunk in response.iter_bytes():
+        _check_deadline(deadline)
+        if len(content) + len(chunk) > max_bytes:
+            raise ValueError(f"HTTP response exceeded {max_bytes} bytes")
+        content.extend(chunk)
+    _check_deadline(deadline)
+    return bytes(content).decode("utf-8", errors="replace")
+
+
+def _iter_bounded_lines(
+    response: httpx.Response,
+    *,
+    deadline: float,
+    max_bytes: int,
+) -> Iterator[str]:
+    observed_bytes = 0
+    pending = bytearray()
+    for chunk in response.iter_bytes():
+        _check_deadline(deadline)
+        observed_bytes += len(chunk)
+        if observed_bytes > max_bytes:
+            raise ValueError(f"HTTP response exceeded {max_bytes} bytes")
+        pending.extend(chunk)
+        while True:
+            newline = pending.find(b"\n")
+            if newline < 0:
+                break
+            raw_line = bytes(pending[:newline])
+            del pending[: newline + 1]
+            _check_deadline(deadline)
+            yield raw_line.decode("utf-8", errors="replace").rstrip("\r")
+    if pending:
+        _check_deadline(deadline)
+        yield bytes(pending).decode("utf-8", errors="replace").rstrip("\r")
+    _check_deadline(deadline)
+
+
+def _sensitive_header_values(target: Endpoint, headers: dict[str, str]) -> tuple[str, ...]:
+    values = {value for value in target.headers.values() if value}
+    for name, value in headers.items():
+        if name.casefold() in {"authorization", "proxy-authorization", "cookie", "set-cookie"}:
+            values.add(value)
+            scheme, separator, credential = value.partition(" ")
+            if separator and scheme.casefold() in {"bearer", "basic"} and credential:
+                values.add(credential)
+    return tuple(sorted(values, key=len, reverse=True))
+
+
+def _redact_text(value: str, sensitive_values: tuple[str, ...]) -> str:
+    redacted = value
+    for secret in sensitive_values:
+        redacted = redacted.replace(secret, _REDACTED)
+    return redacted
 
 
 def read_openai_stream(
@@ -185,7 +704,7 @@ def read_openai_stream(
     reasoning_ttft_s: float | None = None
     usage: dict[str, Any] | None = None
     for raw_line in response:
-        line = raw_line.decode("utf-8", errors="replace").strip()
+        line = _line_text(raw_line)
         if not line or not line.startswith("data:"):
             continue
         data = line.removeprefix("data:").strip()
@@ -288,7 +807,7 @@ def read_ollama_stream(
     reasoning_ttft_s: float | None = None
     final: dict[str, Any] = {}
     for raw_line in response:
-        line = raw_line.decode("utf-8", errors="replace").strip()
+        line = _line_text(raw_line)
         if not line:
             continue
         chunk = json.loads(line)
@@ -428,13 +947,19 @@ def _openai_choice_parts(choice: dict[str, Any]) -> tuple[str, str]:
     for mapping in (choice.get("delta"), choice.get("message"), choice):
         if not isinstance(mapping, dict):
             continue
-        for key in ("reasoning_content", "thinking"):
+        for key in ("reasoning", "reasoning_content", "thinking"):
             if mapping.get(key):
                 reasoning_parts.append(str(mapping[key]))
         for key in ("content", "text"):
             if mapping.get(key):
                 visible_parts.append(str(mapping[key]))
     return "".join(visible_parts), "".join(reasoning_parts)
+
+
+def _line_text(raw_line: object) -> str:
+    if isinstance(raw_line, bytes):
+        return raw_line.decode("utf-8", errors="replace").strip()
+    return str(raw_line).strip()
 
 
 def _interarrival_times(event_times_s: list[float]) -> tuple[float, ...]:

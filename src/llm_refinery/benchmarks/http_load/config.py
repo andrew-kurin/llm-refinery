@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -11,7 +13,9 @@ from llm_refinery.core.config import (
     reject_unknown_keys,
 )
 from llm_refinery.core.endpoints import CHAT_PROTOCOLS, Endpoint
+from llm_refinery.core.http_safety import PinnedHttpRoute
 from llm_refinery.core.runs import stable_hash
+from llm_refinery.utils.terminal import sanitize_terminal_text
 
 CACHE_MODES = {"shared", "unique"}
 RECOMMENDED_MEASURED_REQUESTS = 100
@@ -85,8 +89,11 @@ class HttpScenario:
             raise ConfigError(f"scenario {name!r} warmup_requests cannot be negative")
         if prompt_repeat <= 0:
             raise ConfigError(f"scenario {name!r} prompt_repeat must be positive")
-        if timeout_s <= 0:
-            raise ConfigError(f"scenario {name!r} timeout_s must be positive")
+        if not math.isfinite(timeout_s) or timeout_s <= 0 or timeout_s > threading.TIMEOUT_MAX:
+            raise ConfigError(
+                f"scenario {name!r} timeout_s must be positive and no greater than "
+                f"{threading.TIMEOUT_MAX:g} seconds"
+            )
         if cache_mode not in CACHE_MODES:
             choices = ", ".join(sorted(CACHE_MODES))
             raise ConfigError(f"scenario {name!r} cache_mode must be one of: {choices}")
@@ -158,18 +165,65 @@ class HttpScenario:
 
 
 @dataclass(frozen=True)
+class HttpTransportConfig:
+    """HTTP client environment and TLS settings shared by every trial."""
+
+    trust_env: bool = True
+    ca_bundle: Path | None = None
+    pinned_route: PinnedHttpRoute | None = None
+
+    @classmethod
+    def from_mapping(
+        cls,
+        raw: dict[str, Any] | None,
+        *,
+        base_dir: Path,
+    ) -> HttpTransportConfig:
+        if raw is None:
+            return cls()
+        if not isinstance(raw, dict):
+            raise ConfigError("HTTP-load transport must be a mapping")
+        reject_unknown_keys(raw, {"trust_env", "ca_bundle"}, context="HTTP-load transport")
+        trust_env = raw.get("trust_env", True)
+        if not isinstance(trust_env, bool):
+            raise ConfigError("HTTP-load transport.trust_env must be a boolean")
+        ca_bundle: Path | None = None
+        if "ca_bundle" in raw:
+            ca_bundle_raw = raw["ca_bundle"]
+            if not isinstance(ca_bundle_raw, str) or not ca_bundle_raw.strip():
+                raise ConfigError("HTTP-load transport.ca_bundle must be a non-empty path string")
+            ca_bundle = Path(ca_bundle_raw).expanduser()
+            if not ca_bundle.is_absolute():
+                ca_bundle = base_dir / ca_bundle
+            ca_bundle = ca_bundle.resolve()
+            if not ca_bundle.is_file():
+                raise ConfigError(f"HTTP-load transport.ca_bundle is not a file: {ca_bundle}")
+        return cls(trust_env=trust_env, ca_bundle=ca_bundle)
+
+    def safe_json(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "trust_env": self.trust_env,
+            "ca_bundle": str(self.ca_bundle) if self.ca_bundle else None,
+        }
+        if self.pinned_route is not None:
+            result["pinned_route"] = self.pinned_route.safe_json()
+        return result
+
+
+@dataclass(frozen=True)
 class HttpLoadConfig:
     name: str
     database: Path
     targets: list[Endpoint]
     scenarios: list[HttpScenario]
+    transport: HttpTransportConfig = HttpTransportConfig()
     source_path: Path | None = None
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any], source_path: Path | None = None) -> HttpLoadConfig:
         reject_unknown_keys(
             raw,
-            {"name", "database", "targets", "scenarios"},
+            {"name", "database", "targets", "scenarios", "transport"},
             context="HTTP-load configuration",
         )
         name = str(raw.get("name") or (source_path.stem if source_path else "http-load"))
@@ -194,6 +248,7 @@ class HttpLoadConfig:
             for item in targets_raw
         ]
         scenarios = [HttpScenario.from_mapping(item, base_dir=base_dir) for item in scenarios_raw]
+        transport = HttpTransportConfig.from_mapping(raw.get("transport"), base_dir=base_dir)
         _require_unique_names([target.name for target in targets], context="HTTP target")
         _require_unique_names([scenario.name for scenario in scenarios], context="HTTP scenario")
         return cls(
@@ -201,6 +256,7 @@ class HttpLoadConfig:
             database=Path(str(raw.get("database") or "results/llm_refinery.duckdb")),
             targets=targets,
             scenarios=scenarios,
+            transport=transport,
             source_path=source_path,
         )
 
@@ -212,6 +268,7 @@ class HttpLoadTrial:
     key: str
     target: Endpoint
     scenario: HttpScenario
+    transport: HttpTransportConfig
     concurrency: int
     max_tokens: int
 
@@ -238,6 +295,7 @@ class HttpLoadTrial:
             "model": {"name": self.target.model},
             "target": self.target.safe_json(),
             "scenario": self.scenario.safe_json(),
+            "transport": self.transport.safe_json(),
             "prompt_tokens": None,
             "gen_tokens": self.max_tokens,
             "params": {
@@ -296,6 +354,7 @@ def expand_http_load_trials(
                         "suite": config.name,
                         "target": target.safe_json(),
                         "scenario": scenario.safe_json(),
+                        "transport": config.transport.safe_json(),
                         "concurrency": concurrency,
                         "max_tokens": max_tokens,
                     }
@@ -317,6 +376,7 @@ def expand_http_load_trials(
                             key=key,
                             target=target,
                             scenario=scenario,
+                            transport=config.transport,
                             concurrency=concurrency,
                             max_tokens=max_tokens,
                         )
@@ -338,8 +398,8 @@ def print_http_load_plan(
     )
     trials = all_trials[:limit] if limit is not None else all_trials
     for index, trial in enumerate(trials):
-        print(f"# [{index}] {trial.name}")
-        print(trial.command_text)
+        print(sanitize_terminal_text(f"# [{index}] {trial.name}"))
+        print(sanitize_terminal_text(trial.command_text))
         print()
     print(f"planned {len(trials)} of {len(all_trials)} HTTP load trial(s)")
 

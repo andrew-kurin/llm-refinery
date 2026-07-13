@@ -1,0 +1,30 @@
+schema_version: 2
+name: dgx-spark-quality-smoke
+database: results/llm_refinery.duckdb
+
+# Referenced target and step input paths are resolved relative to this suite manifest.
+# The database and quality output_root remain relative to the invoking working directory.
+target: ../targets/dgx-spark-vllm.yaml
+
+quality:
+  enabled: true
+  # Use local-completions instead only when /v1/completions is served and a
+  # client-side tokenizer is required by the selected tasks.
+  model_backend: local-chat-completions
+  tasks: ifeval_pinned
+  limit: 10
+  max_length: 32768
+  include_path: ../evals/lm_eval_tasks
+  package_spec: lm-eval[api]==0.4.12
+  offline: false
+
+# The suite overlays its discovered endpoint/model onto the targets in this
+# scenario library. Enable only when load measurements are desired.
+http_load:
+  enabled: false
+  config: local-http-load-recommended.yaml
+
+preflight:
+  enabled: true
+  require_clean: false
+  sanity_check: true
