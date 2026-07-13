@@ -91,7 +91,6 @@ class BenchmarkSuiteWorkflow:
         with ResultStore(self.config.database) as store, RunSession(store, spec) as run:
             before_path = run.artifact("system_before", "system-before.txt", "text/plain")
             after_path = run.artifact("system_after", "system-after.txt", "text/plain")
-            preflight_path = run.artifact("preflight", "preflight.json", "application/json")
             discovery_path = None
             server_before_path = None
             server_after_path = None
@@ -181,6 +180,7 @@ class BenchmarkSuiteWorkflow:
                         )
                 self._run_context = run.run_context
                 preflight_result = self.preflight(before_snapshot)
+                preflight_path = run.artifact("preflight", "preflight.json", "application/json")
                 preflight_path.write_text(
                     json.dumps(preflight_result, indent=2, sort_keys=True) + "\n",
                     encoding="utf-8",

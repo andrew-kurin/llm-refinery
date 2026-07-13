@@ -5,7 +5,7 @@ import socket
 from dataclasses import dataclass
 from typing import TypeAlias
 from urllib.parse import urlparse, urlsplit, urlunsplit
-from urllib.request import getproxies, proxy_bypass
+from urllib.request import getproxies
 
 from llm_refinery.core.config import ConfigError
 
@@ -192,25 +192,123 @@ def resolve_request_route(
 
 
 def pinned_route_trust_env(url: str, *, trust_env: bool) -> bool:
-    """Return safe HTTPX ``trust_env`` behavior for an IP-pinned route.
+    """Return safe HTTPX ``trust_env`` behavior for a validated target.
 
-    HTTPX applies proxy and NO_PROXY matching to the rewritten connection IP,
-    not the logical hostname. Active proxying is therefore rejected: HTTPS
-    tunnels would also use the IP as TLS SNI. If the logical host is explicitly
-    bypassed, environment proxy mounts are disabled for the pinned client.
+    Explicit client-local targets are always direct so credentials cannot leave
+    the machine through an environment proxy. HTTPX applies proxy and NO_PROXY
+    matching to a rewritten pinned IP rather than the logical hostname, so
+    active proxying is also rejected for pinned targets. If the logical origin
+    is bypassed, environment mounts are disabled for the client.
     """
     if not trust_env:
         return False
-    scheme, hostname, _ = http_origin(url)
+    scheme, hostname, port = http_origin(url)
+    if _is_explicit_client_loopback_host(hostname):
+        return False
     proxies = getproxies()
     if not (proxies.get(scheme) or proxies.get("all")):
         return True
-    if not proxy_bypass(hostname):
+    if not _httpx_no_proxy_bypass(
+        scheme=scheme,
+        hostname=hostname,
+        port=port,
+        no_proxy=str(proxies.get("no") or ""),
+    ):
         raise ConfigError(
             "IP-pinned target endpoints cannot use an environment proxy; "
             "configure a direct connection with transport.trust_env=false"
         )
     return False
+
+
+def _httpx_no_proxy_bypass(
+    *,
+    scheme: str,
+    hostname: str,
+    port: int,
+    no_proxy: str,
+) -> bool:
+    """Match HTTPX's NO_PROXY host, domain, scheme, and port behavior.
+
+    ``urllib.request.proxy_bypass`` accepts only a host string on some
+    platforms and may apply different macOS SystemConfiguration rules. HTTPX
+    converts NO_PROXY entries to URL patterns instead, including an optional
+    port. Keep the safety decision aligned with those request-time patterns.
+    """
+    target_pattern_port = None if port == {"http": 80, "https": 443}.get(scheme) else port
+    for raw_pattern in no_proxy.split(","):
+        pattern = raw_pattern.strip()
+        if not pattern:
+            continue
+        if pattern == "*":
+            return True
+        if "://" in pattern:
+            raw_scheme = pattern.split("://", 1)[0]
+            parsed = urlsplit(pattern)
+            pattern_scheme = parsed.scheme.casefold()
+            if pattern_scheme not in {"all", scheme}:
+                continue
+            pattern_hostname = parsed.hostname
+            try:
+                pattern_port = parsed.port
+            except ValueError:
+                continue
+            if pattern_hostname is None:
+                continue
+            if (
+                raw_scheme in {"http", "https"}
+                and pattern_port == {"http": 80, "https": 443}.get(pattern_scheme)
+            ):
+                # HTTPX normalizes an explicitly written default port out of a
+                # URLPattern, making the pattern port-agnostic.
+                pattern_port = None
+        else:
+            pattern_hostname, pattern_port = _split_no_proxy_host_port(pattern)
+            # HTTPX treats bare IP addresses and the exact string "localhost"
+            # as exact patterns. Other bare entries receive a leading wildcard:
+            # "example.com" matches it and its subdomains, while ".example.com"
+            # matches subdomains only.
+            address_text = pattern.split("/", 1)[0]
+            if _explicit_ip_address(address_text) is not None:
+                pattern_hostname = address_text
+            elif pattern.casefold() != "localhost":
+                pattern_hostname = f"*{pattern_hostname}"
+
+        normalized_pattern = pattern_hostname.casefold().rstrip(".")
+        if pattern_port is not None and pattern_port != target_pattern_port:
+            continue
+        if _no_proxy_host_matches(hostname, normalized_pattern):
+            return True
+    return False
+
+
+def _split_no_proxy_host_port(pattern: str) -> tuple[str, int | None]:
+    if pattern.startswith("["):
+        parsed = urlsplit(f"//{pattern}")
+        try:
+            return parsed.hostname or pattern, parsed.port
+        except ValueError:
+            return pattern, None
+    if pattern.count(":") == 1:
+        host, separator, port_text = pattern.rpartition(":")
+        if separator and port_text.isdigit():
+            port = int(port_text)
+            if 0 < port <= 65535:
+                return host, port
+    return pattern, None
+
+
+def _no_proxy_host_matches(hostname: str, pattern: str) -> bool:
+    candidate_address = _explicit_ip_address(hostname)
+    pattern_address = _explicit_ip_address(pattern)
+    if pattern_address is not None:
+        return candidate_address == pattern_address
+    if pattern.startswith("*."):
+        return hostname.endswith(pattern[1:])
+    if pattern.startswith("*"):
+        normalized = pattern[1:]
+        return hostname == normalized or hostname.endswith(f".{normalized}")
+    return hostname == pattern
 
 
 def _route_address(address_info: tuple[object, ...]) -> str:

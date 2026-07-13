@@ -82,7 +82,7 @@ class _DeadlineWatchdog:
                     deadline, token = self._deadlines[0]
                     remaining = deadline - time.perf_counter()
                     if remaining > 0:
-                        self._condition.wait(timeout=remaining)
+                        self._condition.wait(timeout=min(remaining, threading.TIMEOUT_MAX))
                         continue
                     heapq.heappop(self._deadlines)
                     callback = self._callbacks.pop(token, None)
@@ -104,6 +104,7 @@ class HttpClientPool:
             _new_http_client(trial, route=self._route) for _ in range(trial.concurrency)
         ]
         self._available: LifoQueue[httpx.Client] = LifoQueue()
+        self._clients_lock = threading.Lock()
         for client in self._clients:
             self._available.put(client)
         self.is_closed = False
@@ -116,7 +117,14 @@ class HttpClientPool:
         finally:
             if client.is_closed and not self.is_closed:
                 replacement = _new_http_client(self._trial, route=self._route)
-                self._clients.append(replacement)
+                with self._clients_lock:
+                    for index, owned_client in enumerate(self._clients):
+                        if owned_client is client:
+                            self._clients[index] = replacement
+                            break
+                    else:  # pragma: no cover - invariant guard
+                        replacement.close()
+                        raise RuntimeError("leased HTTP client is not owned by its pool")
                 client = replacement
             self._available.put(client)
 
@@ -158,8 +166,18 @@ def run_requests(
         client_context as active_client,
         ThreadPoolExecutor(max_workers=trial.concurrency) as executor,
     ):
+        # Hold the first worker wave until every slot has leased a distinct
+        # persistent client. In particular, this guarantees the runner's
+        # concurrency-sized warmup actually warms every measured connection.
+        first_wave = (
+            threading.Barrier(trial.concurrency)
+            if isinstance(active_client, HttpClientPool)
+            and trial.concurrency > 1
+            and count >= trial.concurrency
+            else None
+        )
         futures: dict[Any, tuple[int, float]] = {}
-        for request_index in range(index_offset, index_offset + count):
+        for batch_index, request_index in enumerate(range(index_offset, index_offset + count)):
             submitted_at = time.perf_counter()
             future = executor.submit(
                 _execute_with_client,
@@ -167,6 +185,7 @@ def run_requests(
                 request_index,
                 request_nonce=nonce,
                 client=active_client,
+                start_barrier=first_wave if batch_index < trial.concurrency else None,
             )
             futures[future] = (request_index, submitted_at)
         for future in as_completed(futures):
@@ -226,13 +245,9 @@ def _new_http_client(
     if route is not None:
         route.request_url(trial.target.base_url)
     validated_origin = http_origin(trial.target.base_url)
-    client_trust_env = (
-        pinned_route_trust_env(
-            trial.target.base_url,
-            trust_env=trial.transport.trust_env,
-        )
-        if route is not None
-        else trial.transport.trust_env
+    client_trust_env = pinned_route_trust_env(
+        trial.target.base_url,
+        trust_env=trial.transport.trust_env,
     )
     verify: bool | ssl.SSLContext = True
     if trial.transport.ca_bundle is not None:
@@ -259,9 +274,12 @@ def _execute_with_client(
     *,
     request_nonce: str,
     client: httpx.Client | HttpClientPool,
+    start_barrier: threading.Barrier | None = None,
 ) -> RequestResult:
     if isinstance(client, HttpClientPool):
         with client.lease() as leased_client:
+            if start_barrier is not None:
+                start_barrier.wait()
             return execute_http_request(
                 trial,
                 index,

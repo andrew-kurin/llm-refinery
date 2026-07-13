@@ -66,11 +66,6 @@ def test_pinned_route_rejects_active_environment_proxy(monkeypatch):
         "llm_refinery.core.http_safety.getproxies",
         lambda: {"http": "http://proxy.test:3128"},
     )
-    monkeypatch.setattr(
-        "llm_refinery.core.http_safety.proxy_bypass",
-        lambda host: False,
-    )
-
     with pytest.raises(ConfigError, match="cannot use an environment proxy"):
         pinned_route_trust_env("http://dgx.local:8000/v1", trust_env=True)
 
@@ -78,14 +73,68 @@ def test_pinned_route_rejects_active_environment_proxy(monkeypatch):
 def test_pinned_route_disables_proxy_mounts_when_logical_host_is_bypassed(monkeypatch):
     monkeypatch.setattr(
         "llm_refinery.core.http_safety.getproxies",
-        lambda: {"http": "http://proxy.test:3128", "no": ".local"},
-    )
-    monkeypatch.setattr(
-        "llm_refinery.core.http_safety.proxy_bypass",
-        lambda host: host == "dgx.local",
+        lambda: {"http": "http://proxy.test:3128", "no": "dgx.local:8000"},
     )
 
     assert pinned_route_trust_env("http://dgx.local:8000/v1", trust_env=True) is False
+
+
+def test_pinned_route_no_proxy_port_must_match(monkeypatch):
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.getproxies",
+        lambda: {"http": "http://proxy.test:3128", "no": "dgx.local:9000"},
+    )
+
+    with pytest.raises(ConfigError, match="cannot use an environment proxy"):
+        pinned_route_trust_env("http://dgx.local:8000/v1", trust_env=True)
+
+
+def test_scheme_qualified_no_proxy_entry_matches_only_its_exact_host(monkeypatch):
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.getproxies",
+        lambda: {"http": "http://proxy.test:3128", "no": "http://dgx.local:8000"},
+    )
+
+    assert pinned_route_trust_env("http://dgx.local:8000/v1", trust_env=True) is False
+    with pytest.raises(ConfigError, match="cannot use an environment proxy"):
+        pinned_route_trust_env("http://other.dgx.local:8000/v1", trust_env=True)
+
+
+def test_scheme_qualified_no_proxy_default_port_matches_httpx_normalization(monkeypatch):
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.getproxies",
+        lambda: {"http": "http://proxy.test:3128", "no": "http://dgx.local:80"},
+    )
+
+    assert pinned_route_trust_env("http://dgx.local:8000/v1", trust_env=True) is False
+
+
+@pytest.mark.parametrize("no_proxy", ["all://dgx.local:80", "HTTP://DGX.LOCAL:80"])
+def test_no_proxy_patterns_retain_non_normalized_default_ports(monkeypatch, no_proxy):
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.getproxies",
+        lambda: {"http": "http://proxy.test:3128", "no": no_proxy},
+    )
+
+    with pytest.raises(ConfigError, match="cannot use an environment proxy"):
+        pinned_route_trust_env("http://dgx.local:80/v1", trust_env=True)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:8000/v1",
+        "http://127.0.0.1:8000/v1",
+        "http://[::1]:8000/v1",
+    ],
+)
+def test_explicit_loopback_targets_always_disable_environment_proxies(monkeypatch, url):
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.getproxies",
+        lambda: {"http": "http://proxy.test:3128"},
+    )
+
+    assert pinned_route_trust_env(url, trust_env=True) is False
 
 
 @pytest.mark.parametrize("port", ["", "0"])

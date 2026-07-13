@@ -1,10 +1,12 @@
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import httpx
 import pytest
 
 from llm_refinery.core.config import ConfigError
 from llm_refinery.core.http_safety import PinnedHttpRoute
+from llm_refinery.providers import openai_chat as openai_chat_module
 from llm_refinery.providers.openai_chat import (
     DEFAULT_USER_AGENT,
     json_headers,
@@ -119,6 +121,31 @@ def test_post_json_body_does_not_follow_a_credentialed_redirect():
         destination_thread.join(timeout=2)
 
     assert redirected_headers == []
+
+
+def test_post_json_body_forces_explicit_loopback_target_direct(monkeypatch):
+    captured = {}
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"{}", request=request)
+        )
+    )
+
+    def client_factory(**kwargs):
+        captured.update(kwargs)
+        return client
+
+    monkeypatch.setattr(openai_chat_module.httpx, "Client", client_factory)
+
+    body = post_json_body(
+        "http://127.0.0.1:8000/v1/chat/completions",
+        {"model": "test"},
+        headers={"Authorization": "Bearer local-secret"},
+        timeout_s=1,
+    )
+
+    assert body == "{}"
+    assert captured["trust_env"] is False
 
 
 def test_post_json_body_does_not_persist_untrusted_error_body():

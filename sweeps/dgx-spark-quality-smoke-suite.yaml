@@ -2,7 +2,8 @@ schema_version: 2
 name: dgx-spark-quality-smoke
 database: results/llm_refinery.duckdb
 
-# Paths are resolved relative to this suite manifest.
+# Referenced target and step input paths are resolved relative to this suite manifest.
+# The database and quality output_root remain relative to the invoking working directory.
 target: ../targets/dgx-spark-vllm.yaml
 
 quality:

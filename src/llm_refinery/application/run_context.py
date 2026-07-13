@@ -57,6 +57,10 @@ class RunContext:
         profile = profile if isinstance(profile, dict) else {}
         service = target.get("service") or {}
         service = service if isinstance(service, dict) else {}
+        route = target.get("route") or {}
+        route = route if isinstance(route, dict) else {}
+        logical_origin = route.get("logical_origin") or {}
+        logical_origin = logical_origin if isinstance(logical_origin, dict) else {}
         server_info = service.get("server_info")
         host_fingerprint = profile.get("host_fingerprint")
         host_identity = (
@@ -77,6 +81,17 @@ class RunContext:
                 "version": service.get("version"),
                 "server_info_hash": stable_hash(server_info) if server_info else None,
             },
+            "route": {
+                "logical_origin": {
+                    "scheme": logical_origin.get("scheme"),
+                    "hostname": logical_origin.get("hostname"),
+                    "port": logical_origin.get("port"),
+                },
+                "selected_address": route.get("selected_address"),
+                "authority": route.get("authority"),
+            }
+            if route
+            else None,
             "model": target.get("model"),
             "topology": target.get("topology"),
         }

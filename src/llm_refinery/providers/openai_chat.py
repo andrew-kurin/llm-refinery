@@ -175,9 +175,7 @@ def post_json_body(
     ca_bundle: Path | None = None,
     route: PinnedHttpRoute | None = None,
 ) -> str:
-    client_trust_env = (
-        pinned_route_trust_env(url, trust_env=trust_env) if route is not None else trust_env
-    )
+    client_trust_env = pinned_route_trust_env(url, trust_env=trust_env)
     try:
         context = httpx.create_ssl_context(
             verify=str(ca_bundle) if ca_bundle is not None else True,

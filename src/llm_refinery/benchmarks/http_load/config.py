@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -86,8 +88,15 @@ class HttpScenario:
             raise ConfigError(f"scenario {name!r} warmup_requests cannot be negative")
         if prompt_repeat <= 0:
             raise ConfigError(f"scenario {name!r} prompt_repeat must be positive")
-        if timeout_s <= 0:
-            raise ConfigError(f"scenario {name!r} timeout_s must be positive")
+        if (
+            not math.isfinite(timeout_s)
+            or timeout_s <= 0
+            or timeout_s > threading.TIMEOUT_MAX
+        ):
+            raise ConfigError(
+                f"scenario {name!r} timeout_s must be positive and no greater than "
+                f"{threading.TIMEOUT_MAX:g} seconds"
+            )
         if cache_mode not in CACHE_MODES:
             choices = ", ".join(sorted(CACHE_MODES))
             raise ConfigError(f"scenario {name!r} cache_mode must be one of: {choices}")

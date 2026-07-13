@@ -18,6 +18,8 @@ from llm_refinery.storage.duckdb import ResultStore, utc_now
 from llm_refinery.storage.models import RunRecord
 from llm_refinery.utils.system import get_system_profile, host_identity
 
+_PROVENANCE_KEY = "_llm_refinery_provenance"
+
 
 class RunSession:
     """Own the durable lifecycle and artifacts for one benchmark run."""
@@ -93,9 +95,13 @@ class RunSession:
                 target_json=context_target_json,
                 allow_unverified_executor=allow_unverified_executor,
             )
-            self.system_profile = dict(
-                provided_system_profile if recovered_executor else resume_state["system_json"]
-            )
+            if recovered_executor:
+                self.system_profile = _record_unverified_executor_recovery(
+                    current=provided_system_profile,
+                    original=resume_state["system_json"],
+                )
+            else:
+                self.system_profile = dict(resume_state["system_json"])
             self.target_json = dict(resume_state["target_json"])
         else:
             if provided_system_profile is not None:
@@ -310,3 +316,24 @@ class RunSession:
                 error=error,
             )
         )
+
+
+def _record_unverified_executor_recovery(
+    *, current: Mapping[str, Any], original: Mapping[str, Any]
+) -> dict[str, Any]:
+    recovered = dict(current)
+    existing = recovered.get(_PROVENANCE_KEY)
+    if isinstance(existing, Mapping):
+        provenance = dict(existing)
+    elif existing is None:
+        provenance = {}
+    else:
+        provenance = {"prior_profile_value": existing}
+    provenance["unverified_executor_recovery"] = {
+        "status": "unverified",
+        "reason": "stored_executor_identity_unknown",
+        "recorded_at": utc_now().isoformat(),
+        "original_system_json": dict(original),
+    }
+    recovered[_PROVENANCE_KEY] = provenance
+    return recovered

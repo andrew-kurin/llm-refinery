@@ -4,8 +4,10 @@ import json
 import socket
 import socketserver
 import subprocess
+import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +80,57 @@ def _target_mapping(
 
 def _spec(**kwargs: Any) -> TargetSpec:
     return TargetSpec.from_mapping(_target_mapping(**kwargs))
+
+
+class _MockOpenAIDiscoveryClient(OpenAIDiscoveryClient):
+    """Test-only client provider that preserves production ownership semantics."""
+
+    def __init__(
+        self,
+        handler: Callable[[httpx.Request], httpx.Response],
+        *,
+        timeout_s: float = 5.0,
+    ) -> None:
+        super().__init__(timeout_s=timeout_s)
+        self._handler = handler
+        self.created_clients: list[httpx.Client] = []
+
+    def _new_client(
+        self,
+        transport: TargetTransport,
+        *,
+        trust_env: bool | None = None,
+    ) -> httpx.Client:
+        del transport, trust_env
+        client = httpx.Client(transport=httpx.MockTransport(self._handler))
+        self.created_clients.append(client)
+        return client
+
+
+class _TrackingOpenAIDiscoveryClient(OpenAIDiscoveryClient):
+    """Exercise production client construction while retaining ownership evidence."""
+
+    def __init__(self, *, timeout_s: float = 5.0) -> None:
+        super().__init__(timeout_s=timeout_s)
+        self.created_clients: list[httpx.Client] = []
+
+    def _new_client(
+        self,
+        transport: TargetTransport,
+        *,
+        trust_env: bool | None = None,
+    ) -> httpx.Client:
+        client = super()._new_client(transport, trust_env=trust_env)
+        self.created_clients.append(client)
+        return client
+
+
+def _discovery_client(
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    timeout_s: float = 5.0,
+) -> _MockOpenAIDiscoveryClient:
+    return _MockOpenAIDiscoveryClient(handler, timeout_s=timeout_s)
 
 
 def _host(*, transport: str = "ssh") -> HostDiscovery:
@@ -482,6 +535,31 @@ def test_ssh_adapter_reports_timeout_and_rejects_oversized_output():
         OpenSSHClient(runner=oversized_runner).collect_host_profile(access)
 
 
+@pytest.mark.parametrize("output_fd", [1, 2])
+def test_ssh_adapter_bounds_streamed_stdout_and_stderr(
+    tmp_path: Path,
+    output_fd: int,
+):
+    fake_ssh = tmp_path / "fake-ssh"
+    fake_ssh.write_text(
+        f"""#!{sys.executable}
+import os
+
+chunk = b"x" * 65536
+remaining = {MAX_PROBE_OUTPUT_CHARS + 1}
+while remaining:
+    written = os.write({output_fd}, chunk[:remaining])
+    remaining -= written
+""",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+    access = HostAccess(access="ssh", destination="dgx", command_timeout_s=4)
+
+    with pytest.raises(RuntimeError, match="exceeded"):
+        OpenSSHClient(ssh_executable=str(fake_ssh)).collect_host_profile(access)
+
+
 def test_ssh_adapter_local_inventory_does_not_execute_probe(monkeypatch: pytest.MonkeyPatch):
     def runner(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         raise AssertionError("local inventory must not execute the SSH probe")
@@ -739,13 +817,12 @@ def test_openai_discovery_uses_api_auth_and_sanitizes_server_info(
         return httpx.Response(404)
 
     monkeypatch.setenv("VLLM_API_KEY", "top-secret-api-key")
-    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        discovery_client = OpenAIDiscoveryClient(client=client)
-        discovery = discovery_client.discover(
-            _spec(api_key_env="VLLM_API_KEY").endpoint,
-            DiscoveryPolicy(server_info="optional"),
-        )
-        metrics = discovery_client.metrics(_spec(api_key_env="VLLM_API_KEY").endpoint)
+    discovery_client = _discovery_client(handler)
+    discovery = discovery_client.discover(
+        _spec(api_key_env="VLLM_API_KEY").endpoint,
+        DiscoveryPolicy(server_info="optional"),
+    )
+    metrics = discovery_client.metrics(_spec(api_key_env="VLLM_API_KEY").endpoint)
 
     assert [request.url.path for request in requests] == [
         "/health",
@@ -811,6 +888,49 @@ def test_openai_discovery_applies_target_transport_to_owned_clients(
     }
 
 
+def test_openai_discovery_forces_owned_loopback_client_direct(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["client_kwargs"] = kwargs
+            self.is_closed = False
+
+        def close(self) -> None:
+            self.is_closed = True
+
+    def bounded_response(_client: Any, url: str, **kwargs: Any) -> httpx.Response:
+        del kwargs
+        request = httpx.Request("GET", url)
+        if request.url.path == "/health":
+            return httpx.Response(200, request=request)
+        if request.url.path == "/version":
+            return httpx.Response(200, json={"version": "test"}, request=request)
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "served"}]},
+                request=request,
+            )
+        return httpx.Response(404, request=request)
+
+    monkeypatch.setattr(openai_discovery_module.httpx, "Client", FakeClient)
+    monkeypatch.setattr(openai_discovery_module, "_get_bounded_response", bounded_response)
+    endpoint = EndpointSpec(
+        name="local",
+        protocol="openai_chat",
+        base_url="http://127.0.0.1:8000/v1",
+    )
+
+    discovery = OpenAIDiscoveryClient().discover(
+        endpoint,
+        DiscoveryPolicy(server_info="off"),
+    )
+
+    assert discovery.models[0].id == "served"
+    assert captured["client_kwargs"]["trust_env"] is False
+
+
 @pytest.mark.parametrize(
     "model",
     [
@@ -836,11 +956,8 @@ def test_openai_discovery_rejects_malformed_model_metadata(model: dict[str, Any]
             return httpx.Response(200, json={"version": "v"}, request=request)
         return httpx.Response(200, json={"data": [model]}, request=request)
 
-    with (
-        httpx.Client(transport=httpx.MockTransport(handler)) as client,
-        pytest.raises(ConfigError, match="model discovery returned an invalid response"),
-    ):
-        OpenAIDiscoveryClient(client=client).discover(
+    with pytest.raises(ConfigError, match="model discovery returned an invalid response"):
+        _discovery_client(handler).discover(
             _spec().endpoint,
             DiscoveryPolicy(server_info="off"),
         )
@@ -866,11 +983,8 @@ def test_openai_discovery_bounds_streams_before_buffering(monkeypatch: pytest.Mo
             return httpx.Response(200, stream=ModelStream())
         return httpx.Response(404)
 
-    with (
-        httpx.Client(transport=httpx.MockTransport(handler)) as client,
-        pytest.raises(ConfigError, match="model discovery.*response is too large"),
-    ):
-        OpenAIDiscoveryClient(client=client).discover(
+    with pytest.raises(ConfigError, match="model discovery.*response is too large"):
+        _discovery_client(handler).discover(
             _spec().endpoint, DiscoveryPolicy(server_info="off")
         )
 
@@ -897,13 +1011,12 @@ def test_offline_tolerance_does_not_suppress_oversized_health_response(
             request=request,
         )
 
-    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        resolver = TargetResolver(
-            ssh_client=_FakeSSH(),  # type: ignore[arg-type]
-            service_client=OpenAIDiscoveryClient(client=client),
-        )
-        with pytest.raises(ConfigError, match="health.*response is too large"):
-            resolver.inspect(_spec(), allow_service_unavailable=True)
+    resolver = TargetResolver(
+        ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+        service_client=_discovery_client(handler),
+    )
+    with pytest.raises(ConfigError, match="health.*response is too large"):
+        resolver.inspect(_spec(), allow_service_unavailable=True)
 
     assert health_body_read is False
 
@@ -919,15 +1032,11 @@ def test_openai_discovery_bounds_metrics_while_streaming(monkeypatch: pytest.Mon
                 chunks_read += 1
                 yield chunk
 
-    with (
-        httpx.Client(
-            transport=httpx.MockTransport(
-                lambda request: httpx.Response(200, stream=MetricsStream())
-            )
-        ) as client,
-        pytest.raises(RuntimeError, match="response is too large"),
-    ):
-        OpenAIDiscoveryClient(client=client).metrics(_spec().endpoint)
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=MetricsStream(), request=request)
+
+    with pytest.raises(RuntimeError, match="response is too large"):
+        _discovery_client(handler).metrics(_spec().endpoint)
 
     assert chunks_read == 2
 
@@ -940,15 +1049,69 @@ def test_openai_discovery_applies_total_stream_deadline(monkeypatch: pytest.Monk
         def __iter__(self):
             yield b"still arriving"
 
-    with (
-        httpx.Client(
-            transport=httpx.MockTransport(
-                lambda request: httpx.Response(200, stream=TricklingStream())
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=TricklingStream(), request=request)
+
+    with pytest.raises(RuntimeError, match="exceeded the total timeout"):
+        _discovery_client(handler, timeout_s=5.0).metrics(_spec().endpoint)
+
+
+def test_openai_discovery_owns_and_closes_test_clients():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, request=request)
+        if request.url.path == "/version":
+            return httpx.Response(200, json={"version": "test"}, request=request)
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "served"}]}, request=request)
+        return httpx.Response(404, request=request)
+
+    discovery_client = _discovery_client(handler)
+    discovery = discovery_client.discover(
+        _spec().endpoint,
+        DiscoveryPolicy(server_info="off"),
+    )
+
+    assert discovery.models[0].id == "served"
+    assert len(discovery_client.created_clients) == 1
+    assert all(client.is_closed for client in discovery_client.created_clients)
+
+
+def test_openai_discovery_replaces_owned_client_after_optional_endpoint_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, request=request)
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "served"}]},
+                request=request,
             )
-        ) as client,
-        pytest.raises(RuntimeError, match="exceeded the total timeout"),
-    ):
-        OpenAIDiscoveryClient(client=client, timeout_s=5.0).metrics(_spec().endpoint)
+        return httpx.Response(404, request=request)
+
+    original_request = openai_discovery_module._get_bounded_response
+
+    def bounded_response(client: httpx.Client, url: str, **kwargs: Any) -> httpx.Response:
+        if url.endswith("/version"):
+            client.close()
+            raise httpx.ReadTimeout(
+                "version timed out",
+                request=httpx.Request("GET", url),
+            )
+        return original_request(client, url, **kwargs)
+
+    monkeypatch.setattr(openai_discovery_module, "_get_bounded_response", bounded_response)
+    discovery_client = _discovery_client(handler)
+    discovery = discovery_client.discover(
+        _spec().endpoint,
+        DiscoveryPolicy(server_info="off"),
+    )
+
+    assert discovery.models[0].id == "served"
+    assert len(discovery_client.created_clients) == 2
+    assert all(client.is_closed for client in discovery_client.created_clients)
 
 
 def test_openai_discovery_interrupts_trickled_response_headers(monkeypatch):
@@ -989,15 +1152,55 @@ def test_openai_discovery_interrupts_trickled_response_headers(monkeypatch):
     assert time.perf_counter() - started < 1
 
 
+def test_openai_discovery_bounds_and_closes_factory_client(monkeypatch):
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        _REAL_GETADDRINFO,
+    )
+
+    class TrickleHandler(socketserver.BaseRequestHandler):
+        def handle(self):
+            self.request.recv(65536)
+            self.request.sendall(b"HTTP/1.1 200 OK\r\nX-Trickle: ")
+            for _ in range(100):
+                time.sleep(0.02)
+                try:
+                    self.request.sendall(b"x")
+                except OSError:
+                    return
+
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), TrickleHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    endpoint = EndpointSpec(
+        name="local",
+        protocol="openai_chat",
+        base_url=f"http://127.0.0.1:{server.server_address[1]}/v1",
+    )
+    started = time.perf_counter()
+    discovery_client = _TrackingOpenAIDiscoveryClient(timeout_s=0.08)
+    try:
+        with pytest.raises(RuntimeError, match="exceeded the total timeout"):
+            discovery_client.metrics(endpoint)
+        elapsed = time.perf_counter() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert elapsed < 1
+    assert len(discovery_client.created_clients) == 1
+    assert discovery_client.created_clients[0].is_closed is True
+
+
 def test_openai_discovery_requires_configured_api_key(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_API_KEY", raising=False)
-    with (
-        httpx.Client(
-            transport=httpx.MockTransport(lambda request: pytest.fail("must not send request"))
-        ) as client,
-        pytest.raises(ConfigError, match="VLLM_API_KEY"),
-    ):
-        OpenAIDiscoveryClient(client=client).discover(
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"must not send request: {request.url}")
+
+    with pytest.raises(ConfigError, match="VLLM_API_KEY"):
+        _discovery_client(handler).discover(
             _spec(api_key_env="VLLM_API_KEY").endpoint,
             DiscoveryPolicy(),
         )
@@ -1024,13 +1227,12 @@ def test_invalid_authorization_never_reaches_transport_or_error_text(
         headers=headers,
         api_key_env=api_key_env,
     )
-    with (
-        httpx.Client(
-            transport=httpx.MockTransport(lambda request: pytest.fail("must not send request"))
-        ) as client,
-        pytest.raises(ConfigError) as caught,
-    ):
-        OpenAIDiscoveryClient(client=client).discover(endpoint, DiscoveryPolicy())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"must not send request: {request.url}")
+
+    with pytest.raises(ConfigError) as caught:
+        _discovery_client(handler).discover(endpoint, DiscoveryPolicy())
 
     assert "super-secret" not in str(caught.value)
     assert "Injected" not in str(caught.value)
@@ -1040,18 +1242,19 @@ def test_offline_tolerance_does_not_suppress_missing_api_key_config(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.delenv("VLLM_API_KEY", raising=False)
-    with httpx.Client(
-        transport=httpx.MockTransport(lambda request: pytest.fail("must not send request"))
-    ) as client:
-        resolver = TargetResolver(
-            ssh_client=_FakeSSH(),  # type: ignore[arg-type]
-            service_client=OpenAIDiscoveryClient(client=client),
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"must not send request: {request.url}")
+
+    resolver = TargetResolver(
+        ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+        service_client=_discovery_client(handler),
+    )
+    with pytest.raises(ConfigError, match="VLLM_API_KEY"):
+        resolver.inspect(
+            _spec(api_key_env="VLLM_API_KEY"),
+            allow_service_unavailable=True,
         )
-        with pytest.raises(ConfigError, match="VLLM_API_KEY"):
-            resolver.inspect(
-                _spec(api_key_env="VLLM_API_KEY"),
-                allow_service_unavailable=True,
-            )
 
 
 @pytest.mark.parametrize("unauthorized_path", ["/health", "/v1/models"])
@@ -1067,13 +1270,12 @@ def test_offline_tolerance_does_not_suppress_discovery_authorization_failures(
             return httpx.Response(200, json={"version": "0.10.0"}, request=request)
         return httpx.Response(404, request=request)
 
-    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        resolver = TargetResolver(
-            ssh_client=_FakeSSH(),  # type: ignore[arg-type]
-            service_client=OpenAIDiscoveryClient(client=client),
-        )
-        with pytest.raises(ConfigError, match="authorization failed with HTTP 401"):
-            resolver.inspect(_spec(), allow_service_unavailable=True)
+    resolver = TargetResolver(
+        ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+        service_client=_discovery_client(handler),
+    )
+    with pytest.raises(ConfigError, match="authorization failed with HTTP 401"):
+        resolver.inspect(_spec(), allow_service_unavailable=True)
 
 
 def test_optional_server_info_authorization_failure_remains_a_warning():
@@ -1090,12 +1292,11 @@ def test_optional_server_info_authorization_failure_remains_a_warning():
             )
         return httpx.Response(403, request=request)
 
-    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        resolver = TargetResolver(
-            ssh_client=_FakeSSH(),  # type: ignore[arg-type]
-            service_client=OpenAIDiscoveryClient(client=client),
-        )
-        inspection = resolver.inspect(_spec())
+    resolver = TargetResolver(
+        ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+        service_client=_discovery_client(handler),
+    )
+    inspection = resolver.inspect(_spec())
 
     assert inspection.available is True
     assert "server_info: HTTP 403" in inspection.errors
@@ -1108,13 +1309,12 @@ def test_offline_tolerance_does_not_suppress_reachable_wrong_http_service():
         requests.append(request)
         return httpx.Response(404, request=request)
 
-    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        resolver = TargetResolver(
-            ssh_client=_FakeSSH(),  # type: ignore[arg-type]
-            service_client=OpenAIDiscoveryClient(client=client),
-        )
-        with pytest.raises(ConfigError, match="health failed with HTTP 404"):
-            resolver.inspect(_spec(), allow_service_unavailable=True)
+    resolver = TargetResolver(
+        ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+        service_client=_discovery_client(handler),
+    )
+    with pytest.raises(ConfigError, match="health failed with HTTP 404"):
+        resolver.inspect(_spec(), allow_service_unavailable=True)
 
     assert [request.url.path for request in requests] == ["/health"]
 
@@ -1136,11 +1336,8 @@ def test_discovery_rejects_cross_origin_redirect_before_following_it(
             request=request,
         )
 
-    with (
-        httpx.Client(transport=httpx.MockTransport(handler)) as client,
-        pytest.raises(ConfigError, match="remain on the configured.*origin"),
-    ):
-        OpenAIDiscoveryClient(client=client).discover(
+    with pytest.raises(ConfigError, match="remain on the configured.*origin"):
+        _discovery_client(handler).discover(
             _spec().endpoint, DiscoveryPolicy(server_info="off")
         )
 
@@ -1154,15 +1351,15 @@ def test_discovery_rejects_dns_name_that_resolves_to_client_loopback(
         "llm_refinery.core.http_safety.socket.getaddrinfo",
         lambda host, port, **kwargs: [(2, 1, 6, "", ("127.0.0.1", port))],
     )
-    with httpx.Client(
-        transport=httpx.MockTransport(lambda request: pytest.fail("must not send request"))
-    ) as client:
-        resolver = TargetResolver(
-            ssh_client=_FakeSSH(),  # type: ignore[arg-type]
-            service_client=OpenAIDiscoveryClient(client=client),
-        )
-        with pytest.raises(ConfigError, match="client-local"):
-            resolver.inspect(_spec(), allow_service_unavailable=True)
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"must not send request: {request.url}")
+
+    resolver = TargetResolver(
+        ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+        service_client=_discovery_client(handler),
+    )
+    with pytest.raises(ConfigError, match="client-local"):
+        resolver.inspect(_spec(), allow_service_unavailable=True)
 
 
 def test_discovery_requires_ssh_endpoint_hostname_to_resolve(
@@ -1222,12 +1419,11 @@ def test_discovery_allows_dgx_local_name_that_resolves_to_lan_address(
             )
         return httpx.Response(404, request=request)
 
-    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        resolver = TargetResolver(
-            ssh_client=_FakeSSH(),  # type: ignore[arg-type]
-            service_client=OpenAIDiscoveryClient(client=client),
-        )
-        inspection = resolver.inspect(_spec())
+    resolver = TargetResolver(
+        ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+        service_client=_discovery_client(handler),
+    )
+    inspection = resolver.inspect(_spec())
 
     assert inspection.service is not None
     assert inspection.service.health == "ok"
@@ -1253,11 +1449,10 @@ def test_openai_discovery_preserves_explicit_auth_and_short_circuits_offline_hos
         api_key_env="MISSING_API_KEY",
         headers={"authorization": "Static credential"},
     )
-    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        discovery = OpenAIDiscoveryClient(client=client).discover(
-            endpoint,
-            DiscoveryPolicy(),
-        )
+    discovery = _discovery_client(handler).discover(
+        endpoint,
+        DiscoveryPolicy(),
+    )
 
     assert len(requests) == 1
     assert requests[0].url.path == "/health"
@@ -1270,12 +1465,11 @@ def test_offline_tolerance_accepts_connection_reset_read_error():
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadError("connection reset", request=request)
 
-    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        resolver = TargetResolver(
-            ssh_client=_FakeSSH(),  # type: ignore[arg-type]
-            service_client=OpenAIDiscoveryClient(client=client),
-        )
-        inspection = resolver.inspect(_spec(), allow_service_unavailable=True)
+    resolver = TargetResolver(
+        ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+        service_client=_discovery_client(handler),
+    )
+    inspection = resolver.inspect(_spec(), allow_service_unavailable=True)
 
     assert inspection.available is False
     assert inspection.errors == ("health: connection reset",)
@@ -1298,13 +1492,12 @@ def test_offline_tolerance_does_not_suppress_fatal_transport_errors(
         error.request = request
         raise error
 
-    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        resolver = TargetResolver(
-            ssh_client=_FakeSSH(),  # type: ignore[arg-type]
-            service_client=OpenAIDiscoveryClient(client=client),
-        )
-        with pytest.raises(ConfigError, match=message):
-            resolver.inspect(_spec(), allow_service_unavailable=True)
+    resolver = TargetResolver(
+        ssh_client=_FakeSSH(),  # type: ignore[arg-type]
+        service_client=_discovery_client(handler),
+    )
+    with pytest.raises(ConfigError, match=message):
+        resolver.inspect(_spec(), allow_service_unavailable=True)
 
 
 def test_resolver_can_return_inventory_when_service_is_unavailable():

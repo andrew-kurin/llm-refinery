@@ -69,10 +69,8 @@ class OpenAIDiscoveryClient:
     def __init__(
         self,
         *,
-        client: httpx.Client | None = None,
         timeout_s: float = 5.0,
     ) -> None:
-        self._client = client
         self._timeout_s = timeout_s
 
     def discover(
@@ -88,19 +86,24 @@ class OpenAIDiscoveryClient:
         errors: list[str] = []
         headers = _headers(endpoint)
         effective_transport = transport or TargetTransport()
-        client_trust_env = (
-            pinned_route_trust_env(
-                endpoint.base_url,
-                trust_env=effective_transport.trust_env,
-            )
-            if route is not None
-            else effective_transport.trust_env
+        client_trust_env = pinned_route_trust_env(
+            endpoint.base_url,
+            trust_env=effective_transport.trust_env,
         )
-        owns_client = self._client is None
-        client = self._client or self._new_client(
+        client = self._new_client(
             effective_transport,
             trust_env=client_trust_env,
         )
+
+        def active_client() -> httpx.Client:
+            nonlocal client
+            if client.is_closed:
+                client = self._new_client(
+                    effective_transport,
+                    trust_env=client_trust_env,
+                )
+            return client
+
         health = "unavailable"
         version: str | None = None
         models: tuple[ModelDescriptor, ...] = ()
@@ -109,7 +112,7 @@ class OpenAIDiscoveryClient:
         try:
             try:
                 _get_bounded_response(
-                    client,
+                    active_client(),
                     f"{endpoint.server_root_url}/health",
                     headers=headers,
                     timeout_s=self._timeout_s,
@@ -124,7 +127,7 @@ class OpenAIDiscoveryClient:
             if not health_transport_failed:
                 try:
                     response = _get_bounded_response(
-                        client,
+                        active_client(),
                         f"{endpoint.server_root_url}/version",
                         headers=headers,
                         timeout_s=self._timeout_s,
@@ -141,7 +144,7 @@ class OpenAIDiscoveryClient:
 
                 try:
                     response = _get_bounded_response(
-                        client,
+                        active_client(),
                         _models_url(endpoint),
                         headers=headers,
                         timeout_s=self._timeout_s,
@@ -155,7 +158,7 @@ class OpenAIDiscoveryClient:
                 if policy.server_info != SERVER_INFO_OFF:
                     try:
                         response = _get_bounded_response(
-                            client,
+                            active_client(),
                             f"{endpoint.server_root_url}/server_info",
                             params={"config_format": "json"},
                             headers=headers,
@@ -167,8 +170,7 @@ class OpenAIDiscoveryClient:
                         _raise_fatal_transport_error(exc, operation="server_info discovery")
                         errors.append(f"server_info: {_error_text(exc)}")
         finally:
-            if owns_client:
-                client.close()
+            client.close()
 
         return ServiceDiscovery(
             implementation="vllm",
@@ -190,16 +192,11 @@ class OpenAIDiscoveryClient:
         """Read the Prometheus snapshot without changing server state."""
         headers = _headers(endpoint)
         effective_transport = transport or TargetTransport()
-        client_trust_env = (
-            pinned_route_trust_env(
-                endpoint.base_url,
-                trust_env=effective_transport.trust_env,
-            )
-            if route is not None
-            else effective_transport.trust_env
+        client_trust_env = pinned_route_trust_env(
+            endpoint.base_url,
+            trust_env=effective_transport.trust_env,
         )
-        owns_client = self._client is None
-        client = self._client or self._new_client(
+        client = self._new_client(
             effective_transport,
             trust_env=client_trust_env,
         )
@@ -216,8 +213,7 @@ class OpenAIDiscoveryClient:
             _raise_fatal_transport_error(exc, operation="metrics discovery")
             raise RuntimeError(f"could not read vLLM metrics: {_error_text(exc)}") from exc
         finally:
-            if owns_client:
-                client.close()
+            client.close()
 
     def _new_client(
         self,

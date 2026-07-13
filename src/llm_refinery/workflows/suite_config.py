@@ -27,6 +27,16 @@ def _schema_version(value: Any) -> int:
     return value
 
 
+def _strict_integer(value: Any, *, context: str, minimum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        qualifier = "positive" if minimum == 1 else "non-negative"
+        raise ConfigError(f"{context} must be a {qualifier} integer")
+    if value < minimum:
+        qualifier = "positive" if minimum == 1 else "non-negative"
+        raise ConfigError(f"{context} must be a {qualifier} integer")
+    return value
+
+
 @dataclass(frozen=True)
 class QualityStep:
     enabled: bool = True
@@ -49,10 +59,15 @@ class QualityStep:
     ca_bundle: Path | None = None
 
     def __post_init__(self) -> None:
-        if self.limit is not None and self.limit <= 0:
-            raise ConfigError("suite quality.limit must be positive or None")
-        if self.max_length <= 0:
-            raise ConfigError("suite quality.max_length must be positive")
+        if self.limit is not None:
+            _strict_integer(self.limit, context="suite quality.limit", minimum=1)
+        if self.num_fewshot is not None:
+            _strict_integer(
+                self.num_fewshot,
+                context="suite quality.num_fewshot",
+                minimum=0,
+            )
+        _strict_integer(self.max_length, context="suite quality.max_length", minimum=1)
         if not self.package_spec.strip():
             raise ConfigError("suite quality.package_spec cannot be empty")
         if any(not package.strip() for package in self.extra_packages):
@@ -93,12 +108,29 @@ class QualityStep:
             context="suite quality step",
         )
         limit_raw = raw.get("limit", 50)
-        limit = None if limit_raw is None or str(limit_raw).lower() == "all" else int(limit_raw)
-        if limit is not None and limit <= 0:
-            raise ConfigError("suite quality.limit must be a positive integer or 'all'")
-        max_length = int(raw.get("max_length", 8192))
-        if max_length <= 0:
-            raise ConfigError("suite quality.max_length must be positive")
+        if limit_raw is None or (isinstance(limit_raw, str) and limit_raw.lower() == "all"):
+            limit = None
+        else:
+            limit = _strict_integer(
+                limit_raw,
+                context="suite quality.limit",
+                minimum=1,
+            )
+        max_length = _strict_integer(
+            raw.get("max_length", 8192),
+            context="suite quality.max_length",
+            minimum=1,
+        )
+        num_fewshot_raw = raw.get("num_fewshot")
+        num_fewshot = (
+            _strict_integer(
+                num_fewshot_raw,
+                context="suite quality.num_fewshot",
+                minimum=0,
+            )
+            if num_fewshot_raw is not None
+            else None
+        )
         include_path = Path(str(raw["include_path"])) if raw.get("include_path") else None
         if include_path is not None and source_path is not None and not include_path.is_absolute():
             include_path = source_path.parent / include_path
@@ -107,9 +139,11 @@ class QualityStep:
             not isinstance(ca_bundle_raw, str) or not ca_bundle_raw.strip()
         ):
             raise ConfigError("suite quality.ca_bundle must be a non-empty path string")
-        ca_bundle = Path(ca_bundle_raw) if ca_bundle_raw is not None else None
+        ca_bundle = Path(ca_bundle_raw).expanduser() if ca_bundle_raw is not None else None
         if ca_bundle is not None and source_path is not None and not ca_bundle.is_absolute():
             ca_bundle = source_path.parent / ca_bundle
+        if ca_bundle is not None:
+            ca_bundle = ca_bundle.resolve()
         if ca_bundle is not None and not ca_bundle.is_file():
             raise ConfigError(f"suite quality.ca_bundle is not a file: {ca_bundle}")
         metadata_raw = raw.get("metadata")
@@ -124,7 +158,7 @@ class QualityStep:
             enabled=_strict_bool(raw.get("enabled", True), context="suite quality.enabled"),
             tasks=str(raw.get("tasks") or "ifeval,gsm8k"),
             limit=limit,
-            num_fewshot=int(raw["num_fewshot"]) if raw.get("num_fewshot") is not None else None,
+            num_fewshot=num_fewshot,
             max_length=max_length,
             eos_string=str(raw["eos_string"]) if raw.get("eos_string") else None,
             tokenizer=str(raw["tokenizer"]) if raw.get("tokenizer") else None,

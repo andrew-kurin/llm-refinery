@@ -256,7 +256,75 @@ def test_suite_quality_resolves_ca_bundle_relative_to_manifest(tmp_path: Path):
     )
 
     assert config.quality.trust_env is True
-    assert config.quality.ca_bundle == ca_bundle
+    assert config.quality.ca_bundle == ca_bundle.resolve()
+
+
+def test_suite_quality_expands_home_in_ca_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "home"
+    ca_bundle = home / ".config" / "private-ca.pem"
+    ca_bundle.parent.mkdir(parents=True)
+    ca_bundle.write_text("test CA", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+
+    config = SuiteConfig.from_mapping(
+        {
+            "endpoint": {
+                "name": "local",
+                "protocol": "openai_chat",
+                "base_url": "https://model.local/v1",
+                "model": "model",
+            },
+            "quality": {"ca_bundle": "~/.config/private-ca.pem"},
+        },
+        source_path=tmp_path / "manifests" / "suite.yaml",
+    )
+
+    assert config.quality.ca_bundle == ca_bundle.resolve()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("limit", True),
+        ("limit", 1.9),
+        ("limit", "2"),
+        ("max_length", False),
+        ("max_length", 8192.9),
+        ("max_length", "8192"),
+        ("num_fewshot", True),
+        ("num_fewshot", 1.5),
+        ("num_fewshot", "1"),
+    ],
+)
+def test_suite_quality_rejects_non_integer_numeric_fields(field: str, value: object):
+    raw = {
+        "endpoint": {
+            "name": "local",
+            "protocol": "openai_chat",
+            "base_url": "http://127.0.0.1:8080/v1",
+            "model": "model",
+        },
+        "quality": {field: value},
+    }
+
+    with pytest.raises(ConfigError, match=rf"quality\.{field} must be"):
+        SuiteConfig.from_mapping(raw)
+
+
+def test_suite_quality_accepts_zero_fewshot():
+    config = SuiteConfig.from_mapping(
+        {
+            "endpoint": {
+                "name": "local",
+                "protocol": "openai_chat",
+                "base_url": "http://127.0.0.1:8080/v1",
+                "model": "model",
+            },
+            "quality": {"num_fewshot": 0},
+        }
+    )
+
+    assert config.quality.num_fewshot == 0
 
 
 def test_suite_can_require_the_response_model_identity(tmp_path: Path):
@@ -564,6 +632,11 @@ def test_remote_suite_preflight_defaults_to_discovered_model_identity(tmp_path: 
     with pytest.raises(RuntimeError, match="served-model"):
         workflow.execute()
 
+    with ResultStore(config.database) as store:
+        run = store.comparison_runs(include_failed=True)[0]
+    assert "preflight" not in run["artifacts"]
+    assert not (config.database.parent / "artifacts" / run["run_id"] / "preflight.json").exists()
+
 
 def test_remote_suite_preflight_inherits_target_transport(monkeypatch, tmp_path: Path):
     spec, inspection = _resolved_dgx_target()
@@ -677,6 +750,7 @@ def test_remote_suite_persists_unavailable_discovery_and_starts_no_children(tmp_
     assert "connection refused" in run["target_json"]["errors"]
     assert "connection refused" in run["error"]
     assert "local telemetry failed" not in run["error"]
+    assert "preflight" not in run["artifacts"]
 
 
 def test_remote_suite_persists_discovery_exception_before_failing(tmp_path: Path):
@@ -718,6 +792,7 @@ def test_remote_suite_persists_discovery_exception_before_failing(tmp_path: Path
     assert "inventory response was malformed" in run["target_json"]["errors"][0]
     assert "inventory response was malformed" in discovery_path.read_text()
     assert '"hostname": "spark"' in server_before_path.read_text()
+    assert "preflight" not in run["artifacts"]
 
 
 def test_target_limit_validation_only_checks_selected_http_scenarios(tmp_path: Path):

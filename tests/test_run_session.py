@@ -280,8 +280,20 @@ def test_legacy_resume_requires_explicit_recovery_and_rebinds_executor(tmp_path:
             system_profile=recovered_profile,
             allow_unverified_executor=True,
         ) as resumed:
-            assert resumed.system_profile == recovered_profile
+            assert resumed.system_profile["host_fingerprint"] == "mac-one"
+            recovery = resumed.system_profile["_llm_refinery_provenance"][
+                "unverified_executor_recovery"
+            ]
+            assert recovery["status"] == "unverified"
+            assert recovery["reason"] == "stored_executor_identity_unknown"
+            assert recovery["recorded_at"]
+            assert recovery["original_system_json"] == {"capture_error": "legacy inventory failure"}
             resumed.complete(status="failed", error="retry again")
+
+        stored = store.comparison_runs(include_failed=True)[0]
+        assert stored["system_json"]["_llm_refinery_provenance"]["unverified_executor_recovery"][
+            "original_system_json"
+        ] == {"capture_error": "legacy inventory failure"}
 
         with pytest.raises(RuntimeError, match="resume executor host"):
             RunSession(
@@ -355,6 +367,15 @@ def test_run_context_target_identity_excludes_volatile_observations():
             "health": "ok",
             "server_info": {"dtype": "bfloat16"},
         },
+        "route": {
+            "logical_origin": {
+                "scheme": "http",
+                "hostname": "spark.local",
+                "port": 8000,
+            },
+            "selected_address": "192.168.1.41",
+            "authority": "spark.local:8000",
+        },
         "model": {"id": "served", "root": "org/model"},
         "topology": {"measurement_scope": "remote_lan_end_to_end"},
         "errors": [],
@@ -375,6 +396,15 @@ def test_run_context_target_identity_excludes_volatile_observations():
         == RunContext(target_json=changed_observation).target_identity_json()
     )
 
+    changed_route = {
+        **base,
+        "route": {**base["route"], "selected_address": "192.168.1.42"},
+    }
+    assert (
+        RunContext(target_json=base).target_identity_json()
+        != RunContext(target_json=changed_route).target_identity_json()
+    )
+
 
 def test_resume_rejects_changed_executor_or_target_provenance(tmp_path: Path):
     database = tmp_path / "runs.duckdb"
@@ -392,6 +422,15 @@ def test_resume_rejects_changed_executor_or_target_provenance(tmp_path: Path):
             "host": {
                 "destination": "dgx",
                 "profile": {"host_fingerprint": "spark-one"},
+            },
+            "route": {
+                "logical_origin": {
+                    "scheme": "http",
+                    "hostname": "spark.local",
+                    "port": 8000,
+                },
+                "selected_address": "192.168.1.41",
+                "authority": "spark.local:8000",
             },
             "model": {"id": "model-one"},
         },
@@ -429,5 +468,18 @@ def test_resume_rejects_changed_executor_or_target_provenance(tmp_path: Path):
                         },
                         "model": {"id": "model-two"},
                     },
+                ),
+            )
+
+        changed_route = original.to_target_json()
+        changed_route["route"]["selected_address"] = "192.168.1.42"
+        with pytest.raises(RuntimeError, match="target identity"):
+            RunSession(
+                store,
+                spec,
+                resume_run_id=run.run_id,
+                run_context=RunContext(
+                    executor_system_json=original.executor_system_json,
+                    target_json=changed_route,
                 ),
             )

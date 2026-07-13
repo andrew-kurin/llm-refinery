@@ -159,6 +159,34 @@ def test_http_client_applies_transport_proxy_and_ca_settings(tmp_path, monkeypat
     assert captured["verify"] is ssl_context
 
 
+def test_http_client_forces_explicit_loopback_target_direct(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "model": "local",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello"}],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(http_transport.httpx, "Client", FakeClient)
+
+    http_transport._new_http_client(trial)
+
+    assert captured["trust_env"] is False
+
+
 def test_http_client_resolves_remote_origin_once_before_measured_requests(monkeypatch):
     config = HttpLoadConfig.from_mapping(
         {
@@ -496,8 +524,63 @@ def test_run_requests_shares_and_closes_one_connection_pool(monkeypatch):
     results = run_requests(trial, count=4)
 
     assert [result.index for result in results] == [0, 1, 2, 3]
-    assert 1 <= len({id(client) for client in clients}) <= trial.concurrency
+    assert len({id(client) for client in clients}) == trial.concurrency
     assert all(client.is_closed for client in clients)
+
+
+def test_connection_pool_replaces_timed_out_clients_without_retaining_them():
+    config = HttpLoadConfig.from_mapping(
+        {
+            "targets": [
+                {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "model": "local",
+                }
+            ],
+            "scenarios": [
+                {
+                    "name": "pooled",
+                    "prompt": "hello",
+                    "requests": 2,
+                    "concurrency": 2,
+                }
+            ],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+
+    with pooled_http_client(trial) as pool:
+        for _ in range(5):
+            with pool.lease() as client:
+                client.close()
+            assert len(pool._clients) == trial.concurrency  # type: ignore[attr-defined]
+            assert all(not client.is_closed for client in pool._clients)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("timeout_s", [float("inf"), float("-inf"), float("nan"), 1e100])
+def test_http_scenario_rejects_unsupported_timeout(timeout_s):
+    with pytest.raises(ConfigError, match="timeout_s must be positive and no greater"):
+        HttpLoadConfig.from_mapping(
+            {
+                "targets": [
+                    {
+                        "name": "local",
+                        "protocol": "openai_chat",
+                        "base_url": "http://127.0.0.1:8080/v1",
+                        "model": "local",
+                    }
+                ],
+                "scenarios": [
+                    {
+                        "name": "invalid-timeout",
+                        "prompt": "hello",
+                        "timeout_s": timeout_s,
+                    }
+                ],
+            }
+        )
 
 
 def test_connection_pool_reuses_http11_connections_across_batches():

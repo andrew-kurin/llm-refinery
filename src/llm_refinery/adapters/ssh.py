@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import selectors
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Sequence
 from importlib.resources import files
 from typing import Any
@@ -25,7 +28,7 @@ class OpenSSHClient:
     def __init__(
         self,
         *,
-        runner: ProcessRunner = subprocess.run,
+        runner: ProcessRunner | None = None,
         ssh_executable: str = "ssh",
         local_python: str = sys.executable,
     ) -> None:
@@ -62,29 +65,38 @@ class OpenSSHClient:
         probe_source = linux_dgx_probe_source()
         argv = self.command(access)
         try:
-            result = self._runner(
-                argv,
-                input=probe_source,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=access.command_timeout_s,
-            )
+            if self._runner is None:
+                result = _run_bounded_process(
+                    argv,
+                    input_text=probe_source,
+                    timeout_s=access.command_timeout_s,
+                )
+            else:
+                # Preserve the injected subprocess.run-compatible seam for focused
+                # tests. Production collection uses the streaming implementation.
+                result = self._runner(
+                    argv,
+                    input=probe_source,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=access.command_timeout_s,
+                )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(
                 f"target host inventory timed out after {access.command_timeout_s:g}s"
             ) from exc
         except OSError as exc:
             raise RuntimeError(f"could not execute target host inventory: {exc}") from exc
+        if _encoded_size(result.stdout) + _encoded_size(result.stderr) > MAX_PROBE_OUTPUT_CHARS:
+            raise RuntimeError(
+                f"target host inventory exceeded {MAX_PROBE_OUTPUT_CHARS} characters"
+            )
         if result.returncode != 0:
             detail = _bounded_error(result.stderr or result.stdout)
             raise RuntimeError(
                 f"target host inventory failed with exit code {result.returncode}"
                 + (f": {detail}" if detail else "")
-            )
-        if len(result.stdout) > MAX_PROBE_OUTPUT_CHARS:
-            raise RuntimeError(
-                f"target host inventory exceeded {MAX_PROBE_OUTPUT_CHARS} characters"
             )
         try:
             profile = json.loads(result.stdout)
@@ -102,6 +114,95 @@ class OpenSSHClient:
             destination=access.destination,
             profile=_sanitize_profile(profile),
         )
+
+
+def _run_bounded_process(
+    argv: Sequence[str],
+    *,
+    input_text: str,
+    timeout_s: float,
+) -> subprocess.CompletedProcess[str]:
+    """Collect a child process without allowing either output pipe to grow unbounded."""
+    process = subprocess.Popen(  # noqa: S603 - argv is fixed by command().
+        argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+    selector = selectors.DefaultSelector()
+    input_bytes = input_text.encode("utf-8")
+    input_offset = 0
+    output = bytearray()
+    error = bytearray()
+    deadline = time.monotonic() + timeout_s
+    try:
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            os.set_blocking(pipe.fileno(), False)
+        selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout_s)
+            events = selector.select(remaining)
+            if not events:
+                raise subprocess.TimeoutExpired(argv, timeout_s)
+            for key, _ in events:
+                if key.data == "stdin":
+                    try:
+                        written = os.write(key.fd, input_bytes[input_offset:])
+                    except BrokenPipeError:
+                        written = len(input_bytes) - input_offset
+                    except BlockingIOError:
+                        continue
+                    input_offset += written
+                    if input_offset >= len(input_bytes):
+                        selector.unregister(key.fileobj)
+                        process.stdin.close()
+                    continue
+                remaining_capacity = MAX_PROBE_OUTPUT_CHARS - len(output) - len(error) + 1
+                try:
+                    chunk = os.read(key.fd, min(64 * 1024, remaining_capacity))
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                destination = output if key.data == "stdout" else error
+                destination.extend(chunk)
+                if len(output) + len(error) > MAX_PROBE_OUTPUT_CHARS:
+                    raise RuntimeError(
+                        f"target host inventory exceeded {MAX_PROBE_OUTPUT_CHARS} characters"
+                    )
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(argv, timeout_s)
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            raise subprocess.TimeoutExpired(argv, timeout_s) from exc
+        return subprocess.CompletedProcess(
+            argv,
+            returncode,
+            stdout=output.decode("utf-8", errors="replace"),
+            stderr=error.decode("utf-8", errors="replace"),
+        )
+    finally:
+        selector.close()
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            pipe.close()
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
+def _encoded_size(value: str) -> int:
+    return len(value.encode("utf-8"))
 
 
 def linux_dgx_probe_source() -> str:
