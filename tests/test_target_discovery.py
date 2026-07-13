@@ -678,7 +678,10 @@ def test_ssh_adapter_rejects_excessively_nested_json_without_leaking_recursion_e
         del kwargs
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
-    with pytest.raises(RuntimeError, match="JSON that is too deeply nested"):
+    # CPython versions differ on whether the JSON decoder or the subsequent
+    # profile sanitizer reaches its recursion guard first. Both paths must
+    # expose the same bounded user-facing invariant, never RecursionError.
+    with pytest.raises(RuntimeError, match="too deeply nested"):
         OpenSSHClient(runner=runner).collect_host_profile(
             HostAccess(access="ssh", destination="dgx")
         )
