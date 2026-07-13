@@ -99,15 +99,14 @@ The runner warms every concurrency slot and warns when a cell is too small for u
 tail inspection. It records all-request latency (including failures), visible and
 reasoning TTFT, TPOT, approximate streaming-event ITL, and explicit correctness failures.
 
-HTTP load honors the standard proxy and private-CA environment by default,
-including `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, and
-`SSL_CERT_DIR`. A manifest can set `transport.trust_env: false` for a
-deterministic direct path, or set `transport.ca_bundle` to a PEM bundle (relative
-to the manifest) without disabling certificate verification. The recommended
-local manifest uses direct mode explicitly. Standalone HTTP-load manifests keep
-proxy-routed origins route-less so the proxy receives the logical hostname;
-DGX target suites instead use their discovered IP-pinned route and reject an
-active proxy unless the logical host is covered by `NO_PROXY`.
+HTTP load honors the standard private-CA and proxy-bypass environment by default,
+including `NO_PROXY`, `SSL_CERT_FILE`, and `SSL_CERT_DIR`. Model traffic must be
+direct because a synchronous proxy lookup cannot be cancelled safely at the
+request deadline. If `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` is configured,
+cover the logical model host with `NO_PROXY` or set `transport.trust_env: false`.
+A manifest can also set `transport.ca_bundle` to a PEM bundle (relative to the
+manifest) without disabling certificate verification. The recommended local
+manifest uses direct mode explicitly.
 
 Compare HTTP load results by latency, TTFT, throughput, and optionally host metadata:
 
@@ -290,9 +289,14 @@ use `openai_chat` with `api_key_env` when needed.
 ### Suite configuration
 
 Suite manifests are separate from llama sweep manifests. See
-[`sweeps/gemma4-31b-suite.yaml`](sweeps/gemma4-31b-suite.yaml). They contain an
-`endpoint`, `quality`, optional `http_load`, and `preflight` section. Referenced
-HTTP-load paths resolve relative to the suite manifest.
+[`sweeps/gemma4-31b-suite.yaml`](sweeps/gemma4-31b-suite.yaml). Legacy schema-v1
+suites use an `endpoint`. A schema-v2 suite must define exactly one of `endpoint`
+or `target`; `target` may be an inline discovery mapping or a path to a target
+manifest such as [`targets/dgx-spark-vllm.yaml`](targets/dgx-spark-vllm.yaml).
+Referenced target manifests, quality include paths, and HTTP-load configurations
+resolve relative to the suite manifest. Paths inside a referenced target manifest
+resolve relative to that target file. The suite database and quality output root
+remain relative to the invoking working directory.
 
 Successful suite preflight responses are retained as `preflight.json`, including the
 model identifier returned by the endpoint. When an endpoint exposes a stable model id,
@@ -303,7 +307,7 @@ set `preflight.expected_response_model` to make an accidental model swap fail cl
 1. Start with `llm-refinery plan` to verify exact llama.cpp commands.
 2. Run a small `--limit` first for low-level benchmark sweeps.
 3. Launch candidates with `llm-refinery server` or an external Ollama/MLX server.
-4. Run `llm-refinery suite` with a suite manifest for recorded lm-eval + HTTP-load checks. Use `endpoint.model` in YAML or `--api-model` when the endpoint requires the real model id.
+4. Run `llm-refinery suite` with a suite manifest for recorded lm-eval + HTTP-load checks. Fixed endpoints use `endpoint.model`; schema-v2 targets discover the served model or select `target.model.id` explicitly. `--api-model` overrides either form for one invocation.
 5. Use `llm-refinery agent-eval` for direct chat benchmarks like GeoAnalystBench.
 6. Use `llm-refinery dabstep` for the external multi-step DABStep agent baseline.
 7. Compare parsed metrics with `llm-refinery compare`.

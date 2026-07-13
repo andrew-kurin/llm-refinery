@@ -20,6 +20,7 @@ from llm_refinery.benchmarks.http_load.transport import pooled_http_client, run_
 from llm_refinery.core.runs import CompletedRun, RunSpec
 from llm_refinery.storage.duckdb import ResultStore
 from llm_refinery.storage.models import SampleRecord
+from llm_refinery.utils.terminal import sanitize_terminal_text
 
 
 class HttpLoadFailed(RuntimeError):
@@ -85,7 +86,7 @@ def run_http_load(
                 if keep_going:
                     message = f"{trial.name}: {exc}"
                     failures.append(message)
-                    print(f"failed: {message}")
+                    print(sanitize_terminal_text(f"failed: {message}"))
                     continue
                 raise
     if failures:
@@ -119,8 +120,8 @@ def _run_one_http_load(
         parent_run_id=parent_run_id,
     )
 
-    print(f"[{index}/{total}] {spec.trial_name}")
-    print(trial.command_text)
+    print(sanitize_terminal_text(f"[{index}/{total}] {spec.trial_name}"))
+    print(sanitize_terminal_text(trial.command_text))
     if trial.scenario.requests < RECOMMENDED_MEASURED_REQUESTS:
         print(
             "warning: only "
@@ -208,7 +209,7 @@ def _run_one_http_load(
         outcome = run.complete(status=status, metrics=metrics, error=error)
 
     summary = _http_metric_summary(metrics)
-    print(f"stored {status}: {outcome.run_id} ({summary})")
+    print(sanitize_terminal_text(f"stored {status}: {outcome.run_id} ({summary})"))
     if status != "ok":
         raise HttpLoadFailed(
             f"{spec.trial_name} had HTTP load errors: {error}; artifacts: {errors_path}"

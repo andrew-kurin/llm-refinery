@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from llm_refinery.application.run_context import RunContext
 from llm_refinery.application.run_session import RunSession
@@ -29,6 +30,7 @@ from llm_refinery.core.targets import ResolvedTarget, TargetInspection, TargetSp
 from llm_refinery.storage.duckdb import ResultStore
 from llm_refinery.utils.sanity import run_api_sanity_check
 from llm_refinery.utils.system import get_system_snapshot, is_port_listening
+from llm_refinery.utils.terminal import sanitize_terminal_text
 from llm_refinery.workflows.suite_config import SuiteConfig
 
 LmEvalRunner = Callable[..., list[CompletedRun]]
@@ -234,7 +236,7 @@ class BenchmarkSuiteWorkflow:
                 )
                 after_path.write_text(after_snapshot, encoding="utf-8")
                 self._log("Memory/process snapshot after")
-                self.console.print(after_snapshot)
+                self.console.print(_terminal_multiline_text(after_snapshot))
 
             children = _merge_linked_children(store, run.run_id, children)
             failed_children = sum(child.status != "ok" for child in children)
@@ -288,7 +290,9 @@ class BenchmarkSuiteWorkflow:
                     )
 
         self._log("Memory/process snapshot before")
-        self.console.print(snapshot if snapshot is not None else self.system_snapshot())
+        self.console.print(
+            _terminal_multiline_text(snapshot if snapshot is not None else self.system_snapshot())
+        )
         if not config.sanity_check:
             return {
                 "enabled": True,
@@ -322,7 +326,7 @@ class BenchmarkSuiteWorkflow:
             "model_matches",
             "content_preview",
         ):
-            self.console.print(f"    {key}={sanity.get(key)}")
+            self.console.print(_terminal_text(f"    {key}={sanity.get(key)}"))
         return {
             "enabled": True,
             "sanity_check": True,
@@ -364,6 +368,7 @@ class BenchmarkSuiteWorkflow:
             output_root=quality.output_root,
             package_spec=quality.package_spec,
             extra_packages=quality.extra_packages,
+            apply_chat_template=quality.apply_chat_template,
             offline=quality.offline,
             trust_env=trust_env,
             ca_bundle=ca_bundle,
@@ -492,7 +497,9 @@ class BenchmarkSuiteWorkflow:
         if warning in self._validation_warnings:
             return
         self._validation_warnings.append(warning)
-        self.console.print(f"[yellow]warning:[/yellow] {warning}")
+        output = Text("warning:", style="yellow")
+        output.append(f" {sanitize_terminal_text(warning)}")
+        self.console.print(output)
 
     def _print_http_comparison(self, store: ResultStore, suite_name: str) -> None:
         runs = [
@@ -519,13 +526,28 @@ class BenchmarkSuiteWorkflow:
         if not table_rows:
             return
         self._log("HTTP comparison for this suite")
-        table = Table(*[str(header) for header in table_rows[0]])
+        table = Table(*[sanitize_terminal_text(str(header)) for header in table_rows[0]])
         for row in table_rows[1:]:
-            table.add_row(*[str(cell) for cell in row])
+            table.add_row(*[_terminal_text(cell) for cell in row])
         self.console.print(table)
 
     def _log(self, message: str) -> None:
-        self.console.print(f"[bold blue]==>[/bold blue] {message}")
+        output = Text("==>", style="bold blue")
+        output.append(f" {sanitize_terminal_text(message)}")
+        self.console.print(output)
+
+
+def _terminal_text(value: object) -> Text:
+    return Text(sanitize_terminal_text(str(value)))
+
+
+def _terminal_multiline_text(value: object) -> Text:
+    output = Text()
+    for index, line in enumerate(str(value).split("\n")):
+        if index:
+            output.append("\n")
+        output.append(sanitize_terminal_text(line))
+    return output
 
 
 def _port_from_url(url: str) -> int:

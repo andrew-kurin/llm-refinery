@@ -69,6 +69,72 @@ def test_expand_http_load_trials_crosses_targets_scenarios_concurrency_and_token
     assert all(trial.transport.trust_env is True for trial in trials)
 
 
+def test_http_load_plan_sanitizes_remote_model_output(tmp_path, capsys):
+    unsafe_model = (
+        "served\x1b]2;forged-title\x07\x1b[31m-red\u2028forged-line\u2029forged-paragraph"
+    )
+    config = HttpLoadConfig.from_mapping(
+        {
+            "database": str(tmp_path / "runs.duckdb"),
+            "targets": [
+                {
+                    "name": "remote",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8000/v1",
+                    "model": unsafe_model,
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello"}],
+        }
+    )
+
+    assert run_http_load(config, dry_run=True) == []
+
+    output = capsys.readouterr().out
+    assert "\x1b" not in output
+    assert "forged-title" not in output
+    assert "\u2028" not in output
+    assert "\u2029" not in output
+    assert "-red forged-line forged-paragraph" in output
+
+
+def test_http_load_runner_sanitizes_failure_output(tmp_path, monkeypatch, capsys):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "database": str(tmp_path / "runs.duckdb"),
+            "targets": [
+                {
+                    "name": "remote",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8000/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [{"name": "chat", "prompt": "hello"}],
+        }
+    )
+
+    def fail_trial(*_args, **_kwargs):
+        raise RuntimeError(
+            "failed\x1b]2;forged-title\x07\x1b[31m-red\u2028forged-line\u2029forged-paragraph"
+        )
+
+    monkeypatch.setattr(
+        "llm_refinery.benchmarks.http_load.runner._run_one_http_load",
+        fail_trial,
+    )
+
+    with pytest.raises(HttpLoadFailed, match="1 HTTP load trial"):
+        run_http_load(config, keep_going=True)
+
+    output = capsys.readouterr().out
+    assert "\x1b" not in output
+    assert "forged-title" not in output
+    assert "\u2028" not in output
+    assert "\u2029" not in output
+    assert "-red forged-line forged-paragraph" in output
+
+
 def test_http_transport_config_supports_direct_mode_and_relative_ca_bundle(tmp_path):
     ca_bundle = tmp_path / "private-ca.pem"
     ca_bundle.write_text("test certificate bundle", encoding="utf-8")
@@ -285,7 +351,45 @@ def test_http_client_resolves_remote_origin_once_before_measured_requests(monkey
     assert resolutions == 1
 
 
-def test_http_client_uses_active_proxy_without_ip_pinning(monkeypatch):
+def test_http_client_route_resolution_uses_scenario_timeout(monkeypatch):
+    config = HttpLoadConfig.from_mapping(
+        {
+            "transport": {"trust_env": False},
+            "targets": [
+                {
+                    "name": "dgx",
+                    "protocol": "openai_chat",
+                    "base_url": "http://aitopatom-41de.local:8000/v1",
+                    "model": "served-model",
+                }
+            ],
+            "scenarios": [
+                {
+                    "name": "chat",
+                    "prompt": "hello",
+                    "timeout_s": 0.125,
+                }
+            ],
+        }
+    )
+    trial = expand_http_load_trials(config)[0]
+    captured: dict[str, object] = {}
+
+    def resolve_route(url: str, **kwargs):
+        captured.update(url=url, **kwargs)
+        return None
+
+    monkeypatch.setattr(http_transport, "resolve_request_route", resolve_route)
+
+    assert http_transport._trial_route(trial) is None
+    assert captured == {
+        "url": trial.target.base_url,
+        "require_resolution": True,
+        "resolution_timeout_s": 0.125,
+    }
+
+
+def test_http_client_rejects_active_proxy_before_dns_or_client_creation(monkeypatch):
     config = HttpLoadConfig.from_mapping(
         {
             "targets": [
@@ -300,8 +404,6 @@ def test_http_client_uses_active_proxy_without_ip_pinning(monkeypatch):
         }
     )
     trial = expand_http_load_trials(config)[0]
-    captured: dict[str, object] = {}
-
     monkeypatch.setattr(
         "llm_refinery.core.http_safety.getproxies",
         lambda: {"http": "http://proxy.example:3128"},
@@ -315,18 +417,8 @@ def test_http_client_uses_active_proxy_without_ip_pinning(monkeypatch):
         unexpected_resolution,
     )
 
-    class FakeClient:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
-
-    monkeypatch.setattr(http_transport.httpx, "Client", FakeClient)
-
-    client = http_transport._new_http_client(trial)
-
-    assert captured["trust_env"] is True
-    assert client._llm_refinery_routes == {  # type: ignore[attr-defined]
-        ("http", "model.example", 8000): None
-    }
+    with pytest.raises(ConfigError, match="add the target host to NO_PROXY"):
+        http_transport._new_http_client(trial)
 
 
 def test_http_scenario_supports_prompt_pools_and_explicit_unique_cache_mode():

@@ -75,7 +75,7 @@ from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
 )
 @click.option(
     "--include-path",
-    type=click.Path(file_okay=False, path_type=Path),
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
     help="Additional lm-eval task directory, e.g. evals/lm_eval_tasks.",
 )
 @click.option(
@@ -100,7 +100,10 @@ from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
     "--trust-env/--no-trust-env",
     default=False,
     show_default=True,
-    help="Honor proxy and CA environment variables for relay and online child traffic.",
+    help=(
+        "Honor CA variables and retain proxy variables for online child downloads; "
+        "the model host itself must be direct or covered by NO_PROXY."
+    ),
 )
 @click.option(
     "--ca-bundle",

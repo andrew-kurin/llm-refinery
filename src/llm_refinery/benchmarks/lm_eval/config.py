@@ -52,6 +52,8 @@ class LmEvalConfig:
     def __post_init__(self) -> None:
         if not self.target.strip():
             raise ConfigError("lm-eval target cannot be empty")
+        if not isinstance(self.apply_chat_template, bool):
+            raise ConfigError("lm-eval apply_chat_template must be a boolean")
         if self.limit is not None and self.limit <= 0:
             raise ConfigError("lm-eval limit must be positive or None")
         if self.num_concurrent <= 0:
@@ -79,6 +81,8 @@ class LmEvalConfig:
             raise ConfigError("lm-eval trust_env must be a boolean")
         if self.ca_bundle is not None and not self.ca_bundle.is_file():
             raise ConfigError(f"lm-eval ca_bundle is not a file: {self.ca_bundle}")
+        if self.include_path is not None and not self.include_path.is_dir():
+            raise ConfigError(f"lm-eval include_path is not a directory: {self.include_path}")
         if not self.package_spec.strip():
             raise ConfigError("lm-eval package_spec cannot be empty")
         if any(not package.strip() for package in self.extra_packages):
@@ -92,6 +96,16 @@ class LmEvalConfig:
             raise ConfigError(
                 "lm-eval tokenizer is not supported by the local-chat-completions "
                 "backend: it ignores client-side tokenization and token-aware truncation"
+            )
+        if (
+            self.model_backend == "local-completions"
+            and self.tokenizer is None
+            and self.apply_chat_template
+        ):
+            raise ConfigError(
+                "lm-eval apply_chat_template must be false when model_backend is "
+                "local-completions and tokenizer is omitted; lm-eval 0.4.12 cannot "
+                "apply chat templates through vLLM's remote tokenizer"
             )
         if self.metadata is not None:
             try:

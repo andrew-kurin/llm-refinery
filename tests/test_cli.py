@@ -75,8 +75,8 @@ def test_lm_eval_help_does_not_restrict_trust_env_concurrency():
     result = CliRunner().invoke(main, ["lm-eval", "--help"])
 
     assert result.exit_code == 0
-    assert "Honor proxy and CA environment variables" in result.output
-    assert "relay and online child traffic" in result.output
+    assert "Honor CA variables and retain proxy" in result.output
+    assert "must be direct or covered" in result.output
     assert "supported only with --num-concurrent 1" not in result.output
 
 

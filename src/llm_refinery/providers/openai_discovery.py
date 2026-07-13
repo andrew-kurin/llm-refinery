@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import re
 import ssl
@@ -54,6 +55,7 @@ _SECRET_KEY_SEGMENTS = frozenset(
         "authorization",
         "credential",
         "credentials",
+        "key",
         "passphrase",
         "passwd",
         "password",
@@ -73,6 +75,7 @@ _SECRET_SUFFIXES = (
     "_token",
 )
 _MAX_REDIRECTS = 5
+_MAX_JSON_DEPTH = 64
 
 
 class OpenAIDiscoveryClient:
@@ -83,7 +86,22 @@ class OpenAIDiscoveryClient:
         *,
         timeout_s: float = 5.0,
     ) -> None:
-        self._timeout_s = timeout_s
+        if (
+            isinstance(timeout_s, bool)
+            or not isinstance(timeout_s, (int, float))
+            or not math.isfinite(timeout_s)
+            or timeout_s <= 0
+            or timeout_s > threading.TIMEOUT_MAX
+        ):
+            raise ValueError(
+                "timeout_s must be positive, finite, and no greater than threading.TIMEOUT_MAX"
+            )
+        self._timeout_s = float(timeout_s)
+
+    @property
+    def timeout_s(self) -> float:
+        """Wall-clock budget for each discovery request and its route lookup."""
+        return self._timeout_s
 
     def discover(
         self,
@@ -345,7 +363,9 @@ def _get_bounded_response_before_deadline(
             resolve_addresses=False,
         )
         request_url = route.request_url(current_url) if route is not None else current_url
-        request_headers = route.request_headers(headers) if route is not None else headers
+        request_headers = _identity_encoding_headers(headers)
+        if route is not None:
+            request_headers = route.request_headers(request_headers)
         extensions = {"sni_hostname": route.sni_hostname} if route is not None else None
         with client.stream(
             "GET",
@@ -368,6 +388,9 @@ def _get_bounded_response_before_deadline(
                 current_params = None
                 continue
             response.raise_for_status()
+            content_encoding = response.headers.get("content-encoding", "").strip().casefold()
+            if content_encoding and content_encoding != "identity":
+                raise ValueError("compressed discovery responses are not supported")
             content_length = response.headers.get("content-length")
             if content_length:
                 try:
@@ -377,14 +400,18 @@ def _get_bounded_response_before_deadline(
                 if declared_size is not None and declared_size > MAX_RESPONSE_BYTES:
                     raise ValueError("response is too large")
             content = bytearray()
-            for chunk in response.iter_bytes():
+            # Mock/in-process transports may return an already-materialized
+            # response even inside ``Client.stream``. Real network responses
+            # remain raw streams and are bounded before buffering.
+            chunks = (response.content,) if response.is_stream_consumed else response.iter_raw()
+            for chunk in chunks:
                 _check_deadline(deadline, response.request)
                 if len(content) + len(chunk) > MAX_RESPONSE_BYTES:
                     raise ValueError("response is too large")
                 content.extend(chunk)
             _check_deadline(deadline, response.request)
-            # iter_bytes() has already decoded transfer/content encodings. Do not retain
-            # headers that would make the in-memory response decode the bytes a second time.
+            # Transfer framing has already been removed. Content encodings are
+            # rejected above so these bounded bytes cannot expand when consumed.
             bounded_headers = [
                 (key, value)
                 for key, value in response.headers.multi_items()
@@ -453,23 +480,50 @@ def _json_object(response: httpx.Response) -> dict[str, Any]:
         raise ValueError("response is too large")
     try:
         payload = response.json()
+    except RecursionError as exc:
+        raise ValueError("response JSON was too deeply nested") from exc
     except ValueError as exc:
         raise ValueError("response was not valid JSON") from exc
+    _validate_json_depth(payload)
     if not isinstance(payload, dict):
         raise ValueError("response JSON must be an object")
     return payload
 
 
 def _sanitize(value: Any) -> Any:
+    _validate_json_depth(value)
+    return _sanitize_value(value)
+
+
+def _sanitize_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            str(key): _sanitize(child)
+            str(key): _sanitize_value(child)
             for key, child in value.items()
             if not _is_secret_key(str(key))
         }
     if isinstance(value, list):
-        return [_sanitize(child) for child in value]
+        return [_sanitize_value(child) for child in value]
     return value
+
+
+def _validate_json_depth(value: Any) -> None:
+    def visit(current: Any, depth: int) -> None:
+        if not isinstance(current, (dict, list)):
+            return
+        if depth >= _MAX_JSON_DEPTH:
+            raise ValueError("response JSON was too deeply nested")
+        children = current.values() if isinstance(current, dict) else current
+        for child in children:
+            visit(child, depth + 1)
+
+    visit(value, 0)
+
+
+def _identity_encoding_headers(headers: dict[str, str]) -> dict[str, str]:
+    result = {key: value for key, value in headers.items() if key.casefold() != "accept-encoding"}
+    result["Accept-Encoding"] = "identity"
+    return result
 
 
 def _is_secret_key(key: str) -> bool:

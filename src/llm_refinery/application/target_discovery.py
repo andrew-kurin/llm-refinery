@@ -6,6 +6,7 @@ from llm_refinery.adapters.ssh import OpenSSHClient
 from llm_refinery.core.config import ConfigError
 from llm_refinery.core.http_safety import (
     HttpOrigin,
+    HttpResolutionError,
     PinnedHttpRoute,
     http_origin,
     resolve_request_route,
@@ -39,7 +40,7 @@ class TargetResolver:
         self._ssh_client = ssh_client or OpenSSHClient()
         self._service_client = service_client or OpenAIDiscoveryClient()
         self._local_system_profile = local_system_profile
-        self._service_routes: dict[HttpOrigin, PinnedHttpRoute | None] = {}
+        self._service_routes: dict[tuple[HttpOrigin, bool], PinnedHttpRoute | None] = {}
 
     def inspect(
         self,
@@ -71,6 +72,28 @@ class TargetResolver:
                     route=route,
                 )
                 errors.extend(service.errors)
+            except HttpResolutionError as exc:
+                error = f"service: {exc}"
+                service_unavailability_allowed = (
+                    allow_service_unavailable or not spec.discovery.service_required
+                )
+                if spec.host.access == HOST_ACCESS_LOCAL and service_unavailability_allowed:
+                    # Local-network inspection may still return useful host
+                    # inventory when DNS itself is unavailable. Do not pass an
+                    # unresolved hostname to HTTPX, which would repeat the same
+                    # lookup without our wall-clock bound.
+                    errors.append(error)
+                else:
+                    partial = TargetInspection(
+                        spec=spec,
+                        host=host,
+                        service=None,
+                        resolved=None,
+                        route=route,
+                        errors=tuple(dict.fromkeys([*errors, error])),
+                    )
+                    exc.target_inspection = partial  # type: ignore[attr-defined]
+                    raise
             except ConfigError as exc:
                 error = f"service: {exc}"
                 partial = TargetInspection(
@@ -207,16 +230,17 @@ class TargetResolver:
         )
 
     def _service_route(self, spec: TargetSpec) -> PinnedHttpRoute | None:
-        if spec.host.access != HOST_ACCESS_SSH:
-            return None
         origin = http_origin(spec.endpoint.base_url)
-        if origin not in self._service_routes:
-            self._service_routes[origin] = resolve_request_route(
+        reject_client_local = spec.host.access == HOST_ACCESS_SSH
+        cache_key = (origin, reject_client_local)
+        if cache_key not in self._service_routes:
+            self._service_routes[cache_key] = resolve_request_route(
                 spec.endpoint.base_url,
                 require_resolution=True,
-                reject_client_local=True,
+                reject_client_local=reject_client_local,
+                resolution_timeout_s=getattr(self._service_client, "timeout_s", None),
             )
-        return self._service_routes[origin]
+        return self._service_routes[cache_key]
 
     def resolve(self, spec: TargetSpec) -> ResolvedTarget:
         inspection = self.inspect(spec)

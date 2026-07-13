@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import socket
 import socketserver
 import subprocess
@@ -568,6 +570,14 @@ def test_ssh_adapter_uses_fixed_argv_probe_stdin_and_never_requests_a_shell():
         "-o",
         "BatchMode=yes",
         "-o",
+        "ClearAllForwardings=yes",
+        "-o",
+        "PermitLocalCommand=no",
+        "-o",
+        "RemoteCommand=none",
+        "-o",
+        "StdinNull=no",
+        "-o",
         "ConnectTimeout=3",
         "--",
         "dgx",
@@ -588,6 +598,42 @@ def test_ssh_adapter_uses_fixed_argv_probe_stdin_and_never_requests_a_shell():
         "hostname": "spark",
         "nested": {"safe": True},
     }
+
+
+def test_ssh_adapter_overrides_alias_remote_command_and_stdin_policy(tmp_path: Path):
+    ssh = shutil.which("ssh")
+    if ssh is None:
+        pytest.skip("OpenSSH client is not installed")
+    config = tmp_path / "ssh_config"
+    config.write_text(
+        """\
+Host dgx
+    HostName example.invalid
+    RemoteCommand false
+    StdinNull yes
+    PermitLocalCommand yes
+    LocalCommand false
+""",
+        encoding="utf-8",
+    )
+    command = OpenSSHClient(ssh_executable=ssh).command(
+        HostAccess(access="ssh", destination="dgx")
+    )
+
+    completed = subprocess.run(
+        [command[0], "-G", "-F", str(config), *command[1:]],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    effective = completed.stdout.casefold().splitlines()
+    assert "clearallforwardings yes" in effective
+    assert "permitlocalcommand no" in effective
+    assert "stdinnull no" in effective
+    assert "remotecommand false" not in effective
 
 
 @pytest.mark.parametrize("schema_version", [True, 1.0, "1", None])
@@ -621,6 +667,43 @@ def test_ssh_adapter_reports_timeout_and_rejects_oversized_output():
 
     with pytest.raises(RuntimeError, match="exceeded"):
         OpenSSHClient(runner=oversized_runner).collect_host_profile(access)
+
+
+def test_ssh_adapter_rejects_excessively_nested_json_without_leaking_recursion_error():
+    depth = sys.getrecursionlimit() + 100
+    nested = '{"value":' * depth + "null" + "}" * depth
+    stdout = '{"schema_version":1,"nested":' + nested + "}"
+
+    def runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    with pytest.raises(RuntimeError, match="JSON that is too deeply nested"):
+        OpenSSHClient(runner=runner).collect_host_profile(
+            HostAccess(access="ssh", destination="dgx")
+        )
+
+
+def test_ssh_adapter_rejects_profile_that_is_too_deep_to_sanitize(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    profile: dict[str, Any] = {"schema_version": 1}
+    cursor = profile
+    for _ in range(sys.getrecursionlimit() + 100):
+        child: dict[str, Any] = {}
+        cursor["nested"] = child
+        cursor = child
+
+    monkeypatch.setattr(ssh_module.json, "loads", lambda _value: profile)
+
+    def runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    with pytest.raises(RuntimeError, match="profile is too deeply nested"):
+        OpenSSHClient(runner=runner).collect_host_profile(
+            HostAccess(access="ssh", destination="dgx")
+        )
 
 
 def test_ssh_adapter_strips_terminal_sequences_from_failure_details():
@@ -895,11 +978,25 @@ def test_remote_and_local_linux_inventory_share_fingerprint_contract(
     )
 
 
-def test_remote_probe_source_is_compatible_with_python_3_10():
+def test_remote_probe_executes_with_python_3_10():
     source = ssh_module.linux_dgx_probe_source()
+    python = os.environ.get("LLM_REFINERY_PYTHON_310") or shutil.which("python3.10")
+    if python is None:
+        pytest.skip("Python 3.10 is not installed; CI supplies it explicitly")
 
-    assert "from datetime import UTC" not in source
-    assert "datetime.now(timezone.utc)" in source
+    completed = subprocess.run(
+        [python, "-I", "-"],
+        input=source,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    profile = json.loads(completed.stdout)
+    assert profile["schema_version"] == 1
+    assert profile["platform"]["python_version"].startswith("3.10.")
 
 
 def test_remote_probe_keeps_gpu_identity_when_memory_queries_are_unsupported(
@@ -1816,6 +1913,147 @@ def test_discovery_requires_ssh_endpoint_hostname_to_resolve(
         resolver.inspect(_spec(), allow_service_unavailable=True)
 
 
+@pytest.mark.parametrize(
+    ("service_required", "allow_service_unavailable"),
+    [(True, True), (False, False)],
+)
+def test_local_inspection_tolerates_unresolvable_service_without_retrying_http(
+    monkeypatch: pytest.MonkeyPatch,
+    service_required: bool,
+    allow_service_unavailable: bool,
+):
+    def fail_resolution(host: str, port: int, **kwargs: Any) -> Any:
+        raise socket.gaierror("not found")
+
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        fail_resolution,
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, request=request)
+
+    raw = _target_mapping(access="local", destination=None)
+    raw["discovery"]["service_required"] = service_required
+    resolver = TargetResolver(
+        service_client=_discovery_client(handler, timeout_s=0.02),
+        local_system_profile=lambda: {"hostname": "local-mac", "schema_version": 2},
+    )
+
+    inspection = resolver.inspect(
+        TargetSpec.from_mapping(raw),
+        allow_service_unavailable=allow_service_unavailable,
+    )
+
+    assert requests == []
+    assert inspection.available is False
+    assert inspection.host is not None
+    assert inspection.host.profile["hostname"] == "local-mac"
+    assert inspection.service is None
+    assert inspection.errors == (
+        "service: configured endpoint hostname could not be resolved for safety validation",
+    )
+
+
+def test_local_inspection_tolerates_bounded_dns_timeout_without_http_request(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    release = threading.Event()
+
+    def block_resolution(host: str, port: int, **kwargs: Any) -> Any:
+        release.wait(timeout=2)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.41", port))]
+
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        block_resolution,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"must not send request: {request.url}")
+
+    resolver = TargetResolver(
+        service_client=_discovery_client(handler, timeout_s=0.02),
+        local_system_profile=lambda: {"hostname": "local-mac", "schema_version": 2},
+    )
+    started = time.perf_counter()
+    try:
+        inspection = resolver.inspect(
+            _spec(access="local", destination=None),
+            allow_service_unavailable=True,
+        )
+    finally:
+        release.set()
+
+    assert time.perf_counter() - started < 0.5
+    assert inspection.available is False
+    assert inspection.service is None
+    assert inspection.errors == (
+        "service: configured endpoint hostname resolution exceeded its timeout",
+    )
+
+
+@pytest.mark.parametrize("failure", ["unresolvable", "timeout"])
+def test_required_local_inspection_fails_closed_on_resolution_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+):
+    release = threading.Event()
+
+    def fail_resolution(host: str, port: int, **kwargs: Any) -> Any:
+        if failure == "timeout":
+            release.wait(timeout=2)
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.41", port))]
+        raise socket.gaierror("not found")
+
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        fail_resolution,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"must not send request: {request.url}")
+
+    resolver = TargetResolver(
+        service_client=_discovery_client(handler, timeout_s=0.02),
+        local_system_profile=lambda: {"hostname": "local-mac", "schema_version": 2},
+    )
+    try:
+        with pytest.raises(
+            ConfigError, match="hostname (could not be resolved|resolution exceeded)"
+        ):
+            resolver.inspect(_spec(access="local", destination=None))
+    finally:
+        release.set()
+
+
+def test_local_offline_tolerance_does_not_suppress_unsafe_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        lambda host, port, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))
+        ],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"must not send request: {request.url}")
+
+    resolver = TargetResolver(
+        service_client=_discovery_client(handler),
+        local_system_profile=lambda: {"hostname": "local-mac", "schema_version": 2},
+    )
+
+    with pytest.raises(ConfigError, match="client-local"):
+        resolver.inspect(
+            _spec(access="local", destination=None),
+            allow_service_unavailable=True,
+        )
+
+
 def test_discovery_rejects_endpoint_address_assigned_to_benchmark_client(monkeypatch):
     monkeypatch.setattr(
         "llm_refinery.core.http_safety._is_client_interface_address",
@@ -1828,6 +2066,22 @@ def test_discovery_rejects_endpoint_address_assigned_to_benchmark_client(monkeyp
 
     with pytest.raises(ConfigError, match="assigned to the benchmark client"):
         resolver.inspect(_spec())
+
+
+def test_local_route_cache_cannot_bypass_later_ssh_client_identity_check(monkeypatch):
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety._is_client_interface_address",
+        lambda address, route_address, port: True,
+    )
+    resolver = TargetResolver(
+        service_client=_FakeService(_service("served-model")),  # type: ignore[arg-type]
+    )
+
+    local_route = resolver._service_route(_spec(access="local", destination=None))
+
+    assert local_route is not None
+    with pytest.raises(ConfigError, match="assigned to the benchmark client"):
+        resolver._service_route(_spec())
 
 
 def test_discovery_allows_dgx_local_name_that_resolves_to_lan_address(

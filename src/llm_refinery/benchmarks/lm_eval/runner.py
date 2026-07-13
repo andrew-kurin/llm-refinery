@@ -32,10 +32,15 @@ from llm_refinery.benchmarks.lm_eval.parser import (
 from llm_refinery.benchmarks.lm_eval.presets import default_targets
 from llm_refinery.core.config import ConfigError
 from llm_refinery.core.endpoints import Endpoint
-from llm_refinery.core.http_safety import pinned_route_trust_env
+from llm_refinery.core.http_safety import (
+    environment_proxy_applies,
+    pinned_route_trust_env,
+    resolve_request_route,
+)
 from llm_refinery.core.runs import CompletedRun, RunSpec, stable_hash
 from llm_refinery.storage.duckdb import ResultStore
 from llm_refinery.storage.models import SampleRecord
+from llm_refinery.utils.terminal import sanitize_terminal_text
 
 
 class LmEvalFailed(RuntimeError):
@@ -191,12 +196,19 @@ def run_lm_eval(
             )
             command_text = shlex.join(command_template)
             print(
-                f"==> Running lm-eval target={target.name} tasks={config.tasks} limit={limit_text}"
+                sanitize_terminal_text(
+                    f"==> Running lm-eval target={target.name} "
+                    f"tasks={config.tasks} limit={limit_text}"
+                )
             )
-            print(f"    model={target.model} base_url={logical_target.base_url}")
+            print(
+                sanitize_terminal_text(
+                    f"    model={target.model} base_url={logical_target.base_url}"
+                )
+            )
             if dry_run:
-                print(f"    output_path={command_output_path}")
-                print(command_text)
+                print(sanitize_terminal_text(f"    output_path={command_output_path}"))
+                print(sanitize_terminal_text(command_text))
                 relay_stack.pop_all().close()
                 continue
 
@@ -215,7 +227,7 @@ def run_lm_eval(
             session = RunSession(active_store, spec, run_context=run_context)
             output_path = config.output_root / target.name / session.run_id
             cmd = build_lm_eval_command(config, target, output_path=output_path)
-            print(f"    output_path={output_path}")
+            print(sanitize_terminal_text(f"    output_path={output_path}"))
             with session as run:
                 stdout_path = run.artifact("stdout", "stdout.txt", "text/plain")
                 stderr_path = run.artifact("stderr", "stderr.txt", "text/plain")
@@ -478,6 +490,25 @@ def _lm_eval_target(
         return
     if route is not None:
         route.request_url(target.base_url)
+
+    # Resolve every permitted non-loopback target once within the request
+    # budget. Synchronous proxy DNS cannot be cancelled safely: returning a
+    # timeout while that lookup continues can let the worker send credentials
+    # after the relay has already reported failure. Require model traffic to
+    # bypass environment proxies; the lm-eval child may still use them for
+    # package, dataset, and tokenizer downloads.
+    if config.trust_env and environment_proxy_applies(target.base_url):
+        raise ConfigError(
+            "lm-eval target requests cannot use an environment proxy; add the target "
+            "host to NO_PROXY, set quality.trust_env=false in a suite, or pass "
+            "--no-trust-env"
+        )
+    if route is None:
+        route = resolve_request_route(
+            target.base_url,
+            require_resolution=True,
+            resolution_timeout_s=config.request_timeout_s,
+        )
 
     client_trust_env = pinned_route_trust_env(
         target.base_url,

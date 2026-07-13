@@ -15,6 +15,7 @@ from llm_refinery.core.config import (
 from llm_refinery.core.endpoints import CHAT_PROTOCOLS, Endpoint
 from llm_refinery.core.http_safety import PinnedHttpRoute
 from llm_refinery.core.runs import stable_hash
+from llm_refinery.utils.terminal import sanitize_terminal_text
 
 CACHE_MODES = {"shared", "unique"}
 RECOMMENDED_MEASURED_REQUESTS = 100
@@ -88,11 +89,7 @@ class HttpScenario:
             raise ConfigError(f"scenario {name!r} warmup_requests cannot be negative")
         if prompt_repeat <= 0:
             raise ConfigError(f"scenario {name!r} prompt_repeat must be positive")
-        if (
-            not math.isfinite(timeout_s)
-            or timeout_s <= 0
-            or timeout_s > threading.TIMEOUT_MAX
-        ):
+        if not math.isfinite(timeout_s) or timeout_s <= 0 or timeout_s > threading.TIMEOUT_MAX:
             raise ConfigError(
                 f"scenario {name!r} timeout_s must be positive and no greater than "
                 f"{threading.TIMEOUT_MAX:g} seconds"
@@ -194,9 +191,7 @@ class HttpTransportConfig:
         if "ca_bundle" in raw:
             ca_bundle_raw = raw["ca_bundle"]
             if not isinstance(ca_bundle_raw, str) or not ca_bundle_raw.strip():
-                raise ConfigError(
-                    "HTTP-load transport.ca_bundle must be a non-empty path string"
-                )
+                raise ConfigError("HTTP-load transport.ca_bundle must be a non-empty path string")
             ca_bundle = Path(ca_bundle_raw).expanduser()
             if not ca_bundle.is_absolute():
                 ca_bundle = base_dir / ca_bundle
@@ -403,8 +398,8 @@ def print_http_load_plan(
     )
     trials = all_trials[:limit] if limit is not None else all_trials
     for index, trial in enumerate(trials):
-        print(f"# [{index}] {trial.name}")
-        print(trial.command_text)
+        print(sanitize_terminal_text(f"# [{index}] {trial.name}"))
+        print(sanitize_terminal_text(trial.command_text))
         print()
     print(f"planned {len(trials)} of {len(all_trials)} HTTP load trial(s)")
 

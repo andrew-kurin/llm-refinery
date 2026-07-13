@@ -8,6 +8,7 @@ import click
 
 from llm_refinery.application.target_discovery import TargetResolver
 from llm_refinery.core.targets import TargetInspection, load_target_spec
+from llm_refinery.utils.terminal import sanitize_terminal_text
 
 
 @click.group("target", help="Inspect and resolve local or remote inference targets.")
@@ -53,26 +54,30 @@ def target_inspect_command(
 
 def _print_inspection(inspection: TargetInspection) -> None:
     status = "available" if inspection.available else "unavailable"
-    click.echo(f"target={inspection.spec.name} status={status}")
+    _human_echo(f"target={inspection.spec.name} status={status}")
     if inspection.host is not None:
         profile = inspection.host.profile
         hardware = profile.get("hardware") or {}
-        click.echo(
+        _human_echo(
             "host="
             f"{profile.get('hostname') or inspection.host.destination or 'unknown'} "
             f"model={hardware.get('model') or hardware.get('chip') or 'unknown'}"
         )
     if inspection.service is not None:
         model_ids = ",".join(model.id for model in inspection.service.models) or "none"
-        click.echo(
+        _human_echo(
             f"service={inspection.service.implementation} "
             f"health={inspection.service.health} "
             f"version={inspection.service.version or 'unknown'} models={model_ids}"
         )
     if inspection.resolved is not None:
-        click.echo(f"selected_model={inspection.resolved.endpoint.model}")
+        _human_echo(f"selected_model={inspection.resolved.endpoint.model}")
     for error in inspection.errors:
-        click.echo(f"warning: {error}", err=True)
+        _human_echo(f"warning: {error}", err=True)
+
+
+def _human_echo(value: str, *, err: bool = False) -> None:
+    click.echo(sanitize_terminal_text(value), err=err)
 
 
 __all__ = ["target_command", "target_inspect_command"]

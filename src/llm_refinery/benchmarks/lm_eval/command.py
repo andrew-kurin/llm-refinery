@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -34,12 +35,19 @@ def build_lm_eval_command(
     output_path: Path | None = None,
 ) -> list[str]:
     validate_lm_eval_headers(target)
+    validate_lm_eval_output_component(target.name)
     resolved_output_path = str(output_path or config.output_root / target.name)
     base_url = (
         target.completions_url
         if config.model_backend == "local-completions"
         else target.chat_completions_url
     )
+    _validate_model_arg_value(target.model, field="model")
+    _validate_model_arg_value(base_url, field="base_url")
+    if config.eos_string:
+        _validate_model_arg_value(config.eos_string, field="eos_string")
+    if config.tokenizer:
+        _validate_model_arg_value(config.tokenizer, field="tokenizer")
     model_args_parts = [
         f"model={target.model}",
         f"base_url={base_url}",
@@ -117,6 +125,33 @@ def build_lm_eval_command(
 
     cmd.extend(["--output_path", resolved_output_path])
     return cmd
+
+
+def _validate_model_arg_value(value: str, *, field: str) -> None:
+    """Reject values lm-eval's comma-delimited model-argument parser cannot encode."""
+    unsafe_category = any(
+        unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"}
+        for character in value
+    )
+    if "," in value or unsafe_category:
+        raise ConfigError(
+            f"lm-eval {field} cannot contain commas or control characters in --model_args"
+        )
+
+
+def validate_lm_eval_output_component(name: str) -> None:
+    """Reject endpoint names that cannot be one safe output-directory component."""
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or Path(name).is_absolute()
+        or any(ord(character) < 32 or ord(character) == 127 for character in name)
+    ):
+        raise ConfigError(
+            "lm-eval endpoint name must be a single path component without control characters"
+        )
 
 
 def validate_lm_eval_headers(target: Endpoint) -> None:

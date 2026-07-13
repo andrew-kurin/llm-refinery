@@ -1,6 +1,7 @@
 import http.client
 import json
 import os
+import socket
 import ssl
 import subprocess
 import sys
@@ -102,6 +103,34 @@ def test_lm_eval_rejects_blank_tokenizer():
         LmEvalConfig(model_backend="local-completions", tokenizer="  ")
 
 
+def test_lm_eval_rejects_missing_include_path(tmp_path):
+    missing = tmp_path / "missing-tasks"
+
+    with pytest.raises(ConfigError, match="include_path is not a directory"):
+        LmEvalConfig(include_path=missing)
+
+
+def test_lm_eval_rejects_chat_template_with_remote_vllm_tokenizer():
+    with pytest.raises(ConfigError, match="remote tokenizer"):
+        LmEvalConfig(model_backend="local-completions")
+
+    config = LmEvalConfig(
+        model_backend="local-completions",
+        apply_chat_template=False,
+    )
+    command = build_lm_eval_command(
+        config,
+        Endpoint(
+            name="remote",
+            protocol=OPENAI_CHAT,
+            model="served-model",
+            base_url="http://remote.test/v1",
+        ),
+    )
+
+    assert "--apply_chat_template" not in command
+
+
 def test_lm_eval_command_uses_explicit_run_output_path(tmp_path):
     output_path = tmp_path / "target" / "run-id"
     command = build_lm_eval_command(
@@ -116,6 +145,35 @@ def test_lm_eval_command_uses_explicit_run_output_path(tmp_path):
     )
 
     assert command[command.index("--output_path") + 1] == str(output_path)
+
+
+def test_lm_eval_dry_run_sanitizes_dynamic_command_output(tmp_path, capsys):
+    unsafe_tasks = (
+        "served\x1b]2;forged-title\x07\x1b[31m-red\u2028forged-line\u2029forged-paragraph"
+    )
+    config = LmEvalConfig(
+        target="remote",
+        tasks=unsafe_tasks,
+        output_root=tmp_path / "output",
+        database=tmp_path / "runs.duckdb",
+        targets={
+            "remote": Endpoint(
+                name="remote",
+                protocol=OPENAI_CHAT,
+                model="served-model",
+                base_url="http://127.0.0.1:8000/v1",
+            )
+        },
+    )
+
+    assert lm_eval_runner.run_lm_eval(config, dry_run=True) == []
+
+    output = capsys.readouterr().out
+    assert "\x1b" not in output
+    assert "forged-title" not in output
+    assert "\u2028" not in output
+    assert "\u2029" not in output
+    assert "-red forged-line forged-paragraph" in output
 
 
 def test_lm_eval_relay_preserves_online_network_environment_and_bypasses_loopback():
@@ -302,6 +360,7 @@ def test_lm_eval_completions_relay_forwards_remote_tokenizer_contract(tmp_path):
     config = LmEvalConfig(
         target="spark",
         model_backend="local-completions",
+        apply_chat_template=False,
         output_root=tmp_path,
         targets={"spark": target},
         pinned_route=PinnedHttpRoute(
@@ -479,6 +538,104 @@ def test_lm_eval_route_less_relay_enforces_deadline_for_stalled_endpoint(tmp_pat
         upstream.shutdown()
         upstream.server_close()
         thread.join(timeout=2)
+
+
+def test_lm_eval_route_less_direct_dns_is_bounded(tmp_path, monkeypatch):
+    resolver_finished = threading.Event()
+
+    def stalled_getaddrinfo(host, port, **kwargs):
+        del host, kwargs
+        threading.Event().wait(0.4)
+        resolver_finished.set()
+        return [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("192.0.2.1", port),
+            )
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", stalled_getaddrinfo)
+    target = Endpoint(
+        name="remote",
+        protocol=OPENAI_CHAT,
+        model="served-model",
+        base_url="http://slow.test:8000/v1",
+    )
+    config = LmEvalConfig(
+        target="remote",
+        targets={"remote": target},
+        output_root=tmp_path,
+        request_timeout_s=0.05,
+    )
+
+    started = time.monotonic()
+    with (
+        pytest.raises(ConfigError, match="resolution exceeded its timeout"),
+        lm_eval_runner._lm_eval_target(target, config, dry_run=False),
+    ):
+        pytest.fail("relay should not start after DNS exceeds the deadline")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.3
+    assert not resolver_finished.is_set()
+
+
+@pytest.mark.parametrize(
+    "pinned_route",
+    [
+        None,
+        PinnedHttpRoute(
+            origin=("http", "upstream.test", 8000),
+            connect_host="192.0.2.41",
+            authority="upstream.test:8000",
+            sni_hostname="upstream.test",
+        ),
+    ],
+)
+def test_lm_eval_rejects_active_proxy_before_dns_or_relay(
+    tmp_path,
+    monkeypatch,
+    pinned_route,
+):
+    resolution_attempted = False
+
+    def unexpected_getaddrinfo(*args, **kwargs):
+        nonlocal resolution_attempted
+        resolution_attempted = True
+        raise AssertionError("proxy rejection must happen before DNS")
+
+    monkeypatch.setattr(socket, "getaddrinfo", unexpected_getaddrinfo)
+    monkeypatch.setattr(lm_eval_runner, "environment_proxy_applies", lambda _url: True)
+    target = Endpoint(
+        name="remote",
+        protocol=OPENAI_CHAT,
+        model="served-model",
+        base_url="http://upstream.test:8000/v1",
+    )
+    config = LmEvalConfig(
+        target="remote",
+        targets={"remote": target},
+        output_root=tmp_path,
+        request_timeout_s=0.05,
+        trust_env=True,
+        pinned_route=pinned_route,
+    )
+
+    with (
+        pytest.raises(ConfigError, match="add the target host to NO_PROXY"),
+        lm_eval_runner._lm_eval_target(
+            target,
+            config,
+            dry_run=False,
+            api_key="SECRET",
+        ),
+    ):
+        pytest.fail("relay must not start while an environment proxy applies")
+
+    assert resolution_attempted is False
 
 
 def test_lm_eval_relay_teardown_cancels_and_joins_active_requests(tmp_path, monkeypatch):
@@ -667,6 +824,50 @@ def test_lm_eval_completions_backend_uses_completions_url_and_tokenizer():
     assert "base_url=http://remote.test/v1/completions" in model_args
     assert "tokenizer=org/model-tokenizer" in model_args
     assert "tokenizer_backend=huggingface" in model_args
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["../escape", "/tmp/escape", "nested/name", r"nested\name", ".", "..", "bad\nname"],
+)
+def test_lm_eval_rejects_unsafe_target_output_component(name):
+    target = Endpoint(
+        name=name,
+        protocol=OPENAI_CHAT,
+        model="served-model",
+        base_url="http://127.0.0.1:8000/v1",
+    )
+
+    with pytest.raises(ConfigError, match="single path component"):
+        build_lm_eval_command(LmEvalConfig(), target)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("model", "served,tokenized_requests=True"),
+        ("model", "served\x1b[31m"),
+        ("base_url", "http://remote.test/v1,tokenized_requests=True"),
+        ("eos_string", "stop,tokenized_requests=True"),
+        ("tokenizer", "org/model,tokenized_requests=True"),
+    ],
+)
+def test_lm_eval_rejects_unencodable_model_arg_values(field, value):
+    target = Endpoint(
+        name="remote",
+        protocol=OPENAI_CHAT,
+        model=value if field == "model" else "served-model",
+        base_url=value if field == "base_url" else "http://remote.test/v1",
+    )
+    config_kwargs = {field: value} if field in {"eos_string", "tokenizer"} else {}
+    if field == "tokenizer":
+        config_kwargs.update(
+            model_backend="local-completions",
+            apply_chat_template=False,
+        )
+
+    with pytest.raises(ConfigError, match=rf"lm-eval {field} cannot contain commas"):
+        build_lm_eval_command(LmEvalConfig(**config_kwargs), target)
 
 
 @pytest.mark.parametrize(
@@ -951,6 +1152,7 @@ def test_lm_eval_completions_full_chat_url_keeps_stable_logical_command(
     config = LmEvalConfig(
         target="local",
         model_backend="local-completions",
+        apply_chat_template=False,
         tasks="task",
         limit=1,
         output_root=tmp_path / "lm-eval-output",

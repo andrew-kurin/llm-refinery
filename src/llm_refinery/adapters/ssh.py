@@ -20,6 +20,7 @@ from llm_refinery.core.targets import (
     HostDiscovery,
 )
 from llm_refinery.utils.system import get_system_profile
+from llm_refinery.utils.terminal import sanitize_terminal_text
 
 ProcessRunner = Callable[..., subprocess.CompletedProcess[str]]
 MAX_PROBE_OUTPUT_CHARS = 2_000_000
@@ -50,6 +51,14 @@ class OpenSSHClient:
             "-T",
             "-o",
             "BatchMode=yes",
+            "-o",
+            "ClearAllForwardings=yes",
+            "-o",
+            "PermitLocalCommand=no",
+            "-o",
+            "RemoteCommand=none",
+            "-o",
+            "StdinNull=no",
             "-o",
             f"ConnectTimeout={connect_timeout}",
             "--",
@@ -109,6 +118,10 @@ class OpenSSHClient:
             profile = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
             raise RuntimeError("target host inventory returned invalid JSON") from exc
+        except RecursionError as exc:
+            raise RuntimeError(
+                "target host inventory returned JSON that is too deeply nested"
+            ) from exc
         if not isinstance(profile, dict):
             raise RuntimeError("target host inventory must return a JSON object")
         schema_version = profile.get("schema_version")
@@ -116,10 +129,14 @@ class OpenSSHClient:
             raise RuntimeError(
                 f"target host inventory returned unsupported schema_version {schema_version!r}"
             )
+        try:
+            sanitized_profile = _sanitize_profile(profile)
+        except RecursionError as exc:
+            raise RuntimeError("target host inventory profile is too deeply nested") from exc
         return HostDiscovery(
             transport=access.access,
             destination=access.destination,
-            profile=_sanitize_profile(profile),
+            profile=sanitized_profile,
         )
 
 
@@ -273,75 +290,8 @@ def _sanitize_profile(profile: dict[str, Any]) -> dict[str, Any]:
 
 
 def _bounded_error(value: str, *, limit: int = 2000) -> str:
-    sanitized = _sanitize_terminal_text(value)
+    sanitized = sanitize_terminal_text(value)
     return " ".join(sanitized.strip().split())[-limit:]
-
-
-def _sanitize_terminal_text(value: str) -> str:
-    """Strip terminal control strings, escape sequences, and control characters."""
-    result: list[str] = []
-    index = 0
-    while index < len(value):
-        codepoint = ord(value[index])
-        if codepoint == 0x1B:
-            index = _skip_escape_sequence(value, index + 1)
-            continue
-        if codepoint in {0x90, 0x98, 0x9D, 0x9E, 0x9F}:
-            index = _skip_control_string(value, index + 1, osc=codepoint == 0x9D)
-            continue
-        if codepoint == 0x9B:
-            index = _skip_csi(value, index + 1)
-            continue
-        if codepoint < 0x20:
-            if value[index] in "\t\n\r":
-                result.append(" ")
-            index += 1
-            continue
-        if 0x7F <= codepoint <= 0x9F:
-            index += 1
-            continue
-        result.append(value[index])
-        index += 1
-    return "".join(result)
-
-
-def _skip_escape_sequence(value: str, index: int) -> int:
-    if index >= len(value):
-        return index
-    introducer = value[index]
-    if introducer == "[":
-        return _skip_csi(value, index + 1)
-    if introducer == "]":
-        return _skip_control_string(value, index + 1, osc=True)
-    if introducer in {"P", "X", "^", "_"}:
-        return _skip_control_string(value, index + 1, osc=False)
-
-    # ANSI two-byte and intermediate escape sequences end in 0x30-0x7e.
-    while index < len(value) and 0x20 <= ord(value[index]) <= 0x2F:
-        index += 1
-    if index < len(value) and 0x30 <= ord(value[index]) <= 0x7E:
-        index += 1
-    return index
-
-
-def _skip_csi(value: str, index: int) -> int:
-    while index < len(value):
-        codepoint = ord(value[index])
-        index += 1
-        if 0x40 <= codepoint <= 0x7E:
-            break
-    return index
-
-
-def _skip_control_string(value: str, index: int, *, osc: bool) -> int:
-    while index < len(value):
-        codepoint = ord(value[index])
-        if (osc and codepoint == 0x07) or codepoint == 0x9C:
-            return index + 1
-        if codepoint == 0x1B and index + 1 < len(value) and value[index + 1] == "\\":
-            return index + 2
-        index += 1
-    return index
 
 
 def command_is_read_only(argv: Sequence[str]) -> bool:

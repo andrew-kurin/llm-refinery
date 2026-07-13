@@ -174,7 +174,13 @@ def run_requests(
     client_context: AbstractContextManager[httpx.Client | HttpClientPool]
     client_context = nullcontext(client) if client is not None else pooled_http_client(trial)
     if isinstance(client, httpx.Client):
-        _prepare_client_route(client, trial.target.base_url, require_resolution=False)
+        _reject_active_target_proxy(trial)
+        _prepare_client_route(
+            client,
+            trial.target.base_url,
+            require_resolution=False,
+            resolution_timeout_s=trial.scenario.timeout_s,
+        )
     with (
         client_context as active_client,
         ThreadPoolExecutor(max_workers=trial.concurrency) as executor,
@@ -241,15 +247,22 @@ def _owned_http_client(trial: HttpLoadTrial) -> Iterator[httpx.Client]:
 
 
 def _trial_route(trial: HttpLoadTrial) -> PinnedHttpRoute | None:
+    _reject_active_target_proxy(trial)
     if trial.transport.pinned_route is not None:
         return trial.transport.pinned_route
+    return resolve_request_route(
+        trial.target.base_url,
+        require_resolution=True,
+        resolution_timeout_s=trial.scenario.timeout_s,
+    )
+
+
+def _reject_active_target_proxy(trial: HttpLoadTrial) -> None:
     if trial.transport.trust_env and environment_proxy_applies(trial.target.base_url):
-        # A proxy connects to the logical origin itself, so an IP rewrite would
-        # both bypass that proxy and break its hostname routing. Explicit DGX
-        # routes still take the fail-closed branch above.
-        validate_request_url(trial.target.base_url, resolve_addresses=False)
-        return None
-    return resolve_request_route(trial.target.base_url, require_resolution=True)
+        raise ConfigError(
+            "HTTP-load target requests cannot use an environment proxy; add the target "
+            "host to NO_PROXY or set transport.trust_env=false"
+        )
 
 
 def _new_http_client(
@@ -481,7 +494,12 @@ def _safe_stream(
 ) -> Iterator[httpx.Response]:
     """Stream a request while permitting only same-origin, method-preserving redirects."""
     expected_origin = http_origin(url)
-    route = _prepare_client_route(client, url, require_resolution=False)
+    route = _prepare_client_route(
+        client,
+        url,
+        require_resolution=False,
+        resolution_timeout_s=_remaining_timeout(deadline) if deadline is not None else None,
+    )
     current_url = url
     for _redirect_count in range(_MAX_REDIRECTS + 1):
         if deadline is not None:
@@ -544,6 +562,7 @@ def _prepare_client_route(
     url: str,
     *,
     require_resolution: bool,
+    resolution_timeout_s: float | None = None,
 ) -> PinnedHttpRoute | None:
     origin = http_origin(url)
     with _ROUTE_LOCK:
@@ -558,6 +577,7 @@ def _prepare_client_route(
             routes[origin] = resolve_request_route(
                 url,
                 require_resolution=require_resolution,
+                resolution_timeout_s=resolution_timeout_s,
             )
             client._llm_refinery_routes = routes  # type: ignore[attr-defined]
         return routes[origin]

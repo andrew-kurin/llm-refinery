@@ -1,4 +1,6 @@
 import socket
+import threading
+import time
 
 import httpx
 import pytest
@@ -6,10 +8,86 @@ import pytest
 from llm_refinery.core.config import ConfigError
 from llm_refinery.core.http_safety import (
     environment_proxy_applies,
+    http_origin,
     pinned_route_trust_env,
     resolve_request_route,
     validate_request_url,
 )
+
+
+def test_unicode_and_punycode_hosts_share_httpx_idna2008_origin(monkeypatch):
+    resolved_hosts: list[str] = []
+
+    def resolve(host, port, **kwargs):
+        resolved_hosts.append(host)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.41", port))]
+
+    monkeypatch.setattr("llm_refinery.core.http_safety.socket.getaddrinfo", resolve)
+
+    unicode_url = "https://faß.de:8443/v1"
+    punycode_url = "https://xn--fa-hia.de:8443/v1/models"
+    route = resolve_request_route(unicode_url, require_resolution=True)
+
+    assert (
+        http_origin(unicode_url)
+        == http_origin(punycode_url)
+        == (
+            "https",
+            "xn--fa-hia.de",
+            8443,
+        )
+    )
+    assert resolved_hosts == ["xn--fa-hia.de"]
+    assert route is not None
+    assert route.authority == "xn--fa-hia.de:8443"
+    assert route.sni_hostname == "xn--fa-hia.de"
+    assert route.request_url(punycode_url) == "https://192.0.2.41:8443/v1/models"
+
+
+@pytest.mark.parametrize("operation", ["validate", "route"])
+def test_hostname_resolution_honors_explicit_wall_clock_timeout(monkeypatch, operation):
+    release = threading.Event()
+
+    def blocked_resolution(*args, **kwargs):
+        release.wait(timeout=2)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.41", 8000))]
+
+    monkeypatch.setattr(
+        "llm_refinery.core.http_safety.socket.getaddrinfo",
+        blocked_resolution,
+    )
+    started = time.perf_counter()
+    try:
+        with pytest.raises(ConfigError, match="resolution exceeded its timeout"):
+            if operation == "validate":
+                validate_request_url(
+                    "http://slow.example:8000/v1",
+                    require_resolution=True,
+                    resolution_timeout_s=0.02,
+                )
+            else:
+                resolve_request_route(
+                    "http://slow.example:8000/v1",
+                    require_resolution=True,
+                    resolution_timeout_s=0.02,
+                )
+    finally:
+        release.set()
+
+    assert time.perf_counter() - started < 0.5
+
+
+@pytest.mark.parametrize(
+    "timeout_s",
+    [True, "1", 0, -1, float("nan"), float("inf"), threading.TIMEOUT_MAX + 1],
+)
+def test_hostname_resolution_rejects_invalid_timeout_values(timeout_s):
+    with pytest.raises(ValueError, match="resolution_timeout_s must be positive"):
+        resolve_request_route(
+            "http://remote.example:8000/v1",
+            require_resolution=True,
+            resolution_timeout_s=timeout_s,
+        )
 
 
 def test_resolved_route_pins_safe_address_and_preserves_logical_authority(monkeypatch):
@@ -70,6 +148,27 @@ def test_pinned_route_rejects_active_environment_proxy(monkeypatch):
     )
     with pytest.raises(ConfigError, match="cannot use an environment proxy"):
         pinned_route_trust_env("http://dgx.local:8000/v1", trust_env=True, route_is_pinned=True)
+
+
+def test_pinned_route_disables_environment_mounts_when_no_proxy_is_configured(monkeypatch):
+    calls = 0
+
+    def no_proxies():
+        nonlocal calls
+        calls += 1
+        return {}
+
+    monkeypatch.setattr("llm_refinery.core.http_safety.getproxies", no_proxies)
+
+    assert (
+        pinned_route_trust_env(
+            "http://dgx.local:8000/v1",
+            trust_env=True,
+            route_is_pinned=True,
+        )
+        is False
+    )
+    assert calls == 1
 
 
 def test_pinned_route_disables_proxy_mounts_when_logical_host_is_bypassed(monkeypatch):

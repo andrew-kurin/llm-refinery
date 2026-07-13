@@ -17,16 +17,20 @@ from llm_refinery.commands.sweep import bench_command, init_command, plan_comman
 from llm_refinery.commands.system import backfill_system_metadata_command
 from llm_refinery.commands.targets import target_command
 from llm_refinery.core.config import ConfigError
+from llm_refinery.utils.terminal import sanitize_terminal_text
 
 
 class ErrorHandlingGroup(click.Group):
     def invoke(self, ctx: click.Context) -> Any:
         try:
             return super().invoke(ctx)
-        except (click.exceptions.Exit, click.Abort, click.ClickException):
+        except (click.exceptions.Exit, click.Abort):
+            raise
+        except click.ClickException as exc:
+            exc.message = sanitize_terminal_text(exc.message)
             raise
         except (ConfigError, OSError, IndexError, RuntimeError, duckdb.Error) as exc:
-            raise click.ClickException(str(exc)) from exc
+            raise click.ClickException(sanitize_terminal_text(str(exc))) from exc
         except KeyboardInterrupt as exc:
             raise click.Abort() from exc
 

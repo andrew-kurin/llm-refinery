@@ -1,3 +1,4 @@
+from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -111,7 +112,11 @@ def test_suite_calls_services_directly_and_links_child_runs(tmp_path: Path):
                 "base_url": "http://127.0.0.1:8080/v1",
                 "model": "local-model",
             },
-            "quality": {"tasks": "ifeval", "limit": "all"},
+            "quality": {
+                "tasks": "ifeval",
+                "limit": "all",
+                "apply_chat_template": False,
+            },
             "http_load": {"config": str(http_config), "targets": ["local"]},
             "preflight": {"enabled": False},
         }
@@ -136,6 +141,7 @@ def test_suite_calls_services_directly_and_links_child_runs(tmp_path: Path):
     assert [call[0] for call in calls] == ["quality", "load"]
     assert calls[0][1].limit is None
     assert calls[0][1].tasks == "ifeval"
+    assert calls[0][1].apply_chat_template is False
     assert calls[0][2]["parent_run_id"] == result.run.run_id
     assert calls[1][2]["parent_run_id"] == result.run.run_id
     assert calls[1][2]["store"] is calls[0][2]["store"]
@@ -184,7 +190,7 @@ def test_suite_http_comparison_keeps_runs_from_distinct_executors(tmp_path: Path
                     **shared,
                     "run_id": "mac-a-run",
                     "system_json": {
-                        "hostname": "mac-a",
+                        "hostname": "mac-a\x1b]2;forged-title\x07\u2028forged-line",
                         "host_fingerprint": "host-mac-a",
                     },
                 },
@@ -223,6 +229,58 @@ def test_suite_http_comparison_keeps_runs_from_distinct_executors(tmp_path: Path
     rendered = console.export_text()
     assert "mac-a" in rendered
     assert "mac-b" in rendered
+    assert "\x1b" not in rendered
+    assert "forged-title" not in rendered
+    assert "\u2028" not in rendered
+
+
+def test_suite_sanitizes_preflight_log_and_warning_output(tmp_path: Path):
+    unsafe = (
+        "value[bold red]markup[/]\x1b]2;forged-title\x07\x1b[31m-red"
+        "\u2028forged-line\u2029forged-paragraph"
+    )
+    config = SuiteConfig.from_mapping(
+        {
+            "name": "safe-output",
+            "database": str(tmp_path / "runs.duckdb"),
+            "endpoint": {
+                "name": "local",
+                "protocol": "openai_chat",
+                "base_url": "http://127.0.0.1:8080/v1",
+                "model": "local-model",
+            },
+            "quality": {"enabled": False},
+            "http_load": {"enabled": False},
+            "preflight": {"require_clean": False},
+        }
+    )
+    stream = StringIO()
+    console = Console(file=stream, color_system=None, width=220)
+    workflow = BenchmarkSuiteWorkflow(
+        config,
+        console=console,
+        port_listener=lambda port: port == 8080,
+        sanity_checker=lambda _endpoint: {
+            "success": True,
+            "response_model": unsafe,
+            "content_preview": unsafe,
+        },
+    )
+
+    workflow._log(unsafe)
+    workflow._warn_validation(unsafe)
+    result = workflow.preflight(f"snapshot-before\n{unsafe}\nsnapshot-after")
+
+    output = stream.getvalue()
+    assert result["sanity"]["response_model"] == unsafe
+    assert "\x1b" not in output
+    assert "forged-title" not in output
+    assert "\u2028" not in output
+    assert "\u2029" not in output
+    assert "[bold red]markup[/]" in output
+    assert "-red forged-line forged-paragraph" in output
+    assert "snapshot-before\n" in output
+    assert "snapshot-after" in output
 
 
 @pytest.mark.parametrize("failed_step", ["quality", "http_load"])
@@ -505,6 +563,175 @@ def test_suite_quality_accepts_tokenizer_with_completions_backend():
     assert config.quality.model_backend == "local-completions"
     assert config.quality.tokenizer == "org/model-tokenizer"
     assert config.quality.safe_json()["model_backend"] == "local-completions"
+
+
+def test_suite_quality_requires_chat_template_off_with_remote_vllm_tokenizer():
+    endpoint = {
+        "name": "local",
+        "protocol": "openai_chat",
+        "base_url": "http://127.0.0.1:8080/v1",
+        "model": "model",
+    }
+    with pytest.raises(ConfigError, match="apply_chat_template must be false"):
+        SuiteConfig.from_mapping(
+            {
+                "endpoint": endpoint,
+                "quality": {"model_backend": "local-completions"},
+            }
+        )
+
+    config = SuiteConfig.from_mapping(
+        {
+            "endpoint": endpoint,
+            "quality": {
+                "model_backend": "local-completions",
+                "apply_chat_template": False,
+            },
+        }
+    )
+
+    assert config.quality.apply_chat_template is False
+    assert config.quality.safe_json()["apply_chat_template"] is False
+
+
+def test_suite_steps_fail_fast_for_missing_enabled_input_paths(tmp_path: Path):
+    endpoint = {
+        "name": "local",
+        "protocol": "openai_chat",
+        "base_url": "http://127.0.0.1:8080/v1",
+        "model": "model",
+    }
+
+    with pytest.raises(ConfigError, match="include_path is not a directory"):
+        SuiteConfig.from_mapping(
+            {
+                "endpoint": endpoint,
+                "quality": {"include_path": str(tmp_path / "missing-tasks")},
+            }
+        )
+
+    with pytest.raises(ConfigError, match="http_load.config is not a file"):
+        SuiteConfig.from_mapping(
+            {
+                "endpoint": endpoint,
+                "quality": {"enabled": False},
+                "http_load": {
+                    "enabled": True,
+                    "config": str(tmp_path / "missing-load.yaml"),
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("tasks", []),
+        ("tasks", True),
+        ("tasks", {}),
+        ("tasks", " "),
+        ("tasks", None),
+        ("eos_string", []),
+        ("eos_string", True),
+        ("eos_string", {}),
+        ("eos_string", " "),
+        ("tokenizer", []),
+        ("tokenizer", True),
+        ("tokenizer", {}),
+        ("tokenizer", " "),
+        ("gen_kwargs", []),
+        ("gen_kwargs", True),
+        ("gen_kwargs", {}),
+        ("gen_kwargs", " "),
+        ("include_path", []),
+        ("include_path", True),
+        ("include_path", {}),
+        ("include_path", " "),
+        ("output_root", []),
+        ("output_root", True),
+        ("output_root", {}),
+        ("output_root", " "),
+        ("output_root", None),
+        ("package_spec", []),
+        ("package_spec", True),
+        ("package_spec", {}),
+        ("package_spec", " "),
+        ("package_spec", None),
+        ("extra_packages", "package==1"),
+        ("extra_packages", {}),
+        ("extra_packages", True),
+        ("extra_packages", None),
+        ("extra_packages", [""]),
+        ("extra_packages", [True]),
+        ("apply_chat_template", "false"),
+        ("apply_chat_template", 0),
+    ],
+)
+def test_suite_quality_rejects_invalid_string_and_list_fields(field: str, value: object):
+    with pytest.raises(ConfigError, match=rf"quality\.{field}"):
+        SuiteConfig.from_mapping(
+            {
+                "endpoint": {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "model": "model",
+                },
+                "quality": {field: value},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("config", []),
+        ("config", True),
+        ("config", {}),
+        ("config", " "),
+        ("targets", "local"),
+        ("targets", {}),
+        ("targets", True),
+        ("targets", None),
+        ("targets", [""]),
+        ("targets", [1]),
+        ("scenarios", "short"),
+        ("scenarios", {}),
+        ("scenarios", True),
+        ("scenarios", None),
+        ("scenarios", [""]),
+        ("scenarios", [1]),
+    ],
+)
+def test_suite_http_load_rejects_invalid_path_and_list_fields(field: str, value: object):
+    with pytest.raises(ConfigError, match=rf"http_load\.{field}"):
+        SuiteConfig.from_mapping(
+            {
+                "endpoint": {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "model": "model",
+                },
+                "http_load": {"enabled": False, field: value},
+            }
+        )
+
+
+@pytest.mark.parametrize("value", [False, True, 0, [], {}, " "])
+def test_suite_preflight_rejects_invalid_expected_response_model(value: object):
+    with pytest.raises(ConfigError, match="preflight.expected_response_model"):
+        SuiteConfig.from_mapping(
+            {
+                "endpoint": {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "model": "model",
+                },
+                "preflight": {"expected_response_model": value},
+            }
+        )
 
 
 @pytest.mark.parametrize(

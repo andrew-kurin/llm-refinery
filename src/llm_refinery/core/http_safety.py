@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import ipaddress
+import math
 import socket
+import threading
 from dataclasses import dataclass
-from typing import TypeAlias
+from typing import Any, TypeAlias
 from urllib.parse import urlparse, urlsplit, urlunsplit
 from urllib.request import getproxies
 
@@ -12,6 +14,14 @@ import httpx
 from llm_refinery.core.config import ConfigError
 
 HttpOrigin: TypeAlias = tuple[str, str, int]
+
+
+class HttpResolutionError(ConfigError):
+    """An endpoint hostname could not be resolved within the configured bound."""
+
+
+class _ResolutionTimeout(Exception):
+    """Internal signal used to distinguish a DNS deadline from lookup failure."""
 
 
 @dataclass(frozen=True)
@@ -69,7 +79,7 @@ def http_origin(url: str) -> HttpOrigin:
     if explicit_port == 0 or parsed.netloc.endswith(":"):
         raise ConfigError("HTTP request URL includes an invalid port")
     port = explicit_port if explicit_port is not None else (443 if parsed.scheme == "https" else 80)
-    hostname = parsed.hostname.casefold().rstrip(".")
+    hostname = _canonical_hostname(url)
     return parsed.scheme, hostname, port
 
 
@@ -79,6 +89,7 @@ def validate_request_url(
     expected_origin: HttpOrigin | None = None,
     resolve_addresses: bool = True,
     require_resolution: bool = False,
+    resolution_timeout_s: float | None = None,
 ) -> HttpOrigin:
     """Reject cross-origin requests and DNS names that resolve back to this client.
 
@@ -102,10 +113,18 @@ def validate_request_url(
     if not resolve_addresses:
         return origin
     try:
-        addresses = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+        addresses = _getaddrinfo(
+            hostname,
+            port,
+            timeout_s=resolution_timeout_s,
+        )
+    except _ResolutionTimeout as exc:
+        raise HttpResolutionError(
+            "configured endpoint hostname resolution exceeded its timeout"
+        ) from exc
     except OSError as exc:
         if require_resolution:
-            raise ConfigError(
+            raise HttpResolutionError(
                 "configured endpoint hostname could not be resolved for safety validation"
             ) from exc
         # Preserve the normal HTTP client's DNS/connection error semantics so an
@@ -129,6 +148,7 @@ def resolve_request_route(
     *,
     require_resolution: bool,
     reject_client_local: bool = False,
+    resolution_timeout_s: float | None = None,
 ) -> PinnedHttpRoute | None:
     """Resolve and validate once, returning a route that avoids a second DNS lookup."""
     origin = http_origin(url)
@@ -143,10 +163,18 @@ def resolve_request_route(
             )
         return None
     try:
-        addresses = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+        addresses = _getaddrinfo(
+            hostname,
+            port,
+            timeout_s=resolution_timeout_s,
+        )
+    except _ResolutionTimeout as exc:
+        raise HttpResolutionError(
+            "configured endpoint hostname resolution exceeded its timeout"
+        ) from exc
     except OSError as exc:
         if require_resolution:
-            raise ConfigError(
+            raise HttpResolutionError(
                 "configured endpoint hostname could not be resolved for safety validation"
             ) from exc
         return None
@@ -174,7 +202,7 @@ def resolve_request_route(
             safe_addresses.append((address, route_address))
     if not safe_addresses:
         if require_resolution:
-            raise ConfigError(
+            raise HttpResolutionError(
                 "configured endpoint hostname returned no usable addresses for safety validation"
             )
         return None
@@ -183,14 +211,81 @@ def resolve_request_route(
     # selected address remains fixed for every request made through this route.
     safe_addresses.sort(key=lambda item: isinstance(item[0], ipaddress.IPv6Address))
     parsed = urlsplit(url)
-    assert parsed.hostname is not None
-    sni_hostname = parsed.hostname.encode("idna").decode("ascii")
+    sni_hostname = hostname
     return PinnedHttpRoute(
         origin=origin,
         connect_host=safe_addresses[0][1],
         authority=_authority(sni_hostname, parsed.port),
         sni_hostname=sni_hostname,
     )
+
+
+def _canonical_hostname(url: str) -> str:
+    """Return the exact IDNA2008 ASCII host HTTPX uses for the request."""
+    try:
+        raw_host = httpx.URL(url).raw_host
+        hostname = raw_host.decode("ascii").casefold().rstrip(".")
+    except (httpx.InvalidURL, UnicodeError) as exc:
+        raise ConfigError("HTTP request URL includes an invalid hostname") from exc
+    if not hostname:
+        raise ConfigError("HTTP request URL must include an HTTP(S) origin")
+    return hostname
+
+
+def _getaddrinfo(
+    hostname: str,
+    port: int,
+    *,
+    timeout_s: float | None,
+) -> list[Any]:
+    """Resolve a host with an optional wall-clock bound.
+
+    ``socket.getaddrinfo`` has no portable timeout. A daemon worker lets the
+    caller honor its configured deadline without making process shutdown wait
+    for a stuck platform resolver. Omitting the timeout preserves the original
+    synchronous behavior.
+    """
+    if timeout_s is None:
+        return socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
+        raise ValueError(
+            "resolution_timeout_s must be positive, finite, and no greater than "
+            "threading.TIMEOUT_MAX"
+        )
+    timeout_value = float(timeout_s)
+    if (
+        not math.isfinite(timeout_value)
+        or timeout_value <= 0
+        or timeout_value > threading.TIMEOUT_MAX
+    ):
+        raise ValueError(
+            "resolution_timeout_s must be positive, finite, and no greater than "
+            "threading.TIMEOUT_MAX"
+        )
+
+    completed = threading.Event()
+    results: list[list[Any]] = []
+    failures: list[Exception] = []
+
+    def resolve() -> None:
+        try:
+            results.append(socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM))
+        except Exception as exc:  # noqa: BLE001 - re-raise in the calling thread
+            failures.append(exc)
+        finally:
+            completed.set()
+
+    worker = threading.Thread(
+        target=resolve,
+        name="llm-refinery-dns-resolution",
+        daemon=True,
+    )
+    worker.start()
+    if not completed.wait(timeout_value):
+        raise _ResolutionTimeout
+    if failures:
+        raise failures[0]
+    return results[0]
 
 
 def pinned_route_trust_env(
@@ -204,9 +299,10 @@ def pinned_route_trust_env(
     Explicit client-local targets are always direct so credentials cannot leave
     the machine through an environment proxy. HTTPX applies proxy and NO_PROXY
     matching to a rewritten pinned IP rather than the logical hostname, so
-    active proxying is also rejected for pinned targets. If the logical origin
-    is bypassed, environment mounts are disabled for the client. Route-less
-    non-local targets retain normal HTTPX proxy behavior.
+    active proxying is also rejected for pinned targets. Environment mounts are
+    always disabled after that check so HTTPX cannot observe a later proxy
+    configuration change. Route-less non-local targets retain normal HTTPX
+    proxy behavior.
     """
     if not trust_env:
         return False
@@ -217,7 +313,7 @@ def pinned_route_trust_env(
         return True
     proxies = getproxies()
     if not (proxies.get(scheme) or proxies.get("all")):
-        return True
+        return False
     if environment_proxy_applies(url, proxies=proxies):
         raise ConfigError(
             "IP-pinned target endpoints cannot use an environment proxy; "
@@ -422,6 +518,7 @@ def _is_explicit_client_loopback_host(hostname: str) -> bool:
 __all__ = [
     "environment_proxy_applies",
     "HttpOrigin",
+    "HttpResolutionError",
     "PinnedHttpRoute",
     "http_origin",
     "pinned_route_trust_env",
