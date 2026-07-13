@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from llm_refinery.core.runs import stable_hash
+from llm_refinery.core.targets import host_fingerprint_candidates
 from llm_refinery.utils.system import host_identity as system_host_identity
 
 
@@ -73,6 +74,9 @@ class RunContext:
         logical_origin = logical_origin if isinstance(logical_origin, dict) else {}
         server_info = service.get("server_info")
         host_fingerprint = system_host_identity(profile)
+        bound_fingerprint = _verified_strong_host_binding(target, profile)
+        if bound_fingerprint is not None:
+            host_fingerprint = bound_fingerprint
         if host_fingerprint == "unknown-host" and isinstance(host, dict):
             explicit_fingerprint = host.get("host_fingerprint") or host.get("fingerprint")
             if explicit_fingerprint:
@@ -109,3 +113,26 @@ class RunContext:
             "model": target.get("model"),
             "topology": target.get("topology"),
         }
+
+
+def _verified_strong_host_binding(
+    target: Mapping[str, Any],
+    profile: dict[str, Any],
+) -> str | None:
+    """Return a verified compatibility pin without trusting binding claims alone."""
+    binding = target.get("host_identity_binding")
+    if not isinstance(binding, Mapping) or binding.get("verified") is not True:
+        return None
+    expected = binding.get("expected_fingerprint")
+    actual = binding.get("actual_fingerprint")
+    if not isinstance(actual, str) or not actual or actual != expected:
+        return None
+
+    candidates = host_fingerprint_candidates(profile)
+    strength = candidates.get(actual)
+    if strength not in {"hardware", "installation"}:
+        return None
+    claimed_strength = binding.get("actual_strength")
+    if claimed_strength is not None and claimed_strength != strength:
+        return None
+    return actual

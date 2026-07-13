@@ -1,5 +1,6 @@
 import socket
 
+import httpx
 import pytest
 
 from llm_refinery.core.config import ConfigError
@@ -173,6 +174,103 @@ def test_environment_proxy_applies_respects_no_proxy(monkeypatch):
 
     assert environment_proxy_applies("http://proxied.example:8000/v1") is True
     assert environment_proxy_applies("http://direct.example:8000/v1") is False
+
+
+@pytest.mark.parametrize(
+    ("url", "no_proxy"),
+    [
+        ("http://dgx.local:8000/v1", "dgx.local"),
+        ("http://dgx.local.:8000/v1", "dgx.local"),
+        ("http://dgx.local:8000/v1", "dgx.local."),
+        ("http://dgx.local.:8000/v1", "dgx.local."),
+        ("http://dgx.local:8000/v1", "http://dgx.local:8000"),
+        ("http://dgx.local.:8000/v1", "http://dgx.local:8000"),
+        ("http://dgx.local:8000/v1", "http://dgx.local.:8000"),
+        ("http://dgx.local.:8000/v1", "http://dgx.local.:8000"),
+    ],
+)
+def test_environment_proxy_trailing_dot_matches_httpx_mount_selection(url, no_proxy):
+    selected_transport: list[str] = []
+
+    def direct_handler(_request: httpx.Request) -> httpx.Response:
+        selected_transport.append("direct")
+        return httpx.Response(200)
+
+    def proxy_handler(_request: httpx.Request) -> httpx.Response:
+        selected_transport.append("proxy")
+        return httpx.Response(200)
+
+    direct_transport = httpx.MockTransport(direct_handler)
+    proxy_transport = httpx.MockTransport(proxy_handler)
+    bypass_pattern = no_proxy if "://" in no_proxy else f"all://*{no_proxy}"
+    with httpx.Client(
+        transport=direct_transport,
+        mounts={"http://": proxy_transport, bypass_pattern: None},
+    ) as client:
+        client.get(url)
+
+    assert environment_proxy_applies(
+        url,
+        proxies={
+            "http": "http://proxy.test:3128",
+            "no": no_proxy,
+        },
+    ) is (selected_transport == ["proxy"])
+
+
+@pytest.mark.parametrize(
+    ("no_proxy", "bypass_pattern"),
+    [
+        ("xn--bcher-kva.example", "all://*xn--bcher-kva.example"),
+        (
+            "http://xn--bcher-kva.example:8000",
+            "http://xn--bcher-kva.example:8000",
+        ),
+    ],
+)
+def test_environment_proxy_idna_matches_httpx_mount_selection(no_proxy, bypass_pattern):
+    url = "http://xn--bcher-kva.example:8000/v1"
+    selected_transport: list[str] = []
+
+    direct_transport = httpx.MockTransport(
+        lambda _request: selected_transport.append("direct") or httpx.Response(200)
+    )
+    proxy_transport = httpx.MockTransport(
+        lambda _request: selected_transport.append("proxy") or httpx.Response(200)
+    )
+    with httpx.Client(
+        transport=direct_transport,
+        mounts={"http://": proxy_transport, bypass_pattern: None},
+    ) as client:
+        client.get(url)
+
+    assert environment_proxy_applies(
+        url,
+        proxies={
+            "http": "http://proxy.test:3128",
+            "no": no_proxy,
+        },
+    ) is (selected_transport == ["proxy"])
+
+
+@pytest.mark.parametrize(
+    "no_proxy",
+    [
+        "bücher.example",
+        "http://xn--bcher-kva.example:8000,bücher.example",
+    ],
+)
+def test_environment_proxy_treats_invalid_unicode_no_proxy_pattern_as_active(no_proxy):
+    assert (
+        environment_proxy_applies(
+            "http://xn--bcher-kva.example:8000/v1",
+            proxies={
+                "http": "http://proxy.test:3128",
+                "no": no_proxy,
+            },
+        )
+        is True
+    )
 
 
 @pytest.mark.parametrize("port", ["", "0"])

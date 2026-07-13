@@ -11,6 +11,13 @@ from llm_refinery.core.config import ConfigError
 from llm_refinery.core.endpoints import Endpoint
 from llm_refinery.core.http_safety import PinnedHttpRoute
 
+LM_EVAL_MODEL_BACKENDS = frozenset(
+    {
+        "local-chat-completions",
+        "local-completions",
+    }
+)
+
 
 @dataclass(frozen=True)
 class LmEvalConfig:
@@ -70,17 +77,17 @@ class LmEvalConfig:
             raise ConfigError("lm-eval max_length must be positive")
         if not isinstance(self.trust_env, bool):
             raise ConfigError("lm-eval trust_env must be a boolean")
-        if self.trust_env and self.num_concurrent > 1 and self.pinned_route is None:
-            raise ConfigError(
-                "lm-eval trust_env is supported only with num_concurrent=1 because the "
-                "pinned asynchronous API client does not honor proxy environment variables"
-            )
         if self.ca_bundle is not None and not self.ca_bundle.is_file():
             raise ConfigError(f"lm-eval ca_bundle is not a file: {self.ca_bundle}")
         if not self.package_spec.strip():
             raise ConfigError("lm-eval package_spec cannot be empty")
         if any(not package.strip() for package in self.extra_packages):
             raise ConfigError("lm-eval extra package specs cannot be empty")
+        if self.model_backend not in LM_EVAL_MODEL_BACKENDS:
+            supported = ", ".join(sorted(LM_EVAL_MODEL_BACKENDS))
+            raise ConfigError(f"lm-eval model_backend must be one of: {supported}")
+        if self.tokenizer is not None and not self.tokenizer.strip():
+            raise ConfigError("lm-eval tokenizer must be a non-empty string when set")
         if self.tokenizer and self.model_backend == "local-chat-completions":
             raise ConfigError(
                 "lm-eval tokenizer is not supported by the local-chat-completions "

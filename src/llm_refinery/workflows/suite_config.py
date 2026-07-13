@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from llm_refinery.benchmarks.lm_eval.config import LM_EVAL_MODEL_BACKENDS
 from llm_refinery.core.config import (
     ConfigError,
     coerce_list,
@@ -40,6 +41,7 @@ def _strict_integer(value: Any, *, context: str, minimum: int) -> int:
 @dataclass(frozen=True)
 class QualityStep:
     enabled: bool = True
+    model_backend: str = "local-chat-completions"
     tasks: str = "ifeval,gsm8k"
     limit: int | None = 50
     num_fewshot: int | None = None
@@ -59,6 +61,14 @@ class QualityStep:
     ca_bundle: Path | None = None
 
     def __post_init__(self) -> None:
+        if self.model_backend not in LM_EVAL_MODEL_BACKENDS:
+            supported = ", ".join(sorted(LM_EVAL_MODEL_BACKENDS))
+            raise ConfigError(f"suite quality.model_backend must be one of: {supported}")
+        if self.tokenizer and self.model_backend == "local-chat-completions":
+            raise ConfigError(
+                "suite quality.tokenizer requires model_backend: local-completions; "
+                "local-chat-completions ignores client-side tokenization"
+            )
         if self.limit is not None:
             _strict_integer(self.limit, context="suite quality.limit", minimum=1)
         if self.num_fewshot is not None:
@@ -89,6 +99,7 @@ class QualityStep:
             raw,
             {
                 "enabled",
+                "model_backend",
                 "tasks",
                 "limit",
                 "num_fewshot",
@@ -154,8 +165,13 @@ class QualityStep:
             if metadata_raw is not None
             else None
         )
+        model_backend_raw = raw.get("model_backend", "local-chat-completions")
+        if not isinstance(model_backend_raw, str) or not model_backend_raw.strip():
+            raise ConfigError("suite quality.model_backend must be a non-empty string")
+        model_backend = model_backend_raw.strip()
         return cls(
             enabled=_strict_bool(raw.get("enabled", True), context="suite quality.enabled"),
+            model_backend=model_backend,
             tasks=str(raw.get("tasks") or "ifeval,gsm8k"),
             limit=limit,
             num_fewshot=num_fewshot,
@@ -182,6 +198,7 @@ class QualityStep:
     def safe_json(self) -> dict[str, Any]:
         return {
             "enabled": self.enabled,
+            "model_backend": self.model_backend,
             "tasks": self.tasks,
             "limit": self.limit,
             "num_fewshot": self.num_fewshot,

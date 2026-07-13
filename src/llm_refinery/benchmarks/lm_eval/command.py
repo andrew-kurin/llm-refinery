@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Mapping
+from pathlib import Path
 
 from llm_refinery.benchmarks.lm_eval.config import LmEvalConfig
 from llm_refinery.core.config import ConfigError
@@ -10,7 +11,7 @@ from llm_refinery.core.endpoints import Endpoint
 from llm_refinery.providers.openai_chat import validate_http_headers
 
 _BEARER_AUTHORIZATION = re.compile(r"Bearer[ \t]+([^\s]+)", re.IGNORECASE)
-_PROXY_ENVIRONMENT_VARIABLES = (
+_NETWORK_ENVIRONMENT_VARIABLES = (
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "ALL_PROXY",
@@ -19,8 +20,6 @@ _PROXY_ENVIRONMENT_VARIABLES = (
     "https_proxy",
     "all_proxy",
     "no_proxy",
-)
-_CA_ENVIRONMENT_VARIABLES = (
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
     "REQUESTS_CA_BUNDLE",
@@ -28,9 +27,14 @@ _CA_ENVIRONMENT_VARIABLES = (
 )
 
 
-def build_lm_eval_command(config: LmEvalConfig, target: Endpoint) -> list[str]:
+def build_lm_eval_command(
+    config: LmEvalConfig,
+    target: Endpoint,
+    *,
+    output_path: Path | None = None,
+) -> list[str]:
     validate_lm_eval_headers(target)
-    output_path = str(config.output_root / target.name)
+    resolved_output_path = str(output_path or config.output_root / target.name)
     base_url = (
         target.completions_url
         if config.model_backend == "local-completions"
@@ -51,6 +55,10 @@ def build_lm_eval_command(config: LmEvalConfig, target: Endpoint) -> list[str]:
         model_args_parts.append(f"eos_string={config.eos_string}")
     if config.tokenizer:
         model_args_parts.append(f"tokenizer={config.tokenizer}")
+        # lm-eval 0.4.12 otherwise probes the remote tokenizer even when an
+        # explicit HF tokenizer was supplied, leaving its backend/object state
+        # inconsistent when the vLLM endpoints respond.
+        model_args_parts.append("tokenizer_backend=huggingface")
     model_args = ",".join(model_args_parts)
 
     cmd = [
@@ -64,25 +72,16 @@ def build_lm_eval_command(config: LmEvalConfig, target: Endpoint) -> list[str]:
     ]
     for package in config.extra_packages:
         cmd.extend(["--with", package])
+    # The evaluator talks to a loopback deadline relay. With trust_env enabled,
+    # the runner adds a loopback NO_PROXY exemption and otherwise preserves the
+    # child environment for online datasets and tokenizers. With trust_env
+    # disabled, retain the previous explicit proxy/CA isolation. The relay
+    # alone owns the configured target CA bundle.
     child_command: list[str] = []
-    strip_child_proxy = not config.trust_env or config.pinned_route is not None
-    if strip_child_proxy or config.ca_bundle is not None:
+    if not config.trust_env:
         child_command.append("env")
-        if strip_child_proxy:
-            for name in _PROXY_ENVIRONMENT_VARIABLES:
-                child_command.extend(["-u", name])
-        if not config.trust_env or config.ca_bundle is not None:
-            for name in _CA_ENVIRONMENT_VARIABLES:
-                child_command.extend(["-u", name])
-        if config.ca_bundle is not None:
-            ca_bundle = str(config.ca_bundle)
-            child_command.extend(
-                [
-                    f"SSL_CERT_FILE={ca_bundle}",
-                    f"REQUESTS_CA_BUNDLE={ca_bundle}",
-                    f"CURL_CA_BUNDLE={ca_bundle}",
-                ]
-            )
+        for name in _NETWORK_ENVIRONMENT_VARIABLES:
+            child_command.extend(["-u", name])
     child_command.extend(
         [
             "lm_eval",
@@ -116,7 +115,7 @@ def build_lm_eval_command(config: LmEvalConfig, target: Endpoint) -> list[str]:
     if config.metadata:
         cmd.extend(["--metadata", config.metadata])
 
-    cmd.extend(["--output_path", output_path])
+    cmd.extend(["--output_path", resolved_output_path])
     return cmd
 
 

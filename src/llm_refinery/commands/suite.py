@@ -21,7 +21,15 @@ from llm_refinery.workflows.suite_config import load_suite_config
     help="Maximum lm-eval context length.",
 )
 @click.option("--eos-string", help="EOS string for lm-eval.")
-@click.option("--tokenizer", help="Tokenizer id/path for token-aware lm-eval tasks.")
+@click.option(
+    "--model-backend",
+    type=click.Choice(["local-chat-completions", "local-completions"]),
+    help="lm-eval API model backend.",
+)
+@click.option(
+    "--tokenizer",
+    help="Tokenizer id/path; requires the local-completions model backend.",
+)
 @click.option("--metadata", help="lm-eval metadata JSON.")
 @click.option("--gen-kwargs", help="Extra lm-eval generation kwargs.")
 @click.option("--package-spec", help="Override the uvx lm-eval package spec.")
@@ -70,6 +78,7 @@ def suite_command(
     tasks: str | None,
     max_length: int | None,
     eos_string: str | None,
+    model_backend: str | None,
     tokenizer: str | None,
     metadata: str | None,
     gen_kwargs: str | None,
@@ -136,6 +145,7 @@ def suite_command(
         tasks=tasks or suite.quality.tasks,
         max_length=max_length if max_length is not None else suite.quality.max_length,
         eos_string=eos_string or suite.quality.eos_string,
+        model_backend=model_backend or suite.quality.model_backend,
         tokenizer=tokenizer or suite.quality.tokenizer,
         metadata=metadata or suite.quality.metadata,
         gen_kwargs=gen_kwargs if gen_kwargs is not None else suite.quality.gen_kwargs,

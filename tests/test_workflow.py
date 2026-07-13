@@ -486,6 +486,59 @@ def test_suite_quality_accepts_zero_fewshot():
     assert config.quality.num_fewshot == 0
 
 
+def test_suite_quality_accepts_tokenizer_with_completions_backend():
+    config = SuiteConfig.from_mapping(
+        {
+            "endpoint": {
+                "name": "local",
+                "protocol": "openai_chat",
+                "base_url": "http://127.0.0.1:8080/v1",
+                "model": "model",
+            },
+            "quality": {
+                "model_backend": "local-completions",
+                "tokenizer": "org/model-tokenizer",
+            },
+        }
+    )
+
+    assert config.quality.model_backend == "local-completions"
+    assert config.quality.tokenizer == "org/model-tokenizer"
+    assert config.quality.safe_json()["model_backend"] == "local-completions"
+
+
+@pytest.mark.parametrize(
+    ("quality", "message"),
+    [
+        ({"model_backend": "unknown"}, "quality.model_backend must be one of"),
+        ({"model_backend": False}, "quality.model_backend must be a non-empty string"),
+        ({"model_backend": 0}, "quality.model_backend must be a non-empty string"),
+        ({"model_backend": None}, "quality.model_backend must be a non-empty string"),
+        ({"model_backend": ""}, "quality.model_backend must be a non-empty string"),
+        (
+            {"tokenizer": "org/model-tokenizer"},
+            "quality.tokenizer requires model_backend: local-completions",
+        ),
+    ],
+)
+def test_suite_quality_rejects_incoherent_model_backend_configuration(
+    quality: dict[str, object],
+    message: str,
+):
+    with pytest.raises(ConfigError, match=message):
+        SuiteConfig.from_mapping(
+            {
+                "endpoint": {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "model": "model",
+                },
+                "quality": quality,
+            }
+        )
+
+
 def test_suite_can_require_the_response_model_identity(tmp_path: Path):
     config = SuiteConfig.from_mapping(
         {
@@ -764,6 +817,7 @@ def test_remote_suite_resolves_once_for_children_and_overlays_http_target(tmp_pa
 
     assert [call[0] for call in calls] == ["quality", "load"]
     assert calls[0][1].targets["spark"].model == "served-model"
+    assert calls[0][1].model_backend == "local-chat-completions"
     assert calls[0][1].tokenizer is None
     assert calls[0][1].trust_env is False
     assert calls[0][1].pinned_route == inspection.route

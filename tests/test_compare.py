@@ -344,6 +344,66 @@ def test_compare_keeps_historical_inventory_fingerprints_distinct():
     assert {row["run_id"] for row in rows} == {"host-a", "host-b"}
 
 
+def test_compare_groups_verified_cross_version_host_identity_alias():
+    shared = {
+        "trial_name": "suite",
+        "status": "ok",
+        "duration_s": 1.0,
+        "spec_hash": "declarative-suite-spec",
+        "config_json": {"params": {}},
+        "system_json": {"host_fingerprint": "mac"},
+        "metrics": {"score": 1.0},
+    }
+    target_shared = {
+        "schema_version": 1,
+        "name": "spark",
+        "service": {"base_url": "http://spark.local:8000/v1"},
+        "model": {"id": "served"},
+        "topology": {"measurement_scope": "remote_client_to_server"},
+    }
+    legacy = {
+        **target_shared,
+        "host": {
+            "profile": {
+                "hostname": "spark",
+                "host_fingerprint": "host-prior-hardware",
+                "host_fingerprint_strength": "hardware",
+            }
+        },
+    }
+    migrated = {
+        **target_shared,
+        "host": {
+            "profile": {
+                "hostname": "spark",
+                "host_fingerprint": "host-canonical-installation",
+                "host_fingerprint_strength": "installation",
+                "host_hardware_fingerprint": "host-prior-hardware",
+                "host_fingerprint_aliases": [
+                    {"fingerprint": "host-prior-hardware", "strength": "hardware"}
+                ],
+            }
+        },
+        "host_identity_binding": {
+            "expected_fingerprint": "host-prior-hardware",
+            "actual_fingerprint": "host-prior-hardware",
+            "actual_strength": "hardware",
+            "verified": True,
+        },
+    }
+
+    rows = build_compare_rows(
+        [
+            {**shared, "run_id": "migrated", "target_json": migrated},
+            {**shared, "run_id": "legacy", "target_json": legacy},
+        ],
+        metrics=("score",),
+        limit=10,
+    )
+
+    assert [row["run_id"] for row in rows] == ["migrated"]
+
+
 def test_compare_supports_target_and_executor_dotted_params():
     rows = build_compare_rows(
         [

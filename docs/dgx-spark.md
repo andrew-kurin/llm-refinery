@@ -119,15 +119,32 @@ For a schema-v2 target suite, quality evaluation inherits the target's
 `quality.ca_bundle` can override that policy; legacy endpoint suites default to
 a direct path. The harness gives lm-eval a temporary loopback URL and relays
 requests to the already-resolved address. The relay preserves logical Host and
-HTTPS SNI, applies the configured CA, and refuses upstream redirects. Package
-and dataset resolution by `uvx` retains the executor's network environment;
-proxy and CA variables are removed or replaced only for the lm-eval child.
+HTTPS SNI, applies the configured CA, and refuses upstream redirects. With
+`trust_env: true`, both `uvx` and the lm-eval child retain the executor's
+network environment for package, dataset, and tokenizer resolution; the runner
+merges loopback entries into `NO_PROXY`/`no_proxy`. With `trust_env: false`, the
+lm-eval child explicitly drops ambient proxy and CA variables. In both modes,
+only the relay applies the target's upstream proxy and CA policy.
 
-The pinned `local-chat-completions` backend does not perform client-side
-tokenization or token-aware truncation. The harness therefore rejects a quality
-`tokenizer` setting rather than pretending it is active. Keep quality request
-sizes within the discovered `max_model_len`; use a completions backend only when
-the service actually exposes `/v1/completions` and the selected tasks support it.
+The default `quality.model_backend: local-chat-completions` backend does not
+perform client-side tokenization or token-aware truncation. The harness therefore
+rejects a quality `tokenizer` setting with that backend rather than pretending it
+is active. Set `quality.model_backend: local-completions` together with
+`quality.tokenizer` only when the service actually exposes `/v1/completions` and
+the selected tasks support it. The same pairing is available as
+`suite --model-backend local-completions --tokenizer ID`. An explicit tokenizer
+uses lm-eval's Hugging Face tokenizer backend; omit it to let lm-eval detect
+vLLM's remote tokenizer. The relay forwards `/tokenizer_info`, `/tokenize`, and
+`/detokenize` through the same pinned route and deadline policy. Keep quality
+request sizes within the discovered `max_model_len`.
+
+Every quality child run writes lm-eval output beneath a unique directory named
+for its recorded run ID. Result and sample collection is restricted to that
+directory, so overlapping runs of the same target cannot consume each other's
+artifacts. All model requests, including route-less local targets, pass through
+the loopback relay so `request_timeout_s` is an absolute per-request deadline;
+the relay alone applies the configured upstream proxy, CA, and pinned-route
+policy.
 
 ## Run the smoke suite
 

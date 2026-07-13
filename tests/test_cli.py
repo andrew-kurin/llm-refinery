@@ -71,6 +71,15 @@ def test_lm_eval_command_accepts_arbitrary_openai_compatible_target():
     assert "https://example.test/v1" in result.output
 
 
+def test_lm_eval_help_does_not_restrict_trust_env_concurrency():
+    result = CliRunner().invoke(main, ["lm-eval", "--help"])
+
+    assert result.exit_code == 0
+    assert "Honor proxy and CA environment variables" in result.output
+    assert "relay and online child traffic" in result.output
+    assert "supported only with --num-concurrent 1" not in result.output
+
+
 def test_lm_eval_command_dry_run_supports_include_path_and_suite_db(tmp_path):
     include_path = tmp_path / "tasks"
     include_path.mkdir()
@@ -148,7 +157,7 @@ def test_suite_discovery_overrides_keep_ssh_and_http_planes_separate(
         f"""
 schema_version: 2
 name: spark-suite
-database: {tmp_path / 'runs.duckdb'}
+database: {tmp_path / "runs.duckdb"}
 target:
   name: spark
   host:
@@ -203,6 +212,48 @@ preflight:
     assert config.target.model.selection == "explicit"
     assert config.target.model.model_id == "chosen-model"
     assert config.http_load.targets == ("scenario-target",)
+
+
+def test_suite_quality_backend_and_tokenizer_cli_overrides(tmp_path, monkeypatch):
+    manifest = tmp_path / "suite.yaml"
+    manifest.write_text(
+        """
+name: completions-suite
+quality:
+  enabled: false
+http_load:
+  enabled: false
+preflight:
+  enabled: false
+""",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    class FakeWorkflow:
+        def __init__(self, config):
+            captured["config"] = config
+
+        def execute(self):
+            return None
+
+    monkeypatch.setattr("llm_refinery.commands.suite.BenchmarkSuiteWorkflow", FakeWorkflow)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "suite",
+            str(manifest),
+            "--model-backend",
+            "local-completions",
+            "--tokenizer",
+            "org/model-tokenizer",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"].quality.model_backend == "local-completions"
+    assert captured["config"].quality.tokenizer == "org/model-tokenizer"
 
 
 def test_compare_command_shows_params_and_sorts_by_generation_tps(tmp_path):

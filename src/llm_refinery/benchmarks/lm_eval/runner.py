@@ -7,6 +7,7 @@ import ssl
 import subprocess
 import threading
 import time
+from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -49,6 +50,7 @@ _RELAY_RESPONSE_HEADERS = {
     "retry-after": "Retry-After",
     "retry-after-ms": "retry-after-ms",
 }
+_LOOPBACK_NO_PROXY = ("127.0.0.1", "localhost")
 
 
 class _RelayState:
@@ -156,7 +158,7 @@ def run_lm_eval(
     selected = resolve_target_names(config.target, set(targets))
     config.output_root.mkdir(parents=True, exist_ok=True)
 
-    env = os.environ.copy()
+    env = _lm_eval_environment(os.environ)
     offline_value = "1" if config.offline else "0"
     env["HF_DATASETS_OFFLINE"] = offline_value
     env["HF_HUB_OFFLINE"] = offline_value
@@ -171,27 +173,33 @@ def run_lm_eval(
         assert active_store is not None
         for target_name in selected:
             logical_target = targets[target_name]
+            api_key = None if dry_run else lm_eval_api_key(logical_target, environ=os.environ)
             target = relay_stack.enter_context(
-                _lm_eval_target(logical_target, config, dry_run=dry_run)
+                _lm_eval_target(
+                    logical_target,
+                    config,
+                    dry_run=dry_run,
+                    api_key=api_key,
+                )
             )
             limit_text = str(config.limit) if config.limit is not None else "all"
-            output_path = config.output_root / target.name
-            cmd = build_lm_eval_command(config, target)
-            command_text = shlex.join(cmd)
+            command_output_path = config.output_root / target.name / "<run-id>"
+            command_template = build_lm_eval_command(
+                config,
+                logical_target,
+                output_path=command_output_path,
+            )
+            command_text = shlex.join(command_template)
             print(
                 f"==> Running lm-eval target={target.name} tasks={config.tasks} limit={limit_text}"
             )
-            print(f"    model={target.model} base_url={target.base_url}")
-            print(f"    output_path={output_path}")
+            print(f"    model={target.model} base_url={logical_target.base_url}")
             if dry_run:
+                print(f"    output_path={command_output_path}")
                 print(command_text)
                 relay_stack.pop_all().close()
                 continue
 
-            recorded_command_text = command_text.replace(
-                target.base_url,
-                logical_target.base_url,
-            )
             spec = _run_spec(
                 config,
                 target_name=target.name,
@@ -199,21 +207,23 @@ def run_lm_eval(
                 target_base_url=logical_target.base_url,
                 target_api_key_env=logical_target.api_key_env,
                 target_headers=logical_target.headers,
-                command_text=recorded_command_text,
+                command_text=command_text,
                 database=active_store.database,
                 parent_run_id=parent_run_id,
                 run_context=run_context,
             )
-            with RunSession(active_store, spec, run_context=run_context) as run:
+            session = RunSession(active_store, spec, run_context=run_context)
+            output_path = config.output_root / target.name / session.run_id
+            cmd = build_lm_eval_command(config, target, output_path=output_path)
+            print(f"    output_path={output_path}")
+            with session as run:
                 stdout_path = run.artifact("stdout", "stdout.txt", "text/plain")
                 stderr_path = run.artifact("stderr", "stderr.txt", "text/plain")
                 result_path = run.artifact("result", "result.json", "application/json")
-                result_started_mtime = time.time()
                 target_env = env.copy()
                 # lm-eval's API adapter reads only OPENAI_API_KEY. Resolve the target's
                 # credential into the child environment and never place it in command argv.
                 target_env.pop("OPENAI_API_KEY", None)
-                api_key = lm_eval_api_key(target, environ=os.environ)
                 if api_key is not None:
                     target_env["OPENAI_API_KEY"] = api_key
                 completed, process_timed_out = _run_lm_eval_process(
@@ -229,10 +239,7 @@ def run_lm_eval(
                     _redact_subprocess_output(completed.stderr or "", api_key),
                     encoding="utf-8",
                 )
-                source_result = latest_lm_eval_result(
-                    output_path,
-                    newer_than=result_started_mtime,
-                )
+                source_result = latest_lm_eval_result(output_path)
                 metrics: dict[str, float] = {}
                 parsed_samples: list[ParsedLmEvalSample] = []
                 sample_error: str | None = None
@@ -298,6 +305,28 @@ def run_lm_eval(
                 raise LmEvalFailed(f"lm-eval failed for {target.name}: {error}")
             relay_stack.pop_all().close()
     return outcomes
+
+
+def _lm_eval_environment(environment: Mapping[str, str]) -> dict[str, str]:
+    """Preserve child network policy while forcing model traffic off proxies."""
+    result = dict(environment)
+    entries: list[str] = []
+    seen: set[str] = set()
+    for name in ("NO_PROXY", "no_proxy"):
+        for raw_entry in environment.get(name, "").split(","):
+            entry = raw_entry.strip()
+            key = entry.casefold()
+            if entry and key not in seen:
+                entries.append(entry)
+                seen.add(key)
+    for entry in _LOOPBACK_NO_PROXY:
+        if entry.casefold() not in seen:
+            entries.append(entry)
+            seen.add(entry.casefold())
+    merged = ",".join(entries)
+    result["NO_PROXY"] = merged
+    result["no_proxy"] = merged
+    return result
 
 
 def _run_spec(
@@ -441,18 +470,19 @@ def _lm_eval_target(
     config: LmEvalConfig,
     *,
     dry_run: bool,
+    api_key: str | None = None,
 ):
     route = config.pinned_route
-    if route is None or dry_run:
+    if dry_run:
         yield target
         return
-    pinned_route = route
-    pinned_route.request_url(target.base_url)
+    if route is not None:
+        route.request_url(target.base_url)
 
     client_trust_env = pinned_route_trust_env(
         target.base_url,
         trust_env=config.trust_env,
-        route_is_pinned=True,
+        route_is_pinned=route is not None,
     )
     try:
         verify = httpx.create_ssl_context(
@@ -462,26 +492,48 @@ def _lm_eval_target(
     except (OSError, ssl.SSLError) as exc:
         raise ConfigError(f"could not load lm-eval CA bundle: {config.ca_bundle}") from exc
     logical = urlsplit(target.base_url)
-    allowed_paths = {
-        urlsplit(target.chat_completions_url).path,
-        urlsplit(target.completions_url).path,
+    allowed_requests = {
+        ("POST", urlsplit(target.chat_completions_url).path),
+        ("POST", urlsplit(target.completions_url).path),
     }
+    tokenizer_requests: set[tuple[str, str]] = set()
+    if config.model_backend == "local-completions" and config.tokenizer is None:
+        tokenizer_base = (
+            target.completions_url.replace("/v1/completions", "")
+            .replace("/v1/chat/completions", "")
+            .rstrip("/")
+        )
+        tokenizer_path = urlsplit(tokenizer_base).path.rstrip("/")
+        tokenizer_requests = {
+            ("GET", f"{tokenizer_path}/tokenizer_info"),
+            ("POST", f"{tokenizer_path}/tokenize"),
+            ("POST", f"{tokenizer_path}/detokenize"),
+        }
+        allowed_requests.update(tokenizer_requests)
     relay_state = _RelayState()
 
     class RelayHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self._forward("GET")
+
         def do_POST(self) -> None:
+            self._forward("POST")
+
+        def _forward(self, method: str) -> None:
             request_path = urlsplit(self.path).path
-            if request_path not in allowed_paths:
+            if (method, request_path) not in allowed_requests:
                 self.send_error(404)
                 return
-            try:
-                content_length = int(self.headers.get("Content-Length", ""))
-            except ValueError:
-                content_length = -1
-            if content_length < 0 or content_length > _MAX_RELAY_BODY_BYTES:
-                self.send_error(413)
-                return
-            body = self.rfile.read(content_length)
+            body: bytes | None = None
+            if method == "POST":
+                try:
+                    content_length = int(self.headers.get("Content-Length", ""))
+                except ValueError:
+                    content_length = -1
+                if content_length < 0 or content_length > _MAX_RELAY_BODY_BYTES:
+                    self.send_error(413)
+                    return
+                body = self.rfile.read(content_length)
             forward_url = urlunsplit(
                 (logical.scheme, logical.netloc, request_path, urlsplit(self.path).query, "")
             )
@@ -497,6 +549,24 @@ def _lm_eval_target(
                     "transfer-encoding",
                 }
             }
+            # lm-eval 0.4.12 does not attach its OPENAI_API_KEY to remote
+            # tokenizer probes. Inject it only for those narrowly allowlisted
+            # routes; model requests must authenticate to the loopback relay.
+            if api_key is not None and (method, request_path) in tokenizer_requests:
+                headers = {
+                    key: value
+                    for key, value in headers.items()
+                    if key.casefold() != "authorization"
+                }
+                headers["Authorization"] = f"Bearer {api_key}"
+            if route is not None:
+                upstream_url = route.request_url(forward_url)
+                upstream_headers = route.request_headers(headers)
+                extensions = {"sni_hostname": route.sni_hostname}
+            else:
+                upstream_url = forward_url
+                upstream_headers = headers
+                extensions = {}
             client = httpx.Client(
                 follow_redirects=False,
                 trust_env=client_trust_env,
@@ -520,11 +590,11 @@ def _lm_eval_target(
             timer.start()
             try:
                 with client.stream(
-                    "POST",
-                    pinned_route.request_url(forward_url),
+                    method,
+                    upstream_url,
                     content=body,
-                    headers=pinned_route.request_headers(headers),
-                    extensions={"sni_hostname": pinned_route.sni_hostname},
+                    headers=upstream_headers,
+                    extensions=extensions,
                     timeout=config.request_timeout_s,
                 ) as response:
                     if 300 <= response.status_code < 400:
@@ -549,6 +619,7 @@ def _lm_eval_target(
                 self.send_error(502, "upstream request failed")
             finally:
                 timer.cancel()
+                timer.join()
                 with suppress(Exception):
                     client.close()
                 relay_state.remove_client(client)

@@ -623,6 +623,44 @@ def test_ssh_adapter_reports_timeout_and_rejects_oversized_output():
         OpenSSHClient(runner=oversized_runner).collect_host_profile(access)
 
 
+def test_ssh_adapter_strips_terminal_sequences_from_failure_details():
+    def runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        stderr = (
+            "\x1b[31mpermission denied\x1b[0m\n"
+            "\x1b]2;forged terminal title\x07"
+            "\x1bPprivate payload\x1b\\"
+            "retry\x00\x7f\x85"
+        )
+        return subprocess.CompletedProcess(argv, 255, stdout="", stderr=stderr)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        OpenSSHClient(runner=runner).collect_host_profile(
+            HostAccess(access="ssh", destination="dgx")
+        )
+
+    message = str(exc_info.value)
+    assert message.endswith(": permission denied retry")
+    assert "forged terminal title" not in message
+    assert "private payload" not in message
+    assert all(
+        ord(character) >= 0x20 and not 0x7F <= ord(character) <= 0x9F for character in message
+    )
+
+
+def test_ssh_adapter_strips_terminal_sequences_from_execution_errors():
+    def runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del argv, kwargs
+        raise OSError("\x9b31munsafe\x9b0m \x9dforged title\x9csafe")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        OpenSSHClient(runner=runner).collect_host_profile(
+            HostAccess(access="ssh", destination="dgx")
+        )
+
+    assert str(exc_info.value) == "could not execute target host inventory: unsafe safe"
+
+
 @pytest.mark.parametrize("output_fd", [1, 2])
 def test_ssh_adapter_bounds_streamed_stdout_and_stderr(
     tmp_path: Path,
@@ -1022,16 +1060,24 @@ def test_resolver_fails_closed_on_host_fingerprint_mismatch(actual: str | None):
         profile.pop("host_fingerprint")
     else:
         profile["host_fingerprint"] = actual
+    service = _FakeService(_service("served-model"))
     resolver = TargetResolver(
         ssh_client=_FakeSSH(HostDiscovery(transport="ssh", destination="dgx", profile=profile)),  # type: ignore[arg-type]
-        service_client=_FakeService(error="connection refused"),  # type: ignore[arg-type]
+        service_client=service,  # type: ignore[arg-type]
     )
 
-    with pytest.raises(RuntimeError, match="fingerprint does not match"):
+    with pytest.raises(RuntimeError, match="fingerprint does not match") as exc_info:
         resolver.inspect(
             TargetSpec.from_mapping(raw),
             allow_service_unavailable=True,
         )
+
+    assert service.calls == []
+    inspection = exc_info.value.target_inspection
+    assert inspection.host is not None
+    assert inspection.host.profile == profile
+    assert inspection.service is None
+    assert inspection.safe_json()["status"] == "unavailable"
 
 
 @pytest.mark.parametrize(
@@ -1101,13 +1147,23 @@ def test_openai_discovery_uses_api_auth_and_sanitizes_server_info(
                     "tokenizer": "org/tokenizer",
                     "tokenizer_revision": "revision-123",
                     "max_num_batched_tokens": 8192,
+                    "max_tokens": 4096,
+                    "maxTokens": 2048,
                     "api_key": "server-secret",
                     "hf_token": "server-secret",
                     "github_token": "server-secret",
                     "admin-token": "server-secret",
+                    "secret_key": "server-secret",
+                    "clientSecret": "server-secret",
+                    "aws_secret_access_key": "server-secret",
+                    "AWSSecretAccessKey": "server-secret",
+                    "XApiKey": "server-secret",
+                    "passwd": "server-secret",
+                    "passphrase": "server-secret",
                     "nested": {
                         "authorization": "server-secret",
                         "password": "server-secret",
+                        "database_password_hash": "server-secret",
                         "safe": True,
                     },
                 },
@@ -1144,6 +1200,8 @@ def test_openai_discovery_uses_api_auth_and_sanitizes_server_info(
         "tokenizer": "org/tokenizer",
         "tokenizer_revision": "revision-123",
         "max_num_batched_tokens": 8192,
+        "max_tokens": 4096,
+        "maxTokens": 2048,
         "nested": {"safe": True},
     }
     assert metrics == "vllm:num_requests_running 0\n"
@@ -1352,6 +1410,85 @@ def test_openai_discovery_applies_total_stream_deadline(monkeypatch: pytest.Monk
 
     with pytest.raises(RuntimeError, match="exceeded the total timeout"):
         _discovery_client(handler, timeout_s=5.0).metrics(_spec().endpoint)
+
+
+def test_openai_discovery_waits_for_dequeued_deadline_callback(monkeypatch):
+    callback_may_run = threading.Event()
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    request_finished = threading.Event()
+
+    class RacingTimer:
+        def __init__(self, _interval: float, function: Callable[[], None]) -> None:
+            self._function = function
+            self._thread = threading.Thread(target=self._run, daemon=True)
+
+        def _run(self) -> None:
+            callback_may_run.wait(timeout=2)
+            self._function()
+
+        def start(self) -> None:
+            self._thread.start()
+
+        def cancel(self) -> None:
+            # Model Timer.cancel() losing the race after the callback is dequeued.
+            pass
+
+        def join(self) -> None:
+            self._thread.join(timeout=2)
+
+    class BlockingCloseClient:
+        is_closed = False
+
+        def close(self) -> None:
+            callback_started.set()
+            if release_callback.wait(timeout=2):
+                self.is_closed = True
+
+    def bounded_response(*args: Any, **kwargs: Any) -> httpx.Response:
+        del args, kwargs
+        callback_may_run.set()
+        if not callback_started.wait(timeout=1):
+            raise AssertionError("deadline callback did not start")
+        request = httpx.Request("GET", "http://spark.local:8000/health")
+        return httpx.Response(200, request=request)
+
+    monkeypatch.setattr(openai_discovery_module.threading, "Timer", RacingTimer)
+    monkeypatch.setattr(
+        openai_discovery_module,
+        "_get_bounded_response_before_deadline",
+        bounded_response,
+    )
+    client = BlockingCloseClient()
+    result: list[httpx.Response] = []
+    errors: list[BaseException] = []
+
+    def request() -> None:
+        try:
+            result.append(
+                openai_discovery_module._get_bounded_response(
+                    client,  # type: ignore[arg-type]
+                    "http://spark.local:8000/health",
+                    headers={},
+                    timeout_s=5.0,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+        finally:
+            request_finished.set()
+
+    thread = threading.Thread(target=request)
+    thread.start()
+    assert callback_started.wait(timeout=1)
+    assert not request_finished.wait(timeout=0.05)
+    release_callback.set()
+    thread.join(timeout=1)
+
+    assert request_finished.is_set()
+    assert errors == []
+    assert result[0].status_code == 200
+    assert client.is_closed is True
 
 
 def test_openai_discovery_owns_and_closes_test_clients():
@@ -1822,13 +1959,20 @@ def test_allow_service_unavailable_does_not_suppress_required_host_failure():
         def collect_host_profile(self, access: HostAccess) -> HostDiscovery:
             raise RuntimeError("permission denied")
 
+    service = _FakeService(_service("served-model"))
     resolver = TargetResolver(
         ssh_client=FailingSSH(),  # type: ignore[arg-type]
-        service_client=_FakeService(error="connection refused"),  # type: ignore[arg-type]
+        service_client=service,  # type: ignore[arg-type]
     )
 
-    with pytest.raises(RuntimeError, match="host: permission denied"):
+    with pytest.raises(RuntimeError, match="host: permission denied") as exc_info:
         resolver.inspect(_spec(), allow_service_unavailable=True)
+
+    assert service.calls == []
+    inspection = exc_info.value.target_inspection
+    assert inspection.host is None
+    assert inspection.service is None
+    assert inspection.errors == ("host: permission denied",)
 
 
 @pytest.mark.parametrize(

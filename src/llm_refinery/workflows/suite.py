@@ -351,6 +351,7 @@ class BenchmarkSuiteWorkflow:
         self._log(f"Running lm-eval quality (tasks={quality.tasks}, limit={quality.limit})")
         lm_config = LmEvalConfig(
             target=endpoint.name,
+            model_backend=quality.model_backend,
             limit=quality.limit,
             tasks=quality.tasks,
             max_length=quality.max_length,

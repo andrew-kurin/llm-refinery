@@ -100,12 +100,12 @@ from llm_refinery.core.endpoints import OPENAI_CHAT, Endpoint
     "--trust-env/--no-trust-env",
     default=False,
     show_default=True,
-    help="Honor proxy environment variables (supported only with --num-concurrent 1).",
+    help="Honor proxy and CA environment variables for relay and online child traffic.",
 )
 @click.option(
     "--ca-bundle",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    help="PEM CA bundle used consistently by lm-eval HTTP clients.",
+    help="PEM CA bundle for the relay's upstream model connection.",
 )
 @click.option(
     "--output-root",

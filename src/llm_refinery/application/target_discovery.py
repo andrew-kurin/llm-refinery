@@ -51,7 +51,8 @@ class TargetResolver:
         fatal_errors: list[str] = []
         host: HostDiscovery | None = None
         try:
-            host = self.snapshot_host(spec)
+            host = self._capture_host(spec)
+            self._verify_host(spec, host)
         except RuntimeError as exc:
             error = f"host: {exc}"
             errors.append(error)
@@ -60,29 +61,30 @@ class TargetResolver:
 
         service = None
         route: PinnedHttpRoute | None = None
-        try:
-            route = self._service_route(spec)
-            service = self._service_client.discover(
-                spec.endpoint,
-                spec.discovery,
-                spec.transport,
-                route=route,
-            )
-            errors.extend(service.errors)
-        except ConfigError as exc:
-            error = f"service: {exc}"
-            partial = TargetInspection(
-                spec=spec,
-                host=host,
-                service=None,
-                resolved=None,
-                route=route,
-                errors=tuple(dict.fromkeys([*errors, error])),
-            )
-            exc.target_inspection = partial  # type: ignore[attr-defined]
-            raise
-        except RuntimeError as exc:
-            errors.append(f"service: {exc}")
+        if not fatal_errors:
+            try:
+                route = self._service_route(spec)
+                service = self._service_client.discover(
+                    spec.endpoint,
+                    spec.discovery,
+                    spec.transport,
+                    route=route,
+                )
+                errors.extend(service.errors)
+            except ConfigError as exc:
+                error = f"service: {exc}"
+                partial = TargetInspection(
+                    spec=spec,
+                    host=host,
+                    service=None,
+                    resolved=None,
+                    route=route,
+                    errors=tuple(dict.fromkeys([*errors, error])),
+                )
+                exc.target_inspection = partial  # type: ignore[attr-defined]
+                raise
+            except RuntimeError as exc:
+                errors.append(f"service: {exc}")
 
         selected: ModelDescriptor | None = None
         selection: str | None = None
@@ -163,14 +165,21 @@ class TargetResolver:
 
     def snapshot_host(self, spec: TargetSpec) -> HostDiscovery:
         """Capture host state without repeating service/model discovery."""
+        host = self._capture_host(spec)
+        self._verify_host(spec, host)
+        return host
+
+    def _capture_host(self, spec: TargetSpec) -> HostDiscovery:
         if spec.host.access == HOST_ACCESS_LOCAL:
-            host = HostDiscovery(
+            return HostDiscovery(
                 transport=HOST_ACCESS_LOCAL,
                 destination=None,
                 profile=dict(self._local_system_profile()),
             )
-        else:
-            host = self._ssh_client.collect_host_profile(spec.host)
+        return self._ssh_client.collect_host_profile(spec.host)
+
+    @staticmethod
+    def _verify_host(spec: TargetSpec, host: HostDiscovery) -> None:
         expected_fingerprint = spec.host.expected_fingerprint
         fingerprint_candidates = host_fingerprint_candidates(host.profile)
         if expected_fingerprint is not None and expected_fingerprint not in fingerprint_candidates:
@@ -189,7 +198,6 @@ class TargetResolver:
                 "host.expected_fingerprint verification "
                 f"(strength={fingerprint_candidates.get(expected_fingerprint)!r})"
             )
-        return host
 
     def metrics(self, spec: TargetSpec) -> str:
         return self._service_client.metrics(

@@ -8,6 +8,9 @@ target: ../targets/dgx-spark-vllm.yaml
 
 quality:
   enabled: true
+  # Use local-completions instead only when /v1/completions is served and a
+  # client-side tokenizer is required by the selected tasks.
+  model_backend: local-chat-completions
   tasks: ifeval_pinned
   limit: 10
   max_length: 32768

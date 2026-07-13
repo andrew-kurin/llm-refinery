@@ -49,6 +49,18 @@ _SECRET_KEYS = frozenset(
         "private_key",
     }
 )
+_SECRET_KEY_SEGMENTS = frozenset(
+    {
+        "authorization",
+        "credential",
+        "credentials",
+        "passphrase",
+        "passwd",
+        "password",
+        "secret",
+        "token",
+    }
+)
 _SECRET_SUFFIXES = (
     "_api_key",
     "_password",
@@ -303,6 +315,10 @@ def _get_bounded_response(
         raise
     finally:
         timer.cancel()
+        # ``Timer.cancel()`` only prevents a callback that has not started yet.
+        # Once the callback has been dequeued it may still close this client, so
+        # wait for it before discovery is allowed to reuse the client.
+        timer.join()
 
 
 def _get_bounded_response_before_deadline(
@@ -457,8 +473,19 @@ def _sanitize(value: Any) -> Any:
 
 
 def _is_secret_key(key: str) -> bool:
-    normalized = re.sub(r"[^a-z0-9]+", "_", key.casefold()).strip("_")
-    return normalized in _SECRET_KEYS or normalized.endswith(_SECRET_SUFFIXES)
+    # Split acronym-to-word boundaries before ordinary camel-case boundaries so
+    # names such as ``AWSSecretAccessKey`` and ``XApiKey`` are normalized to
+    # ``aws_secret_access_key`` and ``x_api_key`` rather than keeping the
+    # credential-bearing words fused to their acronym prefixes.
+    acronym_separated = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", key)
+    camel_separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", acronym_separated)
+    normalized = re.sub(r"[^a-z0-9]+", "_", camel_separated.casefold()).strip("_")
+    segments = frozenset(normalized.split("_"))
+    return (
+        normalized in _SECRET_KEYS
+        or normalized.endswith(_SECRET_SUFFIXES)
+        or not segments.isdisjoint(_SECRET_KEY_SEGMENTS)
+    )
 
 
 def _error_text(exc: Exception) -> str:

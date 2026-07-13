@@ -7,6 +7,8 @@ from typing import TypeAlias
 from urllib.parse import urlparse, urlsplit, urlunsplit
 from urllib.request import getproxies
 
+import httpx
+
 from llm_refinery.core.config import ConfigError
 
 HttpOrigin: TypeAlias = tuple[str, str, int]
@@ -230,15 +232,25 @@ def environment_proxy_applies(
     proxies: dict[str, str] | None = None,
 ) -> bool:
     """Return whether HTTPX would proxy the logical origin from the environment."""
-    scheme, hostname, port = http_origin(url)
-    if _is_explicit_client_loopback_host(hostname):
+    scheme, canonical_hostname, port = http_origin(url)
+    if _is_explicit_client_loopback_host(canonical_hostname):
         return False
     environment = getproxies() if proxies is None else proxies
     if not (environment.get(scheme) or environment.get("all")):
         return False
+    # Origin comparison intentionally treats a DNS root dot as equivalent, but
+    # HTTPX URLPattern matching preserves it and applies HTTPX's own IDNA
+    # normalization to the request host. Match against that public URL view so
+    # a punycode spelling cannot be mistaken for a NO_PROXY bypass.
+    try:
+        proxy_hostname = httpx.URL(url).host.casefold()
+    except (httpx.InvalidURL, UnicodeError):
+        # If HTTPX cannot normalize the logical URL, do not silently convert an
+        # environment-proxied target into a direct pinned connection.
+        return True
     return not _httpx_no_proxy_bypass(
         scheme=scheme,
-        hostname=hostname,
+        hostname=proxy_hostname,
         port=port,
         no_proxy=str(environment.get("no") or ""),
     )
@@ -259,65 +271,66 @@ def _httpx_no_proxy_bypass(
     port. Keep the safety decision aligned with those request-time patterns.
     """
     target_pattern_port = None if port == {"http": 80, "https": 443}.get(scheme) else port
-    for raw_pattern in no_proxy.split(","):
-        pattern = raw_pattern.strip()
-        if not pattern:
-            continue
-        if pattern == "*":
-            return True
-        if "://" in pattern:
-            raw_scheme = pattern.split("://", 1)[0]
-            parsed = urlsplit(pattern)
-            pattern_scheme = parsed.scheme.casefold()
-            if pattern_scheme not in {"all", scheme}:
-                continue
-            pattern_hostname = parsed.hostname
-            try:
-                pattern_port = parsed.port
-            except ValueError:
-                continue
-            if pattern_hostname is None:
-                continue
-            if raw_scheme in {"http", "https"} and pattern_port == {"http": 80, "https": 443}.get(
-                pattern_scheme
-            ):
-                # HTTPX normalizes an explicitly written default port out of a
-                # URLPattern, making the pattern port-agnostic.
-                pattern_port = None
-        else:
-            pattern_hostname, pattern_port = _split_no_proxy_host_port(pattern)
-            # HTTPX treats bare IP addresses and the exact string "localhost"
-            # as exact patterns. Other bare entries receive a leading wildcard:
-            # "example.com" matches it and its subdomains, while ".example.com"
-            # matches subdomains only.
-            address_text = pattern.split("/", 1)[0]
-            if _explicit_ip_address(address_text) is not None:
-                pattern_hostname = address_text
-            elif pattern.casefold() != "localhost":
-                pattern_hostname = f"*{pattern_hostname}"
+    patterns = [raw_pattern.strip() for raw_pattern in no_proxy.split(",") if raw_pattern.strip()]
+    if "*" in patterns:
+        return True
 
-        normalized_pattern = pattern_hostname.casefold().rstrip(".")
+    normalized_patterns: list[tuple[str, str, int | None]] = []
+    for pattern in patterns:
+        normalized = _normalized_httpx_no_proxy_pattern(pattern)
+        if normalized is None:
+            # Invalid environment patterns cannot establish a trustworthy
+            # bypass. Treat the configured proxy as active for pinned routes.
+            return False
+        normalized_patterns.append(normalized)
+
+    for pattern_scheme, normalized_pattern, pattern_port in normalized_patterns:
+        if pattern_scheme not in {"", scheme}:
+            continue
         if pattern_port is not None and pattern_port != target_pattern_port:
             continue
-        if _no_proxy_host_matches(hostname, normalized_pattern):
+        if not normalized_pattern or _no_proxy_host_matches(hostname, normalized_pattern):
             return True
     return False
 
 
-def _split_no_proxy_host_port(pattern: str) -> tuple[str, int | None]:
-    if pattern.startswith("["):
-        parsed = urlsplit(f"//{pattern}")
+def _normalized_httpx_no_proxy_pattern(
+    pattern: str,
+) -> tuple[str, str, int | None] | None:
+    """Return the URLPattern fields HTTPX derives from one NO_PROXY entry."""
+    if "://" in pattern:
+        pattern_url = pattern
+    else:
+        address_text = pattern.split("/", 1)[0]
         try:
-            return parsed.hostname or pattern, parsed.port
+            ipaddress.IPv4Address(address_text)
         except ValueError:
-            return pattern, None
-    if pattern.count(":") == 1:
-        host, separator, port_text = pattern.rpartition(":")
-        if separator and port_text.isdigit():
-            port = int(port_text)
-            if 0 < port <= 65535:
-                return host, port
-    return pattern, None
+            is_ipv4 = False
+        else:
+            is_ipv4 = True
+        try:
+            ipaddress.IPv6Address(address_text)
+        except ValueError:
+            is_ipv6 = False
+        else:
+            is_ipv6 = True
+
+        if is_ipv4:
+            pattern_url = f"all://{pattern}"
+        elif is_ipv6:
+            pattern_url = f"all://[{pattern}]"
+        elif pattern.casefold() == "localhost":
+            pattern_url = f"all://{pattern}"
+        else:
+            pattern_url = f"all://*{pattern}"
+
+    try:
+        parsed = httpx.URL(pattern_url)
+    except (httpx.InvalidURL, UnicodeError):
+        return None
+    pattern_scheme = "" if parsed.scheme == "all" else parsed.scheme
+    pattern_hostname = "" if parsed.host == "*" else parsed.host.casefold()
+    return pattern_scheme, pattern_hostname, parsed.port
 
 
 def _no_proxy_host_matches(hostname: str, pattern: str) -> bool:

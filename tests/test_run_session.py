@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -404,6 +405,128 @@ def test_run_context_target_identity_excludes_volatile_observations():
         RunContext(target_json=base).target_identity_json()
         != RunContext(target_json=changed_route).target_identity_json()
     )
+
+
+def _cross_version_target_pair() -> tuple[dict[str, Any], dict[str, Any]]:
+    shared: dict[str, Any] = {
+        "schema_version": 1,
+        "name": "spark",
+        "service": {
+            "implementation": "vllm",
+            "base_url": "http://spark.local:8000/v1",
+            "version": "0.10.0",
+        },
+        "model": {"id": "served"},
+        "topology": {"measurement_scope": "remote_client_to_server"},
+    }
+    legacy = {
+        **shared,
+        "host": {
+            "transport": "ssh",
+            "destination": "dgx",
+            "profile": {
+                "hostname": "spark",
+                "host_fingerprint": "host-prior-hardware",
+                "host_fingerprint_strength": "hardware",
+            },
+        },
+    }
+    migrated = {
+        **shared,
+        "host": {
+            "transport": "ssh",
+            "destination": "dgx",
+            "profile": {
+                "hostname": "spark",
+                "host_fingerprint": "host-canonical-installation",
+                "host_fingerprint_strength": "installation",
+                "host_hardware_fingerprint": "host-prior-hardware",
+                "host_fingerprint_aliases": [
+                    {
+                        "fingerprint": "host-prior-hardware",
+                        "source": "dmi_product_uuid",
+                        "strength": "hardware",
+                    }
+                ],
+            },
+        },
+        "host_identity_binding": {
+            "expected_fingerprint": "host-prior-hardware",
+            "actual_fingerprint": "host-prior-hardware",
+            "actual_strength": "hardware",
+            "verified": True,
+        },
+    }
+    return legacy, migrated
+
+
+def test_run_context_preserves_verified_strong_compatibility_pin_identity():
+    legacy, migrated = _cross_version_target_pair()
+
+    assert (
+        RunContext(target_json=legacy).target_identity_json()
+        == RunContext(target_json=migrated).target_identity_json()
+    )
+
+
+@pytest.mark.parametrize(
+    "binding_update",
+    [
+        {"verified": False},
+        {"expected_fingerprint": "host-other"},
+        {"actual_fingerprint": "host-unknown", "expected_fingerprint": "host-unknown"},
+        {"actual_strength": "installation"},
+    ],
+)
+def test_run_context_rejects_unverified_or_inconsistent_host_bindings(
+    binding_update: dict[str, object],
+):
+    legacy, migrated = _cross_version_target_pair()
+    binding = dict(migrated["host_identity_binding"])
+    binding.update(binding_update)
+    migrated["host_identity_binding"] = binding
+
+    assert (
+        RunContext(target_json=legacy).target_identity_json()
+        != RunContext(target_json=migrated).target_identity_json()
+    )
+
+
+def test_resume_accepts_verified_cross_version_host_identity_alias(tmp_path: Path):
+    database = tmp_path / "runs.duckdb"
+    spec = RunSpec.create(
+        benchmark_kind="suite",
+        suite="suite",
+        label="suite/dgx",
+        command="suite",
+        config_json={},
+        database=database,
+    )
+    legacy, migrated = _cross_version_target_pair()
+    executor = {"hostname": "mac", "host_fingerprint": "host-mac"}
+
+    with ResultStore(database) as store:
+        with RunSession(
+            store,
+            spec,
+            run_context=RunContext(
+                executor_system_json=executor,
+                target_json=legacy,
+            ),
+        ) as run:
+            run.complete(status="failed", error="retry")
+
+        with RunSession(
+            store,
+            spec,
+            resume_run_id=run.run_id,
+            run_context=RunContext(
+                executor_system_json=executor,
+                target_json=migrated,
+            ),
+        ) as resumed:
+            assert resumed.target_json == legacy
+            resumed.complete()
 
 
 def test_resume_rejects_changed_executor_or_target_provenance(tmp_path: Path):
