@@ -36,6 +36,9 @@ class HttpScenario:
     timeout_s: float = 300.0
     prompt_repeat: int = 1
     expected_contains: list[str] = field(default_factory=list)
+    expected_exact: str | None = None
+    min_prompt_tokens: int | None = None
+    max_prompt_tokens: int | None = None
     prompt_pool: tuple[str, ...] = ()
     cache_mode: str = "shared"
 
@@ -61,6 +64,9 @@ class HttpScenario:
                 "prompt_repeat",
                 "cache_mode",
                 "expected_contains",
+                "expected_exact",
+                "min_prompt_tokens",
+                "max_prompt_tokens",
             },
             context="HTTP scenario",
         )
@@ -76,6 +82,20 @@ class HttpScenario:
         prompt_repeat = int(raw.get("prompt_repeat", 1))
         timeout_s = float(raw.get("timeout_s", 300.0))
         cache_mode = str(raw.get("cache_mode", "shared")).strip().lower()
+        token_bounds = {}
+        for key in ("min_prompt_tokens", "max_prompt_tokens"):
+            value = raw.get(key)
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ConfigError(f"scenario {name!r} {key} must be a positive integer")
+            token_bounds[key] = value
+        minimum, maximum = token_bounds.values()
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise ConfigError(f"scenario {name!r} min_prompt_tokens exceeds max_prompt_tokens")
+        expected_exact = raw.get("expected_exact")
+        if expected_exact is not None and (
+            not isinstance(expected_exact, str) or not expected_exact.strip()
+        ):
+            raise ConfigError(f"scenario {name!r} expected_exact must be a non-empty string")
 
         if any(value <= 0 for value in max_tokens):
             raise ConfigError(f"scenario {name!r} max_tokens values must be positive")
@@ -114,6 +134,9 @@ class HttpScenario:
             prompt_repeat=prompt_repeat,
             cache_mode=cache_mode,
             expected_contains=[str(value) for value in coerce_list(raw.get("expected_contains"))],
+            expected_exact=expected_exact,
+            min_prompt_tokens=minimum,
+            max_prompt_tokens=maximum,
         )
 
     @property
@@ -161,6 +184,9 @@ class HttpScenario:
             "prompt_repeat": self.prompt_repeat,
             "cache_mode": self.cache_mode,
             "expected_contains": self.expected_contains,
+            "expected_exact": self.expected_exact,
+            "min_prompt_tokens": self.min_prompt_tokens,
+            "max_prompt_tokens": self.max_prompt_tokens,
         }
 
 
@@ -218,12 +244,13 @@ class HttpLoadConfig:
     scenarios: list[HttpScenario]
     transport: HttpTransportConfig = HttpTransportConfig()
     source_path: Path | None = None
+    runtime_report: Path | None = None
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any], source_path: Path | None = None) -> HttpLoadConfig:
         reject_unknown_keys(
             raw,
-            {"name", "database", "targets", "scenarios", "transport"},
+            {"name", "database", "targets", "scenarios", "transport", "runtime_report"},
             context="HTTP-load configuration",
         )
         name = str(raw.get("name") or (source_path.stem if source_path else "http-load"))
@@ -239,6 +266,12 @@ class HttpLoadConfig:
         if any(not isinstance(item, dict) for item in scenarios_raw):
             raise ConfigError("each HTTP scenario must be a mapping")
         base_dir = source_path.parent if source_path else Path.cwd()
+        runtime_report = None
+        if raw.get("runtime_report") is not None:
+            value = raw["runtime_report"]
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError("runtime_report must be a non-empty path string")
+            runtime_report = (base_dir / Path(value).expanduser()).resolve()
         targets = [
             Endpoint.from_mapping(
                 item,
@@ -258,6 +291,7 @@ class HttpLoadConfig:
             scenarios=scenarios,
             transport=transport,
             source_path=source_path,
+            runtime_report=runtime_report,
         )
 
 

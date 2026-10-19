@@ -1,6 +1,34 @@
 from llm_refinery.compare import build_compare_rows, build_compare_table_rows
 
 
+def test_http_throughput_comparison_always_shows_available_correctness_checks():
+    rows = build_compare_rows(
+        [
+            {
+                "run_id": "recall",
+                "benchmark_kind": "http_load",
+                "trial_name": "recall/boundary",
+                "status": "failed",
+                "duration_s": 1,
+                "config_json": {"model": "local"},
+                "metrics": {
+                    "completion_tokens_per_second": 100,
+                    "check_pass_rate": 1,
+                    "prompt_tokens_check_pass_rate": 0,
+                },
+            }
+        ],
+        metrics=("completion_tokens_per_second",),
+    )
+    table = build_compare_table_rows(rows)
+    assert table[0][1:4] == (
+        "completion_tokens_per_second",
+        "check_pass_rate",
+        "prompt_tokens_check_pass_rate",
+    )
+    assert rows[0]["prompt_tokens_check_pass_rate"] == 0
+
+
 def test_build_compare_rows_supports_lm_eval_root_model_and_params():
     rows = build_compare_rows(
         [

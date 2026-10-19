@@ -106,6 +106,16 @@ def summarize_request_results(
     ]
     if known_prompt_tokens:
         metrics["prompt_tokens_total"] = float(sum(known_prompt_tokens))
+    observed_prompt_tokens = [r.prompt_tokens for r in results if r.prompt_tokens is not None]
+    if observed_prompt_tokens:
+        metrics["prompt_tokens_min"] = float(min(observed_prompt_tokens))
+        metrics["prompt_tokens_max"] = float(max(observed_prompt_tokens))
+    context_checks = [
+        r.prompt_tokens_check_passed for r in results if r.prompt_tokens_check_passed is not None
+    ]
+    if context_checks:
+        metrics["prompt_tokens_check_pass_rate"] = sum(context_checks) / len(context_checks)
+        metrics["prompt_tokens_check_fail_count"] = float(len(context_checks) - sum(context_checks))
 
     checked_results = [result for result in results if result.check_passed is not None]
     if checked_results:

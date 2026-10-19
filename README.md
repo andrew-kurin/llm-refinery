@@ -99,6 +99,15 @@ The runner warms every concurrency slot and warns when a cell is too small for u
 tail inspection. It records all-request latency (including failures), visible and
 reasoning TTFT, TPOT, approximate streaming-event ITL, and explicit correctness failures.
 
+For MLX DiffusionGemma, use the [cache investigation workflow](docs/mlx-kv-investigation.md)
+to capture serving runtime/cache observations and generate single-fact recall probes
+at exact tokenizer-measured lengths. HTTP scenarios support `expected_exact`,
+`min_prompt_tokens`, and `max_prompt_tokens`; missing server token usage fails a configured
+token bound. An optional `runtime_report` path (relative to the HTTP manifest) preserves
+the local serving report with each run and detects server restarts during measurement.
+HTTP comparison tables include available answer and token-count check rates even when
+only a performance metric was selected.
+
 HTTP load honors the standard private-CA and proxy-bypass environment by default,
 including `NO_PROXY`, `SSL_CERT_FILE`, and `SSL_CERT_DIR`. Model traffic must be
 direct because a synchronous proxy lookup cannot be cancelled safely at the

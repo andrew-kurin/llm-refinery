@@ -4,6 +4,7 @@ import json
 import time
 from contextlib import nullcontext
 from pathlib import Path
+from typing import Any
 
 from llm_refinery.application.run_context import RunContext
 from llm_refinery.application.run_session import RunSession
@@ -80,6 +81,7 @@ def run_http_load(
                         total=len(trials),
                         parent_run_id=parent_run_id,
                         run_context=run_context,
+                        runtime_report=config.runtime_report,
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - RunSession has persisted the failure
@@ -102,8 +104,17 @@ def _run_one_http_load(
     total: int,
     parent_run_id: str | None,
     run_context: RunContext | None,
+    runtime_report: Path | None = None,
 ) -> CompletedRun:
     config_json = {**trial.as_jsonable(), "benchmark": "http_load"}
+    runtime_before = None
+    if runtime_report is not None:
+        runtime_before = json.loads(runtime_report.read_text(encoding="utf-8"))
+        if not runtime_before.get("instance_id"):
+            raise ValueError("runtime_report has no server instance_id")
+        if trial.target.model not in runtime_before.get("models", {}):
+            raise ValueError(f"runtime_report has no loaded model {trial.target.model!r}")
+        config_json["server_runtime"] = _runtime_identity(runtime_before)
     if run_context is not None and run_context.target_json:
         config_json["execution_target"] = run_context.target_identity_json()
     label = (
@@ -161,15 +172,35 @@ def _run_one_http_load(
             max_tokens=trial.max_tokens,
         )
         warmup_errors = [result for result in warmup_results if not result.ok]
+        runtime_error = None
+        if runtime_report is not None:
+            assert runtime_before is not None
+            runtime_path = run.artifact("server_runtime", "server-runtime.json", "application/json")
+            try:
+                runtime_after = json.loads(runtime_report.read_text(encoding="utf-8"))
+                if not isinstance(runtime_after, dict):
+                    raise ValueError("runtime_report must contain an object")
+                if runtime_after.get("instance_id") != runtime_before["instance_id"]:
+                    runtime_error = "server runtime changed during the trial"
+            except (OSError, ValueError) as exc:
+                runtime_error = f"could not capture final server runtime: {exc}"
+                runtime_after = {"capture_error": str(exc)}
+            runtime_path.write_text(
+                json.dumps({"before": runtime_before, "after": runtime_after}, indent=2),
+                encoding="utf-8",
+            )
         metrics["configured_warmup_requests"] = float(trial.scenario.warmup_requests)
         metrics["effective_warmup_requests"] = float(warmup_count)
         metrics["warmup_error_count"] = float(len(warmup_errors))
         status = (
             "ok"
-            if not warmup_errors and metrics["error_count"] == 0 and metrics["success_count"] > 0
+            if not runtime_error
+            and not warmup_errors
+            and metrics["error_count"] == 0
+            and metrics["success_count"] > 0
             else "failed"
         )
-        error = _first_error([*warmup_results, *results]) if status != "ok" else None
+        error = runtime_error or _first_error([*warmup_results, *results])
 
         responses_path.write_text(
             "\n".join(json.dumps(result.as_jsonable(), sort_keys=True) for result in results)
@@ -217,6 +248,20 @@ def _run_one_http_load(
     return outcome
 
 
+def _runtime_identity(report: dict[str, Any]) -> dict[str, Any]:
+    """Keep restart timestamps and observations out of the benchmark spec hash."""
+    return {
+        "packages": report.get("packages", {}),
+        "python": report.get("python"),
+        "server_arguments": report.get("server_arguments"),
+        "server_environment": report.get("server_environment"),
+        "models": {
+            name: {key: model.get(key) for key in ("revision", "requested_revision", "model_type")}
+            for name, model in report["models"].items()
+        },
+    }
+
+
 def _sample_payload(result: RequestResult) -> dict[str, object]:
     payload = result.as_jsonable()
     payload.pop("response_text", None)
@@ -252,6 +297,9 @@ def _http_metric_summary(metrics: dict[str, float]) -> str:
         "tpot_p95_s",
         "completion_tokens_per_second",
         "check_pass_rate",
+        "prompt_tokens_min",
+        "prompt_tokens_max",
+        "prompt_tokens_check_pass_rate",
         "error_count",
     ]
     return ", ".join(f"{key}={metrics[key]:.3f}" for key in keys if key in metrics)
