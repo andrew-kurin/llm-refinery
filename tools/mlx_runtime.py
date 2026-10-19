@@ -1,7 +1,7 @@
 """Run with the pinned MLX environment in diffusiongemma-26b-mlx-vlm-sweep.yaml.
 
-Only the serve/recall entry points import MLX. The server hooks
-observe cache construction and diffusion arguments without changing either.
+Only the serve/recall entry points import MLX. The launcher forwards the server's
+prefill setting when the diffusion caller omits it, and records effective settings.
 """
 
 from __future__ import annotations
@@ -19,6 +19,14 @@ from functools import wraps
 from importlib.metadata import version
 from pathlib import Path
 from types import MethodType
+
+
+def isolate_stop_token_ids(tokenizer):
+    """Keep upstream appends from mutating aliased model configuration lists."""
+    criteria = getattr(tokenizer, "stopping_criteria", None)
+    token_ids = getattr(criteria, "eos_token_ids", None)
+    if isinstance(token_ids, list):
+        criteria.eos_token_ids = list(dict.fromkeys(token_ids))
 
 
 class RuntimeReport:
@@ -77,13 +85,20 @@ class RuntimeReport:
         # Keep the observer out of MLX's parameter/module traversal.
         object.__setattr__(model, "make_cache", MethodType(make_cache, model))
 
-    def observe_diffusion(self, original):
+    def observe_diffusion(self, original, *, prefill_step_size_getter=None):
         signature = inspect.signature(original)
 
         @wraps(original)
         def generate(*args, **kwargs):
             bound = signature.bind(*args, **kwargs)
             bound.apply_defaults()
+            if (
+                prefill_step_size_getter is not None
+                and "prefill_step_size" in signature.parameters
+                and bound.arguments.get("prefill_step_size") is None
+            ):
+                bound.arguments["prefill_step_size"] = prefill_step_size_getter()
+            isolate_stop_token_ids(bound.arguments.get("tokenizer"))
             self.update(
                 observed_diffusion_arguments={
                     name: bound.arguments.get(name)
@@ -95,7 +110,7 @@ class RuntimeReport:
                     if name in signature.parameters
                 ],
             )
-            return original(*args, **kwargs)
+            return original(*bound.args, **bound.kwargs)
 
         return generate
 
@@ -114,7 +129,13 @@ def serve(argv):
     from mlx_vlm.utils import get_model_path
 
     report = RuntimeReport(args.runtime_report)
-    report.update(server_arguments=server_args)
+    report.update(
+        server_arguments=server_args,
+        runtime_policy={
+            "diffusion_prefill": "forward_server_setting_if_omitted",
+            "diffusion_stop_token_ids": "isolate_from_model_config_per_request",
+        },
+    )
     original_load = generation.load
 
     @wraps(original_load)
@@ -150,7 +171,8 @@ def serve(argv):
 
     generation.load = load
     generation.stream_diffusion_generate = report.observe_diffusion(
-        generation.stream_diffusion_generate
+        generation.stream_diffusion_generate,
+        prefill_step_size_getter=generation.get_prefill_step_size,
     )
     sys.argv = ["mlx_vlm.server", *server_args]
     main()

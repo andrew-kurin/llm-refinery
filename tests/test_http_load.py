@@ -1546,6 +1546,8 @@ def test_runtime_identity_changes_only_for_serving_configuration():
         stable_hash(_runtime_identity({**first, "server_arguments": ["--max-kv-size", "0"]}))
         != identity
     )
+    forwarded = {**first, "runtime_policy": {"diffusion_prefill": "forward"}}
+    assert stable_hash(_runtime_identity(forwarded)) != identity
 
 
 @pytest.mark.parametrize("broken_report", [None, "not json", "[]"])

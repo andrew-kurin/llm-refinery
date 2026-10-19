@@ -100,8 +100,9 @@ tail inspection. It records all-request latency (including failures), visible an
 reasoning TTFT, TPOT, approximate streaming-event ITL, and explicit correctness failures.
 
 For MLX DiffusionGemma, use the [cache investigation workflow](docs/mlx-kv-investigation.md)
-to capture serving runtime/cache observations and generate single-fact recall probes
-at exact tokenizer-measured lengths. HTTP scenarios support `expected_exact`,
+to forward native diffusion prefill settings, prevent stop-token list growth in the
+pinned runtime, and generate single-fact recall probes at exact tokenizer-measured
+lengths. HTTP scenarios support `expected_exact`,
 `min_prompt_tokens`, and `max_prompt_tokens`; missing server token usage fails a configured
 token bound. An optional `runtime_report` path (relative to the HTTP manifest) preserves
 the local serving report with each run and detects server restarts during measurement.

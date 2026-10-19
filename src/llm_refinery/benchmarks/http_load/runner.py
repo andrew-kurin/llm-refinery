@@ -255,6 +255,7 @@ def _runtime_identity(report: dict[str, Any]) -> dict[str, Any]:
         "python": report.get("python"),
         "server_arguments": report.get("server_arguments"),
         "server_environment": report.get("server_environment"),
+        "runtime_policy": report.get("runtime_policy"),
         "models": {
             name: {key: model.get(key) for key in ("revision", "requested_revision", "model_type")}
             for name, model in report["models"].items()

@@ -56,18 +56,18 @@ server:
   params:
     host: 127.0.0.1
     port: 8082
-    prefill_step_size: 4096
+    prefill_step_size: 2048
     max_tokens: 512
     max_kv_size: 8192
     # This also caps prompt + requested output tokens at server admission.
     # Boundary probes above 8192 require the diagnostic launch documented below.
-    # Requested flags are not proof that the native diffusion path uses them.
+    # The launcher forwards prefill size to the pinned native diffusion API.
+    # max_kv_size controls admission; the model builds its own cache layout.
     # Inspect observed_diffusion_arguments and observed_cache_layout in the report.
     # Checkpoint weight quantization does not enable KV-cache quantization.
     vision_cache_size: 4
     log_level: INFO
   extra_args: []
   env:
-    # Full limit=50 IFEval+GSM8K on 4bit repeatedly hit the default 600s
-    # no-token queue timeout after ~28 requests. Fail stuck requests faster.
+    # Bound time waiting for the first token while testing new prompt workloads.
     MLX_VLM_TOKEN_QUEUE_TIMEOUT: "300"
