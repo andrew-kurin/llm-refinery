@@ -1,7 +1,8 @@
 # MLX cache and recall investigation
 
-The DiffusionGemma sweep pins Python 3.11, `mlx-vlm==0.6.3`, `mlx-lm==0.31.3`, and
-`mlx==0.31.2`. The first 4-bit checkpoint also pins its model revision. Run these
+The DiffusionGemma sweep pins Python 3.11.11, `mlx-vlm==0.6.3`, `mlx-lm==0.31.3`,
+`mlx==0.31.2`, transformers 5.20.2, tokenizers 0.23.3 and huggingface-hub 2.2.0.
+The first 4-bit checkpoint also pins its model revision. Run these
 commands from the repository root.
 
 Start the server:
@@ -61,7 +62,8 @@ The HTTP config requires the report from the reporting launcher. Each run keeps
 stable serving configuration in `config_json.server_runtime` and complete before
 and after reports in its `server_runtime` artifact. PIDs, timestamps, local cache
 paths, and observations do not change the benchmark configuration hash. A changed
-server instance fails the trial. Keep the
+server instance or changed serving configuration fails the trial. Invalid final
+model metadata also fails the trial while preserving request evidence. Keep the
 report paired with the local server on port 8082; it does not authenticate a
 remote endpoint.
 
@@ -71,7 +73,8 @@ Generate prompts using the pinned model's tokenizer and chat template. This
 downloads tokenizer/configuration files if needed and does not load model weights:
 
 ```bash
-uv run --no-project --python 3.11 --with mlx-vlm==0.6.3 --with mlx-lm==0.31.3 --with mlx==0.31.2 \
+uv run --no-project --python 3.11.11 --with mlx-vlm==0.6.3 --with mlx-lm==0.31.3 --with mlx==0.31.2 \
+  --with transformers==5.20.2 --with tokenizers==0.23.3 --with huggingface-hub==2.2.0 \
   python tools/mlx_runtime.py recall \
   --model mlx-community/diffusiongemma-26B-A4B-it-4bit \
   --revision 0d2cee4aa112548df2fad35a7f017eeb1ac8f352
@@ -92,7 +95,8 @@ retains its 8192-token request budget. This diagnostic setting does not impose a
 memory limit on the model's full-attention caches.
 
 ```bash
-uv run --no-project --python 3.11 --with mlx-vlm==0.6.3 --with mlx-lm==0.31.3 --with mlx==0.31.2 \
+uv run --no-project --python 3.11.11 --with mlx-vlm==0.6.3 --with mlx-lm==0.31.3 --with mlx==0.31.2 \
+  --with transformers==5.20.2 --with tokenizers==0.23.3 --with huggingface-hub==2.2.0 \
   python tools/mlx_runtime.py serve \
   --runtime-report results/mlx-runtime-8082.json \
   --model mlx-community/diffusiongemma-26B-A4B-it-4bit \
@@ -164,7 +168,8 @@ explicit smaller-window case. The guarded implementation matching
 Reproduce the mask checks without loading weights:
 
 ```bash
-uv run --no-project --python 3.11 --with mlx-vlm==0.6.3 --with mlx-lm==0.31.3 --with mlx==0.31.2 \
+uv run --no-project --python 3.11.11 --with mlx-vlm==0.6.3 --with mlx-lm==0.31.3 --with mlx==0.31.2 \
+  --with transformers==5.20.2 --with tokenizers==0.23.3 --with huggingface-hub==2.2.0 \
   python tools/mlx_cache_probe.py --mask-only
 ```
 
@@ -176,7 +181,8 @@ To check the actual DiffusionGemma cache factory, server forwarding method, and
 10 context-admission cases without loading weights:
 
 ```bash
-uv run --no-project --python 3.11 --with mlx-vlm==0.6.3 --with mlx-lm==0.31.3 --with mlx==0.31.2 \
+uv run --no-project --python 3.11.11 --with mlx-vlm==0.6.3 --with mlx-lm==0.31.3 --with mlx==0.31.2 \
+  --with transformers==5.20.2 --with tokenizers==0.23.3 --with huggingface-hub==2.2.0 \
   python tools/mlx_diffusion_probe.py
 ```
 
@@ -191,10 +197,12 @@ calls keep it at 6 entries and the configuration at 3.
 
 ## DiffusionGemma measurements with weights
 
-Run the native generation comparison with the same model revision and packages:
+Run the native generation comparison with the same model revision and current
+pinned packages:
 
 ```bash
-uv run --no-project --python 3.11 --with mlx-vlm==0.6.3 --with mlx-lm==0.31.3 --with mlx==0.31.2 \
+uv run --no-project --python 3.11.11 --with mlx-vlm==0.6.3 --with mlx-lm==0.31.3 --with mlx==0.31.2 \
+  --with transformers==5.20.2 --with tokenizers==0.23.3 --with huggingface-hub==2.2.0 \
   python tools/mlx_diffusion_benchmark.py \
   --tokens 4096 8191 8192 8193 16384 --prefill-steps none 4096 2048 512
 ```
@@ -208,6 +216,10 @@ There is one warmup per cell followed by three measured repetitions, with cell
 order rotated each round. The stop-token list is isolated before every call and
 its size is recorded. This uses the direct generation API; HTTP overhead is measured
 separately. No KV quantization is enabled.
+
+The historical October 18 measurements used transformers 5.20.1. To reproduce
+that environment, substitute `--with transformers==5.20.1` in the command above.
+The current default and October 20 quality comparison use 5.20.2.
 
 The initial unisolated timing series was discarded after the stop-token aliasing
 caused exponential CPU memory growth and increasing stop-check time. The
@@ -249,7 +261,88 @@ keeps its 8192-token admission budget.
 An actual HTTP request under that ordinary budget rejected 8193 prompt tokens plus
 32 requested output tokens with status 400 and the expected 8225-token budget error.
 
-The [recorded DiffusionGemma results](experiments/mlx-diffusion-2026-10-18.json)
+The [historical DiffusionGemma results](experiments/mlx-diffusion-2026-10-18.json)
 include every native call, HTTP samples and metrics, and the no-weights probe.
 The repeated single-fact workload is a correctness and stability smoke. IFEval,
-GSM8K and diverse long-context workloads still need separate quality evaluation.
+GSM8K and varied long-context checks are recorded below; complete benchmark runs
+remain separate evaluations.
+
+## Native runtime upgrade comparison (2026-10-20)
+
+The [paired upgrade results](experiments/mlx-upgrade-quality-2026-10-20.json)
+compare the corrected 0.6.3 launcher with native mlx-vlm 0.7.9. The model revision
+is unchanged. The older runtime uses MLX 0.31.2/mlx-lm 0.31.3; the newer runtime
+uses MLX 0.32.4/mlx-lm 0.32.2. Both used transformers 5.20.2, tokenizers 0.23.3,
+and huggingface-hub 2.2.0 for this comparison.
+
+| Runtime / prefill | IFEval strict | GSM8K strict | Varied retrieval |
+| --- | --- | --- | --- |
+| Corrected 0.6.3 / 2048 | 36/50 (72%) | 45/50 (90%) | 18/18 |
+| Native 0.7.9 / 2048 | 38/50 (76%) | 42/50 (84%) | 16/18 |
+| Native 0.7.9 / 512 | 38/50 (76%) | 43/50 (86%) | 18/18 |
+
+These are the first 50 examples of each task. IFEval is zero-shot; GSM8K uses its
+five-shot task default. Prompt, document and target hashes match for every paired
+item. The evaluator is lm-eval 0.4.12 with seed 42, temperature 0, and task output
+limits of 1280 for IFEval and 256 for GSM8K. Per-item grades, hashes and retrieval
+outputs are versioned; full evaluator JSON/JSONL artifacts remain under
+`results/mlx-upgrade-quality-2026-10-20/`.
+
+Native 0.7.9 forwards prefill and keeps EOS state bounded without either local
+workaround. At prefill 2048 it failed the prior 4096-token `RF7391XZ` fixture,
+consistently returning `7391XZ` across three repeats and two other seeds. Prefill
+512 restored all eight boundary/control calls, including three 4096-token repeats.
+The varied set uses 18 unique prompts: two lengths (8192/16384), three fact
+positions (start/middle/near-end), and three tasks (single key, paired keys, and
+approved revision with a superseded-code distractor). Every measured prompt length
+matched the intended length. There is one warmup and one measured call per fixture.
+
+The default stays on corrected 0.6.3/2048. The newer runtime improved this IFEval
+sample but lost GSM8K items; there is no clear quality win supporting a default
+upgrade yet. This small sample does not establish a universal regression. Some
+baseline and native-512 checks ran concurrently in separate processes; wall times
+from this study are not used for performance comparisons. The earlier 16K memory
+table describes the historical 0.6.3 experiment.
+
+To reproduce the native path with observation only:
+
+```bash
+uv run --no-project --python 3.11.11 --with mlx-vlm==0.7.9 --with mlx-lm==0.32.2 --with mlx==0.32.4 \
+  --with transformers==5.20.2 --with tokenizers==0.23.3 --with huggingface-hub==2.2.0 \
+  python tools/mlx_native_runtime.py --runtime-report results/mlx-native-runtime.json \
+  --revision 0d2cee4aa112548df2fad35a7f017eeb1ac8f352 \
+  --model mlx-community/diffusiongemma-26B-A4B-it-4bit \
+  --host 127.0.0.1 --port 8082 --prefill-step-size 512 --max-kv-size 0
+```
+
+Run the same pinned quality tasks against the selected server:
+
+```bash
+LLM_REFINERY_LOCAL_EVAL_KEY=local-benchmark uv run llm-refinery lm-eval mlx-quality 50 \
+  --model mlx-community/diffusiongemma-26B-A4B-it-4bit \
+  --base-url http://127.0.0.1:8082/v1 --api-key-env LLM_REFINERY_LOCAL_EVAL_KEY \
+  --tasks ifeval_pinned,gsm8k_pinned --include-path evals/lm_eval_tasks \
+  --package-spec 'lm-eval[api]==0.4.12' --gen-kwargs seed=42 \
+  --max-length 8192 --log-samples --online
+```
+
+The placeholder key is for the local evaluator client; it is not a service
+credential. `tools/mlx_retrieval_probe.py` generates the varied fixtures, with
+`--runtime-report` selecting the paired server report. Run its generated HTTP
+manifest with `--keep-going` to preserve every failed answer as scored evidence.
+
+## PR self-review
+
+A second pass over the full diff found two gaps, both corrected: same-process
+changes to the reported serving configuration could pass a trial, and unpinned
+tokenizer dependencies could drift from the measured environment. Runtime
+identity is now compared before and after each trial, with request evidence
+preserved on failure. The default manifest pins all six recorded serving packages
+and Python 3.11.11; a regression check ties those pins to the quality profile.
+
+All 620 repository tests, Ruff and mypy passed after the fixes. Launching the
+exact default manifest then passed three measured 4096-token recall requests
+after one warmup, including the runtime identity check. Each answer was
+`RF7391XZ`, and every measured prompt length was exactly 4096. No further
+blocking findings were identified in this self-review. The quality sample sizes
+and host-specific performance limits described above still apply.

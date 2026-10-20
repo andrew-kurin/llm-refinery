@@ -110,11 +110,14 @@ def _run_one_http_load(
     runtime_before = None
     if runtime_report is not None:
         runtime_before = json.loads(runtime_report.read_text(encoding="utf-8"))
+        if not isinstance(runtime_before, dict):
+            raise ValueError("runtime_report must contain an object")
         if not runtime_before.get("instance_id"):
             raise ValueError("runtime_report has no server instance_id")
+        identity_before = _runtime_identity(runtime_before)
         if trial.target.model not in runtime_before.get("models", {}):
             raise ValueError(f"runtime_report has no loaded model {trial.target.model!r}")
-        config_json["server_runtime"] = _runtime_identity(runtime_before)
+        config_json["server_runtime"] = identity_before
     if run_context is not None and run_context.target_json:
         config_json["execution_target"] = run_context.target_identity_json()
     label = (
@@ -182,6 +185,8 @@ def _run_one_http_load(
                     raise ValueError("runtime_report must contain an object")
                 if runtime_after.get("instance_id") != runtime_before["instance_id"]:
                     runtime_error = "server runtime changed during the trial"
+                elif _runtime_identity(runtime_after) != config_json["server_runtime"]:
+                    runtime_error = "server runtime configuration changed during the trial"
             except (OSError, ValueError) as exc:
                 runtime_error = f"could not capture final server runtime: {exc}"
                 runtime_after = {"capture_error": str(exc)}
@@ -250,6 +255,11 @@ def _run_one_http_load(
 
 def _runtime_identity(report: dict[str, Any]) -> dict[str, Any]:
     """Keep restart timestamps and observations out of the benchmark spec hash."""
+    models = report.get("models", {})
+    if not isinstance(models, dict) or any(
+        not isinstance(model, dict) for model in models.values()
+    ):
+        raise ValueError("runtime_report models must map model IDs to metadata objects")
     return {
         "packages": report.get("packages", {}),
         "python": report.get("python"),
@@ -258,7 +268,7 @@ def _runtime_identity(report: dict[str, Any]) -> dict[str, Any]:
         "runtime_policy": report.get("runtime_policy"),
         "models": {
             name: {key: model.get(key) for key in ("revision", "requested_revision", "model_type")}
-            for name, model in report["models"].items()
+            for name, model in models.items()
         },
     }
 

@@ -4,19 +4,25 @@ database: results/llm_refinery.duckdb
 
 commands:
   bench: ["llama", "bench"]
-  # Keep the serving environment fixed; metadata comes from this process, not the client.
+  # Match the serving/tokenizer stack used in the recorded quality comparison.
   server:
     - uv
     - run
     - --no-project
     - --python
-    - "3.11"
+    - "3.11.11"
     - --with
     - mlx-vlm==0.6.3
     - --with
     - mlx-lm==0.31.3
     - --with
     - mlx==0.31.2
+    - --with
+    - transformers==5.20.2
+    - --with
+    - tokenizers==0.23.3
+    - --with
+    - huggingface-hub==2.2.0
     - python
     - tools/mlx_runtime.py
     - serve

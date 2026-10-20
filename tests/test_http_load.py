@@ -1503,6 +1503,12 @@ def test_http_trial_preserves_server_runtime_and_detects_restart(tmp_path, monke
     def fake_requests(_trial, *, count, client=None):
         if restart:
             runtime_path.write_text(json.dumps({**runtime, "instance_id": "server-b"}))
+        else:
+            runtime_path.write_text(
+                json.dumps(
+                    {**runtime, "requests_completed": 2, "observed_cache_layout": [{"keep": 0}]}
+                )
+            )
         return [RequestResult(index=0, ok=True, status_code=200, latency_s=1)]
 
     monkeypatch.setattr("llm_refinery.benchmarks.http_load.runner.run_requests", fake_requests)
@@ -1518,6 +1524,53 @@ def test_http_trial_preserves_server_runtime_and_detects_restart(tmp_path, monke
     assert saved["before"]["instance_id"] == "server-a"
     assert saved["after"]["instance_id"] == ("server-b" if restart else "server-a")
     assert run["status"] == ("failed" if restart else "ok")
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"models": {"local": {"revision": "different-weights"}}},
+        {"models": {}},
+        {"packages": {"mlx-vlm": "different-version"}},
+        {"server_arguments": ["--max-kv-size", "0"]},
+        {"runtime_policy": {"diffusion_prefill": "different-policy"}},
+    ],
+)
+def test_http_trial_rejects_runtime_configuration_drift(tmp_path, monkeypatch, changed):
+    runtime_path = tmp_path / "runtime.json"
+    before = {"instance_id": "same-process", "models": {"local": {"revision": "verified"}}}
+    runtime_path.write_text(json.dumps(before))
+    config = HttpLoadConfig.from_mapping(
+        {
+            "database": str(tmp_path / "runs.duckdb"),
+            "runtime_report": str(runtime_path),
+            "targets": [
+                {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8082/v1",
+                    "model": "local",
+                }
+            ],
+            "scenarios": [{"name": "recall", "prompt": "fact", "requests": 1}],
+        }
+    )
+
+    def fake_requests(_trial, *, count, client=None):
+        runtime_path.write_text(json.dumps({**before, **changed}))
+        return [RequestResult(index=0, ok=True, status_code=200, latency_s=1)]
+
+    monkeypatch.setattr("llm_refinery.benchmarks.http_load.runner.run_requests", fake_requests)
+    with pytest.raises(HttpLoadFailed, match="runtime configuration changed"):
+        run_http_load(config)
+    with ResultStore(config.database) as store:
+        run = store.comparison_runs(include_failed=True)[0]
+        assert len(store.samples_for_run(run["run_id"])) == 1
+    assert run["status"] == "failed"
+    assert run["metrics"]["success_count"] == 1
+    saved = json.loads(Path(run["artifacts"]["server_runtime"]["path"]).read_text())
+    assert saved["before"] == before
+    assert saved["after"] == {**before, **changed}
 
 
 def test_runtime_identity_changes_only_for_serving_configuration():
@@ -1550,7 +1603,16 @@ def test_runtime_identity_changes_only_for_serving_configuration():
     assert stable_hash(_runtime_identity(forwarded)) != identity
 
 
-@pytest.mark.parametrize("broken_report", [None, "not json", "[]"])
+@pytest.mark.parametrize(
+    "broken_report",
+    [
+        None,
+        "not json",
+        "[]",
+        '{"instance_id":"a","models":[]}',
+        '{"instance_id":"a","models":{"local":[]}}',
+    ],
+)
 def test_runtime_capture_failure_preserves_http_evidence(tmp_path, monkeypatch, broken_report):
     path = tmp_path / "runtime.json"
     path.write_text(json.dumps({"instance_id": "a", "models": {"local": {"revision": "commit"}}}))

@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import yaml
+
 spec = importlib.util.spec_from_file_location(
     "mlx_runtime", Path(__file__).resolve().parents[1] / "tools" / "mlx_runtime.py"
 )
@@ -10,6 +12,22 @@ assert spec is not None and spec.loader is not None
 runtime = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runtime)
 ANSWER, RuntimeReport, recall_prompt = runtime.ANSWER, runtime.RuntimeReport, runtime.recall_prompt
+
+
+def test_default_serving_stack_matches_the_validated_quality_profile():
+    root = Path(__file__).resolve().parents[1]
+    manifest = yaml.safe_load((root / "sweeps/diffusiongemma-26b-mlx-vlm-sweep.yaml").read_text())
+    study = json.loads((root / "docs/experiments/mlx-upgrade-quality-2026-10-20.json").read_text())
+    validated = study["profiles"]["corrected_063_2048"]["runtime"]
+    command = manifest["commands"]["server"]
+    assert command[command.index("--python") + 1] == validated["python"].split()[0]
+    for package, value in validated["packages"].items():
+        assert f"{package}=={value}" in command
+    assert manifest["models"][0]["params"]["revision"] == study["model_revision"]
+    arguments = validated["server_arguments"]
+    assert manifest["server"]["params"]["prefill_step_size"] == int(
+        arguments[arguments.index("--prefill-step-size") + 1]
+    )
 
 
 def test_runtime_observers_preserve_cache_and_diffusion_arguments(tmp_path, monkeypatch):
