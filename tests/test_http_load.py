@@ -3,6 +3,7 @@ import socketserver
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import httpx
 import pytest
@@ -1411,3 +1412,240 @@ def test_failed_correctness_result_fails_the_http_trial(tmp_path, monkeypatch):
     assert run["metrics"]["error_count"] == 1
     assert run["metrics"]["check_pass_rate"] == 0
     assert run["metrics"]["observed_latency_p95_s"] == 0.2
+
+
+@pytest.mark.parametrize(
+    "tokens,passed", [(8192, False), (8193, True), (8194, False), (None, False)]
+)
+def test_exact_recall_requires_the_measured_prompt_length(tokens, passed):
+    scenario = HttpScenario(
+        name="boundary",
+        prompt="a unique fact",
+        expected_exact="RF7391XZ",
+        min_prompt_tokens=8193,
+        max_prompt_tokens=8193,
+    )
+    result = with_check_result(
+        RequestResult(
+            index=0,
+            ok=True,
+            status_code=200,
+            latency_s=1,
+            prompt_tokens=tokens,
+            response_text="RF7391XZ\n",
+        ),
+        scenario,
+    )
+    assert result.ok is passed
+    assert result.check_passed is True
+    assert result.prompt_tokens_check_passed is passed
+    metrics = summarize_request_results([result], wall_duration_s=1, concurrency=1, max_tokens=32)
+    assert metrics["prompt_tokens_check_pass_rate"] == float(passed)
+    if not passed:
+        assert "prompt token check failed" in result.error
+        assert metrics["success_count"] == 0
+    if tokens is not None:
+        assert metrics["prompt_tokens_min"] == metrics["prompt_tokens_max"] == tokens
+
+
+def test_exact_recall_rejects_echoed_answer_in_wrong_output():
+    result = with_check_result(
+        RequestResult(
+            index=0,
+            ok=True,
+            status_code=200,
+            latency_s=1,
+            response_text="It might be RF7391XZ or another code.",
+        ),
+        HttpScenario(name="recall", prompt="fact", expected_exact="RF7391XZ"),
+    )
+    assert not result.ok
+    assert result.check_passed is False
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"min_prompt_tokens": 0},
+        {"min_prompt_tokens": True},
+        {"max_prompt_tokens": "8192"},
+        {"min_prompt_tokens": 8193, "max_prompt_tokens": 8192},
+        {"expected_exact": ""},
+    ],
+)
+def test_recall_config_rejects_invalid_checks(tmp_path, fields):
+    with pytest.raises(ConfigError):
+        HttpScenario.from_mapping({"name": "recall", "prompt": "fact", **fields}, base_dir=tmp_path)
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_http_trial_preserves_server_runtime_and_detects_restart(tmp_path, monkeypatch, restart):
+    runtime_path = tmp_path / "runtime.json"
+    runtime = {"instance_id": "server-a", "models": {"local": {"revision": "commit"}}}
+    runtime_path.write_text(json.dumps(runtime))
+    config = HttpLoadConfig.from_mapping(
+        {
+            "name": "recall",
+            "database": str(tmp_path / "runs.duckdb"),
+            "runtime_report": str(runtime_path),
+            "targets": [
+                {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8082/v1",
+                    "model": "local",
+                }
+            ],
+            "scenarios": [{"name": "recall", "prompt": "fact", "requests": 1}],
+        }
+    )
+
+    def fake_requests(_trial, *, count, client=None):
+        if restart:
+            runtime_path.write_text(json.dumps({**runtime, "instance_id": "server-b"}))
+        else:
+            runtime_path.write_text(
+                json.dumps(
+                    {**runtime, "requests_completed": 2, "observed_cache_layout": [{"keep": 0}]}
+                )
+            )
+        return [RequestResult(index=0, ok=True, status_code=200, latency_s=1)]
+
+    monkeypatch.setattr("llm_refinery.benchmarks.http_load.runner.run_requests", fake_requests)
+    if restart:
+        with pytest.raises(HttpLoadFailed, match="server runtime changed"):
+            run_http_load(config)
+    else:
+        run_http_load(config)
+    with ResultStore(config.database) as store:
+        run = store.comparison_runs(include_failed=True)[0]
+    assert run["config_json"]["server_runtime"]["models"]["local"]["revision"] == "commit"
+    saved = json.loads(Path(run["artifacts"]["server_runtime"]["path"]).read_text())
+    assert saved["before"]["instance_id"] == "server-a"
+    assert saved["after"]["instance_id"] == ("server-b" if restart else "server-a")
+    assert run["status"] == ("failed" if restart else "ok")
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"models": {"local": {"revision": "different-weights"}}},
+        {"models": {}},
+        {"packages": {"mlx-vlm": "different-version"}},
+        {"server_arguments": ["--max-kv-size", "0"]},
+        {"runtime_policy": {"diffusion_prefill": "different-policy"}},
+    ],
+)
+def test_http_trial_rejects_runtime_configuration_drift(tmp_path, monkeypatch, changed):
+    runtime_path = tmp_path / "runtime.json"
+    before = {"instance_id": "same-process", "models": {"local": {"revision": "verified"}}}
+    runtime_path.write_text(json.dumps(before))
+    config = HttpLoadConfig.from_mapping(
+        {
+            "database": str(tmp_path / "runs.duckdb"),
+            "runtime_report": str(runtime_path),
+            "targets": [
+                {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8082/v1",
+                    "model": "local",
+                }
+            ],
+            "scenarios": [{"name": "recall", "prompt": "fact", "requests": 1}],
+        }
+    )
+
+    def fake_requests(_trial, *, count, client=None):
+        runtime_path.write_text(json.dumps({**before, **changed}))
+        return [RequestResult(index=0, ok=True, status_code=200, latency_s=1)]
+
+    monkeypatch.setattr("llm_refinery.benchmarks.http_load.runner.run_requests", fake_requests)
+    with pytest.raises(HttpLoadFailed, match="runtime configuration changed"):
+        run_http_load(config)
+    with ResultStore(config.database) as store:
+        run = store.comparison_runs(include_failed=True)[0]
+        assert len(store.samples_for_run(run["run_id"])) == 1
+    assert run["status"] == "failed"
+    assert run["metrics"]["success_count"] == 1
+    saved = json.loads(Path(run["artifacts"]["server_runtime"]["path"]).read_text())
+    assert saved["before"] == before
+    assert saved["after"] == {**before, **changed}
+
+
+def test_runtime_identity_changes_only_for_serving_configuration():
+    from llm_refinery.benchmarks.http_load.runner import _runtime_identity
+    from llm_refinery.core.runs import stable_hash
+
+    first = {
+        "instance_id": "a",
+        "started_at": "yesterday",
+        "pid": 1,
+        "packages": {"mlx-vlm": "0.6.3"},
+        "models": {"model": {"revision": "commit", "path": "/cache/a"}},
+    }
+    restarted = {
+        **first,
+        "instance_id": "b",
+        "started_at": "today",
+        "pid": 2,
+        "observed_cache_layout": [{"keep": 0}],
+        "models": {"model": {"revision": "commit", "path": "/cache/b"}},
+    }
+    identity = stable_hash(_runtime_identity(first))
+    assert stable_hash(_runtime_identity(restarted)) == identity
+    assert stable_hash(_runtime_identity({**first, "packages": {"mlx-vlm": "new"}})) != identity
+    assert (
+        stable_hash(_runtime_identity({**first, "server_arguments": ["--max-kv-size", "0"]}))
+        != identity
+    )
+    forwarded = {**first, "runtime_policy": {"diffusion_prefill": "forward"}}
+    assert stable_hash(_runtime_identity(forwarded)) != identity
+
+
+@pytest.mark.parametrize(
+    "broken_report",
+    [
+        None,
+        "not json",
+        "[]",
+        '{"instance_id":"a","models":[]}',
+        '{"instance_id":"a","models":{"local":[]}}',
+    ],
+)
+def test_runtime_capture_failure_preserves_http_evidence(tmp_path, monkeypatch, broken_report):
+    path = tmp_path / "runtime.json"
+    path.write_text(json.dumps({"instance_id": "a", "models": {"local": {"revision": "commit"}}}))
+    config = HttpLoadConfig.from_mapping(
+        {
+            "database": str(tmp_path / "runs.duckdb"),
+            "runtime_report": str(path),
+            "targets": [
+                {
+                    "name": "local",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:8082/v1",
+                    "model": "local",
+                }
+            ],
+            "scenarios": [{"name": "recall", "prompt": "fact", "requests": 1}],
+        }
+    )
+
+    def fake_requests(_trial, *, count, client=None):
+        if broken_report is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(broken_report)
+        return [RequestResult(index=0, ok=True, status_code=200, latency_s=1, response_text="7391")]
+
+    monkeypatch.setattr("llm_refinery.benchmarks.http_load.runner.run_requests", fake_requests)
+    with pytest.raises(HttpLoadFailed, match="could not capture final server runtime"):
+        run_http_load(config)
+    with ResultStore(config.database) as store:
+        run = store.comparison_runs(include_failed=True)[0]
+        samples = store.samples_for_run(run["run_id"])
+    assert len(samples) == 1
+    assert run["metrics"]["success_count"] == 1
+    responses = Path(run["artifacts"]["responses"]["path"]).read_text()
+    assert json.loads(responses)["response_text"] == "7391"

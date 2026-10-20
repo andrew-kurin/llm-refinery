@@ -20,6 +20,7 @@ class RequestResult:
     # ``response_text`` remains the legacy combined reasoning + visible text field.
     response_text: str = ""
     check_passed: bool | None = None
+    prompt_tokens_check_passed: bool | None = None
     error: str | None = None
     visible_ttft_s: float | None = None
     reasoning_ttft_s: float | None = None
@@ -54,5 +55,6 @@ class RequestResult:
             "visible_response_text": self.visible_response_text,
             "reasoning_response_text": self.reasoning_response_text,
             "check_passed": self.check_passed,
+            "prompt_tokens_check_passed": self.prompt_tokens_check_passed,
             "error": self.error,
         }

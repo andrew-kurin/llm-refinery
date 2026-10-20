@@ -892,6 +892,21 @@ def with_check_result(result: RequestResult, scenario: HttpScenario) -> RequestR
     if not result.ok:
         return result
 
+    context_error = None
+    if scenario.min_prompt_tokens is not None or scenario.max_prompt_tokens is not None:
+        tokens = result.prompt_tokens
+        if tokens is None:
+            context_error = "prompt token check failed; server did not report prompt_tokens"
+        elif scenario.min_prompt_tokens is not None and tokens < scenario.min_prompt_tokens:
+            context_error = (
+                f"prompt token check failed; {tokens} < minimum {scenario.min_prompt_tokens}"
+            )
+        elif scenario.max_prompt_tokens is not None and tokens > scenario.max_prompt_tokens:
+            context_error = (
+                f"prompt token check failed; {tokens} > maximum {scenario.max_prompt_tokens}"
+            )
+        result = replace(result, prompt_tokens_check_passed=context_error is None)
+
     # Old artifacts/readers did not split channels, so fall back to their combined text. New
     # readers deliberately require visible content: reasoning-only output is not a usable answer.
     visible_text = (
@@ -903,24 +918,29 @@ def with_check_result(result: RequestResult, scenario: HttpScenario) -> RequestR
         return replace(
             result,
             ok=False,
-            check_passed=False if scenario.expected_contains else None,
+            check_passed=False
+            if scenario.expected_contains or scenario.expected_exact is not None
+            else None,
             error="empty visible response",
         )
 
-    if not scenario.expected_contains:
-        return result
     normalized = visible_text.lower()
     missing = [
         fragment for fragment in scenario.expected_contains if fragment.lower() not in normalized
     ]
+    answer_error = None
     if missing:
-        return replace(
-            result,
-            ok=False,
-            check_passed=False,
-            error=f"correctness check failed; missing: {', '.join(missing)}",
-        )
-    return replace(result, check_passed=True)
+        answer_error = f"correctness check failed; missing: {', '.join(missing)}"
+    elif scenario.expected_exact is not None and visible_text.strip() != scenario.expected_exact:
+        answer_error = "correctness check failed; visible answer does not match expected_exact"
+    checked = bool(scenario.expected_contains) or scenario.expected_exact is not None
+    errors = [error for error in (context_error, answer_error) if error]
+    return replace(
+        result,
+        ok=not errors,
+        check_passed=answer_error is None if checked else None,
+        error="; ".join(errors) if errors else None,
+    )
 
 
 def messages_for_scenario(

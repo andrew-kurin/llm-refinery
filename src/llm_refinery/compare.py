@@ -29,6 +29,10 @@ def build_compare_rows(
     dedupe_configs: bool = True,
 ) -> list[dict[str, Any]]:
     metric_keys = metrics or DEFAULT_METRICS
+    if any(run.get("benchmark_kind") == "http_load" for run in runs):
+        for key in ("check_pass_rate", "prompt_tokens_check_pass_rate"):
+            if key not in metric_keys and any(key in (run.get("metrics") or {}) for run in runs):
+                metric_keys = (*metric_keys, key)
     param_keys = params or infer_param_keys(runs)
     sort_key = sort_key or (metric_keys[0] if metrics else DEFAULT_SORT)
 

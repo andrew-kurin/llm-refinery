@@ -4,12 +4,37 @@ database: results/llm_refinery.duckdb
 
 commands:
   bench: ["llama", "bench"]
-  server: ["uvx", "--from", "mlx-vlm", "mlx_vlm.server"]
+  # Match the serving/tokenizer stack used in the recorded quality comparison.
+  server:
+    - uv
+    - run
+    - --no-project
+    - --python
+    - "3.11.11"
+    - --with
+    - mlx-vlm==0.6.3
+    - --with
+    - mlx-lm==0.31.3
+    - --with
+    - mlx==0.31.2
+    - --with
+    - transformers==5.20.2
+    - --with
+    - tokenizers==0.23.3
+    - --with
+    - huggingface-hub==2.2.0
+    - python
+    - tools/mlx_runtime.py
+    - serve
+    - --runtime-report
+    - results/mlx-runtime-8082.json
 
 models:
   # Best first run on the 32 GB Mac: official MLX 4bit, ~15.7 GB on disk.
   - name: diffusiongemma-26b-mlx-4bit
     hf: mlx-community/diffusiongemma-26B-A4B-it-4bit
+    params:
+      revision: 0d2cee4aa112548df2fad35a7f017eeb1ac8f352
 
   # Smallest MLX DiffusionGemma checkpoint, useful if memory pressure is high.
   - name: diffusiongemma-26b-mlx-mxfp4
@@ -37,13 +62,18 @@ server:
   params:
     host: 127.0.0.1
     port: 8082
-    prefill_step_size: 4096
+    prefill_step_size: 2048
     max_tokens: 512
     max_kv_size: 8192
+    # This also caps prompt + requested output tokens at server admission.
+    # Boundary probes above 8192 require the diagnostic launch documented below.
+    # The launcher forwards prefill size to the pinned native diffusion API.
+    # max_kv_size controls admission; the model builds its own cache layout.
+    # Inspect observed_diffusion_arguments and observed_cache_layout in the report.
+    # Checkpoint weight quantization does not enable KV-cache quantization.
     vision_cache_size: 4
     log_level: INFO
   extra_args: []
   env:
-    # Full limit=50 IFEval+GSM8K on 4bit repeatedly hit the default 600s
-    # no-token queue timeout after ~28 requests. Fail stuck requests faster.
+    # Bound time waiting for the first token while testing new prompt workloads.
     MLX_VLM_TOKEN_QUEUE_TIMEOUT: "300"

@@ -1,6 +1,10 @@
 name: diffusiongemma-26b-mlx-http-load
 
 database: results/llm_refinery.duckdb
+runtime_report: ../results/mlx-runtime-8082.json
+
+transport:
+  trust_env: false
 
 targets:
   - name: mlx-diffusiongemma-26b-4bit
@@ -53,20 +57,15 @@ scenarios:
     timeout_s: 600
     expected_contains: ["def percentile"]
 
-  - name: long-context-recall
+  # Short single-fact smoke only. Generate tokenizer-measured boundary probes
+  # with tools/mlx_runtime.py recall; see docs/mlx-kv-investigation.md.
+  - name: recall-smoke
     system: Answer using only the information in the user message.
     prompt: |
-      Reference note: the deployment codename is DIFFUSIONGEMMA26-MLX. The selected server settings are
-      MLX-VLM, prefill step size 4096, maximum KV size 8192 tokens, max tokens 1280,
-      thinking disabled, and port 8082.
-
-      After reading all repeated notes, answer with exactly two lines:
-      codename: <codename>
-      settings: <server settings>
-    # DiffusionGemma 26B MLX 4bit has already hit 600s no-token timeouts
-    # in full lm-eval on the 32 GB Mac. Keep this as a shorter context smoke.
-    prompt_repeat: 16
-    max_tokens: [128]
+      Reference note: the site trailer access code is RF7391XZ.
+      The archive contains routine building inspection notes.
+      What is the site trailer access code? Reply with only the code.
+    max_tokens: [32]
     concurrency: [1]
     requests: 3
     warmup_requests: 1
@@ -74,4 +73,4 @@ scenarios:
     seed: 42
     stream: true
     timeout_s: 300
-    expected_contains: ["DIFFUSIONGEMMA26-MLX", "4096", "8192"]
+    expected_exact: RF7391XZ
